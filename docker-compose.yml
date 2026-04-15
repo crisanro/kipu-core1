@@ -12,5 +12,9 @@ services:
     volumes:
       - .:/app
     restart: always
+    networks:          # ← mismo nivel que ports, volumes, etc.
+      - red_infraestructura
 
-# Si luego quieres agregar una DB de Postgres aquí mismo, la incluimos abajo
+networks:
+  red_infraestructura:
+    external: true
