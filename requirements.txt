@@ -1,0 +1,24 @@
+# --- Framework Base ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic[email]>=2.7.0
+pydantic-settings>=2.2.1
+python-multipart>=0.0.9
+
+# --- Herramientas de Red y Entorno ---
+httpx>=0.27.0
+python-dotenv>=1.0.1
+
+# --- Base de Datos (PostgreSQL) ---
+sqlalchemy>=2.0.29
+asyncpg>=0.29.0
+apscheduler>=3.11.2
+firebase-admin==6.5.0
+xmltodict>=0.13.0
+pytz>=2024.1
+greenlet
+# --- Almacenamiento (MinIO / S3) ---
+minio>=7.2.5
+
+# --- AWS SDK (Para Secrets Manager, etc.) ---
+boto3>=1.34.79

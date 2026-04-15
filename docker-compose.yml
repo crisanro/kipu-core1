@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  api-core:
+    build: .
+    container_name: kipu_core_python
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # Esto permite que el código se actualice en el contenedor al editarlo (solo para desarrollo)
+    volumes:
+      - .:/app
+    restart: always
+
+# Si luego quieres agregar una DB de Postgres aquí mismo, la incluimos abajo
