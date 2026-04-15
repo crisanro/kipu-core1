@@ -5,7 +5,7 @@ services:
     build: .
     container_name: kipu_core_python
     ports:
-      - "8000:8000"
+      - "8002:8000"
     env_file:
       - .env
     # Esto permite que el código se actualice en el contenedor al editarlo (solo para desarrollo)
@@ -13,8 +13,8 @@ services:
       - .:/app
     restart: always
     networks:          # ← mismo nivel que ports, volumes, etc.
-      - kipu
+      - red_infraestructura
 
 networks:
-  kipu:
+  red_infraestructura:
     external: true
