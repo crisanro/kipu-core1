@@ -35,57 +35,71 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         raise HTTPException(status_code=400, detail="Los campos 'establecimiento' y 'punto_emision' son requeridos.")
 
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 0: Resolución de Identidad del Cliente (UID vs Objeto)
+    # BLOQUE 0: Resolución de Identidad del Cliente (Prioridad ID)
     # ─────────────────────────────────────────────────────────────
+    cliente_id = factura_data.get("cliente_id")
+    cliente_obj = factura_data.get("cliente")
+    
+    cliente_emisor_id = None
     cliente_final = {
         "identificacion": None,
         "razon_social": None,
         "email": None,
-        "id_db": None,
         "direccion": "S/N",
         "telefono": "",
         "tipo_id": "05"
     }
 
-    # Caso A: Viene el objeto "cliente" con datos explícitos (Prioridad)
-    if factura_data.get("cliente"): # 👈 Cambiado 'body' por 'factura_data'
-        c_req = factura_data["cliente"]
-        cliente_final["identificacion"] = c_req.get("identificacion")
-        cliente_final["razon_social"] = c_req.get("razonSocial") or c_req.get("nombre")
-        cliente_final["email"] = c_req.get("email")
-        cliente_final["direccion"] = c_req.get("direccion", "S/N")
-        cliente_final["telefono"] = c_req.get("telefono", "")
-        cliente_final["tipo_id"] = c_req.get("tipoId") or c_req.get("tipo_id") or "05"
-        
-        # Si también viene un cliente_id, lo guardamos para la relación
-        cliente_final["id_db"] = factura_data.get("cliente_id")
-
-    # Caso B: Solo viene "cliente_id", buscamos en la base de datos
-    elif factura_data.get("cliente_id"):
+    # 1. PRIORIDAD ABSOLUTA: cliente_id (si existe y no es "")
+    if cliente_id and str(cliente_id).strip() != "":
         query_cli = text("""
             SELECT id, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono 
             FROM clientes_emisor 
             WHERE id = :cid AND emisor_id = :eid
         """)
-        res_cli = await db.execute(query_cli, {"cid": factura_data["cliente_id"], "eid": emisor_id})
-        cliente_db = res_cli.fetchone()
+        res_cli = await db.execute(query_cli, {"cid": cliente_id, "eid": emisor_id})
+        row_cli = res_cli.fetchone()
         
-        if cliente_db:
-            cliente_final["id_db"] = cliente_db.id
-            cliente_final["identificacion"] = cliente_db.identificacion
-            cliente_final["razon_social"] = cliente_db.razon_social
-            cliente_final["email"] = cliente_db.email
-            cliente_final["direccion"] = cliente_db.direccion
-            cliente_final["telefono"] = cliente_db.telefono
-            cliente_final["tipo_id"] = cliente_db.tipo_identificacion_sri
+        if row_cli:
+            cliente_emisor_id = row_cli.id
+            cliente_final["identificacion"] = row_cli.identificacion
+            cliente_final["razon_social"] = row_cli.razon_social
+            cliente_final["email"] = row_cli.email
+            cliente_final["direccion"] = row_cli.direccion
+            cliente_final["telefono"] = row_cli.telefono
+            cliente_final["tipo_id"] = row_cli.tipo_identificacion_sri
+        else:
+            raise HTTPException(status_code=404, detail="El 'cliente_id' proporcionado no existe.")
 
-    # Validación de seguridad: Evitar el NotNullViolationError de la DB
-    if not cliente_final["identificacion"] or not cliente_final["razon_social"]:
-        raise HTTPException(
-            status_code=400, 
-            detail="Faltan datos del comprador (identificacion o razon_social). Verifique el objeto 'cliente' o el 'cliente_id'."
-        )
+    # 2. SEGUNDA OPCIÓN: Si no hubo ID, usar el objeto "cliente"
+    elif cliente_obj:
+        cliente_final["identificacion"] = cliente_obj.get("identificacion")
+        cliente_final["razon_social"] = cliente_obj.get("razonSocial") or cliente_obj.get("nombre")
+        cliente_final["email"] = cliente_obj.get("email")
+        cliente_final["direccion"] = cliente_obj.get("direccion", "S/N")
+        cliente_final["telefono"] = cliente_obj.get("telefono", "")
+        cliente_final["tipo_id"] = cliente_obj.get("tipoId") or cliente_obj.get("tipo_id") or "05"
 
+        # Intentamos registrarlo para que en la próxima ya tenga ID
+        try:
+            nuevo_cliente = ClienteCreate(
+                tipo_identificacion_sri=cliente_final["tipo_id"],
+                identificacion=cliente_final["identificacion"],
+                razon_social=cliente_final["razon_social"],
+                direccion=cliente_final["direccion"],
+                email=cliente_final["email"] or "",
+                telefono=cliente_final["telefono"] or ""
+            )
+            res_creacion = await crear_cliente_core(emisor_id, nuevo_cliente, db, lanzar_error_si_existe=False)
+            cliente_emisor_id = res_creacion.get("uid")
+        except Exception as e_cli:
+            print(f"⚠️ Nota: Cliente no persistido, se usará modo invitado: {e_cli}")
+
+    # 3. VALIDACIÓN FINAL: Si no hay identificación tras ambos pasos, error.
+    if not cliente_final["identificacion"]:
+        raise HTTPException(status_code=400, detail="Debe proporcionar un 'cliente_id' válido o un objeto 'cliente' completo.")
+
+    
     # ─────────────────────────────────────────────────────────────
     # BLOQUE 1: Base de Datos y Generación de Datos (Transacción)
     # ─────────────────────────────────────────────────────────────
@@ -234,20 +248,23 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         raise HTTPException(status_code=500, detail=f"Falla técnica en firma: {str(e)}")
 
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 3: Persistencia de Factura (Uso de cliente_final)
+    # BLOQUE 3: Guardar en MinIO, descontar crédito e Insertar Factura
     # ─────────────────────────────────────────────────────────────
     try:
         xml_path_rel = f"{emisor.ruc}/{clave_acceso}.xml"
         pdf_path_rel = f"{emisor.ruc}/{clave_acceso}.pdf"
 
+        # 1. Subir archivos
         upload_file("invoices", xml_path_rel, xml_firmado_str.encode('utf-8'), "text/xml")
         upload_file("invoices", pdf_path_rel, pdf_bytes, "application/pdf")
 
+        # 2. Descontar crédito
         await db.execute(
             text("UPDATE user_credits SET balance = balance - 1 WHERE emisor_id = :eid"), 
             {"eid": emisor_id}
         )
 
+        # 3. INSERT con los datos que resolvimos en el BLOQUE 0
         query_insert = text("""
             INSERT INTO invoices (
                 emisor_id, punto_emision_id, cliente_emisor_id, secuencial, fecha_emision, clave_acceso,
@@ -263,20 +280,23 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         res_insert = await db.execute(query_insert, {
             "emisor_id": emisor_id, 
             "pto_id": punto_emision.punto_id, 
-            "cliente_emisor_id": cliente_final["id_db"],
+            "cliente_emisor_id": cliente_emisor_id, # El UUID que encontramos o creamos
             "sec": secuencial,
             "fecha": ahora_ecuador.date(),
             "clave": clave_acceso, 
+            
+            # AQUÍ ES DONDE USAS LAS LLAVES DE CLIENTE_FINAL:
             "id_comp": cliente_final["identificacion"],
             "razon_comp": cliente_final["razon_social"],
+            "email_comp": cliente_final["email"],
+            
             "total": calculos["totales"]["importeTotal"], 
             "sub_iva": calculos["totales"]["subtotal_iva"],
             "sub_0": calculos["totales"]["subtotal_0"], 
             "val_iva": calculos["totales"]["totalIva"],
             "xml_path": f"invoices/{xml_path_rel}", 
             "pdf_path": f"invoices/{pdf_path_rel}",
-            "datos_fac": json.dumps(xml_obj["factura"]), 
-            "email_comp": cliente_final["email"]
+            "datos_fac": json.dumps(xml_obj["factura"])
         })
         
         factura_id = res_insert.scalar()
@@ -284,7 +304,8 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
     except Exception as e:
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al guardar factura: {str(e)}")
+        print(f"❌ Error en Bloque 3: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     # ─────────────────────────────────────────────────────────────
     # BLOQUE 4: Fast-Track al SRI (Recepción y Autorización)
