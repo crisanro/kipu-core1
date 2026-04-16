@@ -29,6 +29,7 @@ async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codig
 
 
 async def obtener_status_core(emisor_id: int, db: AsyncSession):
+    # Usamos bindparam por seguridad extra aunque ya uses diccionarios
     query = text("""
         SELECT
             e.ruc, 
@@ -36,7 +37,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             e.nombre_comercial, 
             e.ambiente,
             e.p12_expiration,
-            c.balance AS creditos_disponibles,
+            COALESCE(c.balance, 0) AS creditos_disponibles,
             (
                 SELECT json_agg(last_docs)
                 FROM (
@@ -54,32 +55,39 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
         LEFT JOIN user_credits c ON e.id = c.emisor_id
         WHERE e.id = :eid
     """)
+    
     res = await db.execute(query, {"eid": emisor_id})
     row = res.fetchone()
     
     if not row:
         raise HTTPException(status_code=404, detail="Emisor no encontrado")
 
-    data = dict(row._mapping)
+    # Mapping es más limpio en SQLAlchemy 2.0
+    data = row._mapping
 
-    # Validar si la firma está vigente (naive datetime a timezone-aware)
+    # Lógica de Firma Electrónica
+    expiracion = data["p12_expiration"]
     firma_valida = False
-    if data.get("p12_expiration"):
-        # Aseguramos que la fecha se compare correctamente
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        firma_valida = data["p12_expiration"] > now_utc
+    
+    if expiracion:
+        # Normalizamos a UTC Aware para evitar el error de comparación
+        if expiracion.tzinfo is None:
+            expiracion = expiracion.replace(tzinfo=timezone.utc)
+        firma_valida = expiracion > datetime.now(timezone.utc)
 
     return {
         "ok": True,
         "emisor": {
             "ruc": data["ruc"],
             "razon_social": data["razon_social"],
+            "nombre_comercial": data["nombre_comercial"],
             "ambiente": "PRUEBAS" if data["ambiente"] == 1 else "PRODUCCIÓN", 
             "firma": {
                 "valida": firma_valida,
-                "vencimiento": data["p12_expiration"],
+                "vencimiento": expiracion.isoformat() if expiracion else None,
+                "dias_restantes": (expiracion - datetime.now(timezone.utc)).days if expiracion else 0
             },
         },
-        "creditos": data["creditos_disponibles"] or 0,
+        "creditos": data["creditos_disponibles"],
         "historial": data["ultimas_facturas"] or [],
     }
