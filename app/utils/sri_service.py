@@ -289,19 +289,23 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
     # ─────────────────────────────────────────────────────────────
     # BLOQUE 4: Fast-Track al SRI (Recepción y Autorización)
     # ─────────────────────────────────────────────────────────────
-    # Esto corre después del COMMIT para asegurar que la factura ya existe en DB.
-    # En FastAPI, idealmente esto se enviaría a una BackgroundTask, pero 
-    # mantendremos el flujo síncrono para que devuelva el estado real al cliente.
     
     urls = URLS_SRI[str(emisor.ambiente)]
     xml_base64 = base64.b64encode(xml_firmado_str.encode('utf-8')).decode('utf-8')
     
+    # CORRECCIÓN AQUÍ: Cambiamos cliente_data por cliente_final
     factura_notificar = {
-        "id": str(factura_id), "clave_acceso": clave_acceso, "email_comprador": cliente_data.get("email"),
-        "razon_social_comprador": cliente_data.get("nombre", cliente_data.get("razonSocial")),
-        "secuencial": secuencial, "importe_total": calculos["totales"]["importeTotal"],
-        "pdf_path": f"invoices/{pdf_path_rel}", "ambiente": emisor.ambiente,
-        "ruc": emisor.ruc, "emisor_db_id": str(emisor_id), "razon_social": emisor.razon_social
+        "id": str(factura_id), 
+        "clave_acceso": clave_acceso, 
+        "email_comprador": cliente_final["email"], # 👈 Corregido
+        "razon_social_comprador": cliente_final["razon_social"], # 👈 Corregido
+        "secuencial": secuencial, 
+        "importe_total": calculos["totales"]["importeTotal"],
+        "pdf_path": f"invoices/{pdf_path_rel}", 
+        "ambiente": emisor.ambiente,
+        "ruc": emisor.ruc, 
+        "emisor_db_id": str(emisor_id), 
+        "razon_social": emisor.razon_social
     }
 
     try:
