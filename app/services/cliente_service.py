@@ -253,21 +253,33 @@ async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str,
 # ==========================================
 # 4. BÚSQUEDA MASIVA + CONSUMIDOR FINAL
 # ==========================================
-async def consultar_clientes_bulk_core(emisor_id: int, identificaciones: list[str], db: AsyncSession):
+async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: AsyncSession):
     try:
         resultados = []
 
-        if identificaciones:
+        if terminos:
+            # Importante: Usamos paréntesis manuales o expandimos los parámetros.
+            # Para evitar errores de sintaxis con asyncpg, la forma más segura es esta:
             query = text("""
                 SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
                 FROM clientes_emisor
-                WHERE emisor_id = :eid AND identificacion IN :idents
+                WHERE emisor_id = :eid 
+                AND (identificacion IN :idents OR id::text IN :idents)
             """)
             
-            res = await db.execute(query, {"eid": emisor_id, "idents": tuple(identificaciones)})
-            resultados = [dict(r._mapping) for r in res.fetchall()]
+            # Pasamos la lista como una tupla
+            res = await db.execute(query, {
+                "eid": emisor_id, 
+                "idents": tuple(terminos)
+            })
+            
+            # Convertimos a diccionarios y nos aseguramos de que el UUID sea string
+            for r in res.fetchall():
+                d = dict(r._mapping)
+                d["uid"] = str(d["uid"])
+                resultados.append(d)
 
-        # AGREGAR SIEMPRE CONSUMIDOR FINAL (Exigencia del SRI)
+        # AGREGAR SIEMPRE CONSUMIDOR FINAL
         consumidor_final = {
             "uid": None,
             "tipo_identificacion_sri": "07",
@@ -287,7 +299,8 @@ async def consultar_clientes_bulk_core(emisor_id: int, identificaciones: list[st
 
     except Exception as e:
         print(f"[Bulk Search Error] {str(e)}")
-        raise HTTPException(status_code=500, detail="Error interno consultando clientes masivamente.")
+        # Es mejor relanzar el error original para debuggear o uno genérico
+        raise HTTPException(status_code=500, detail="Error interno consultando clientes.")
     
 
 # ==========================================
