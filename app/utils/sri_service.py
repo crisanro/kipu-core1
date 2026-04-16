@@ -3,7 +3,7 @@ import base64
 import httpx
 import asyncio
 from datetime import datetime
-from sqlalchemy import text
+from sqlalchemy import text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from app.schemas.cliente import ClienteCreate
@@ -305,19 +305,61 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
 
     # ─────────────────────────────────────────────────────────────
+    # PASO PREVIO: Resolución de Identidad del Cliente
+    # ─────────────────────────────────────────────────────────────
+    cliente_final = {
+        "identificacion": None,
+        "razon_social": None,
+        "email": None,
+        "id_db": None
+    }
+
+    # Caso A: Viene el objeto "cliente" con datos explícitos (Prioridad para datos frescos)
+    if body.get("cliente"):
+        c_req = body["cliente"]
+        cliente_final["identificacion"] = c_req.get("identificacion")
+        cliente_final["razon_social"] = c_req.get("razonSocial") or c_req.get("razon_social")
+        cliente_final["email"] = c_req.get("email")
+        cliente_final["id_db"] = body.get("cliente_id") if body.get("cliente_id") else None
+
+    # Caso B: Solo viene "cliente_id", buscamos en la base de datos
+    elif body.get("cliente_id"):
+        res_cli = await db.execute(
+            text("SELECT id, identificacion, razon_social, email FROM clientes_emisor WHERE id = :cid"),
+            {"cid": body["cliente_id"]}
+        )
+        cliente_db = res_cli.fetchone()
+        if cliente_db:
+            cliente_final["identificacion"] = cliente_db.identificacion
+            cliente_final["razon_social"] = cliente_db.razon_social
+            cliente_final["email"] = cliente_db.email
+            cliente_final["id_db"] = cliente_db.id
+
+    # Validación de seguridad: Evitar el NotNullViolationError de la DB
+    if not cliente_final["identificacion"] or not cliente_final["razon_social"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="Faltan datos del comprador (identificacion o razon_social). Verifique el objeto 'cliente' o el 'cliente_id'."
+        )
+
+    # ─────────────────────────────────────────────────────────────
     # BLOQUE 3: Guardar en MinIO, descontar crédito e Insertar Factura
     # ─────────────────────────────────────────────────────────────
     try:
         xml_path_rel = f"{emisor.ruc}/{clave_acceso}.xml"
         pdf_path_rel = f"{emisor.ruc}/{clave_acceso}.pdf"
 
-        # Subir a MinIO
+        # 1. Almacenamiento en MinIO
         upload_file("invoices", xml_path_rel, xml_firmado_str.encode('utf-8'), "text/xml")
         upload_file("invoices", pdf_path_rel, pdf_bytes, "application/pdf")
 
-        # Iniciar transacción final
-        await db.execute(text("UPDATE user_credits SET balance = balance - 1 WHERE emisor_id = :eid"), {"eid": emisor_id})
+        # 2. Descontar Crédito (Transaccional)
+        await db.execute(
+            text("UPDATE user_credits SET balance = balance - 1 WHERE emisor_id = :eid"), 
+            {"eid": emisor_id}
+        )
 
+        # 3. Insertar Factura con Estado 'FIRMADO'
         query_insert = text("""
             INSERT INTO invoices (
                 emisor_id, punto_emision_id, cliente_emisor_id, secuencial, fecha_emision, clave_acceso,
@@ -332,13 +374,13 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         
         res_insert = await db.execute(query_insert, {
             "emisor_id": emisor_id, 
-            "pto_id": punto_emision.punto_id, 
-            "cliente_emisor_id": cliente_emisor_id, # <--- Se guarda la relación
+            "pto_id": punto_emision.id, 
+            "cliente_emisor_id": cliente_final["id_db"],
             "sec": secuencial,
-            "fecha": ahora_ecuador, 
+            "fecha": ahora_ecuador.date(), # Tu tabla pide DATE
             "clave": clave_acceso, 
-            "id_comp": cliente_data.get("identificacion"),
-            "razon_comp": cliente_data.get("nombre", cliente_data.get("razonSocial")),
+            "id_comp": cliente_final["identificacion"],
+            "razon_comp": cliente_final["razon_social"],
             "total": calculos["totales"]["importeTotal"], 
             "sub_iva": calculos["totales"]["subtotal_iva"],
             "sub_0": calculos["totales"]["subtotal_0"], 
@@ -346,16 +388,16 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
             "xml_path": f"invoices/{xml_path_rel}", 
             "pdf_path": f"invoices/{pdf_path_rel}",
             "datos_fac": json.dumps(xml_obj["factura"]), 
-            "email_comp": cliente_data.get("email")
+            "email_comp": cliente_final["email"]
         })
         
         factura_id = res_insert.scalar()
-        await db.commit()
+        await db.commit() # Guardamos físicamente antes de ir al SRI
 
     except Exception as e:
         await db.rollback()
-        print(f"❌ Error en Bloque 3: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error Persistencia Factura: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al guardar factura: {str(e)}")
 
     # ─────────────────────────────────────────────────────────────
     # BLOQUE 4: Fast-Track al SRI (Recepción y Autorización)
