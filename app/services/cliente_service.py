@@ -395,3 +395,52 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL CONSULTAR EL HISTORIAL.")
     
 
+async def verificar_cliente_existente_flexible(emisor_id: int, busqueda: str, db: AsyncSession):
+    """
+    Busca un cliente por UUID (id) o por Identificación (Cédula/RUC).
+    Retorna True/False y el UID encontrado.
+    """
+    try:
+        # 1. Determinar si la búsqueda es un UUID o una Identificación
+        es_uuid = False
+        try:
+            uuid.UUID(busqueda)
+            es_uuid = True
+        except ValueError:
+            es_uuid = False
+
+        # 2. Construir la consulta según el tipo de dato
+        if es_uuid:
+            sql = text("""
+                SELECT id FROM clientes_emisor 
+                WHERE emisor_id = :eid AND id = :busqueda
+            """)
+        else:
+            # Si no es UUID, asumimos que es identificación (limpiamos el string por si acaso)
+            ident_limpia = busqueda.replace("-", "").replace(".", "").strip()
+            sql = text("""
+                SELECT id FROM clientes_emisor 
+                WHERE emisor_id = :eid AND identificacion = :busqueda
+            """)
+            busqueda = ident_limpia
+
+        # 3. Ejecutar
+        res = await db.execute(sql, {"eid": emisor_id, "busqueda": busqueda})
+        row = res.fetchone()
+
+        if row:
+            return {
+                "valido": True,
+                "existe": True,
+                "uid": str(row.id)
+            }
+        
+        return {
+            "valido": True, 
+            "existe": False, 
+            "uid": None
+        }
+
+    except Exception as e:
+        print(f"Error en verificación flexible: {e}")
+        return {"valido": False, "existe": False, "uid": None}
