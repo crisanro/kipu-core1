@@ -258,28 +258,27 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
         resultados = []
 
         if terminos:
-            # Importante: Usamos paréntesis manuales o expandimos los parámetros.
-            # Para evitar errores de sintaxis con asyncpg, la forma más segura es esta:
+            # Convertimos la lista de strings a una tupla para SQLAlchemy
+            # Usamos id::text para comparar los UUIDs de la DB con los strings recibidos
             query = text("""
                 SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
                 FROM clientes_emisor
                 WHERE emisor_id = :eid 
-                AND (identificacion IN :idents OR id::text IN :idents)
+                AND id::text IN :uids
             """)
             
-            # Pasamos la lista como una tupla
             res = await db.execute(query, {
                 "eid": emisor_id, 
-                "idents": tuple(terminos)
+                "uids": tuple(terminos)
             })
             
-            # Convertimos a diccionarios y nos aseguramos de que el UUID sea string
+            # Mapeo de resultados
             for r in res.fetchall():
                 d = dict(r._mapping)
-                d["uid"] = str(d["uid"])
+                d["uid"] = str(d["uid"]) # Convertir UUID objeto a string para el JSON
                 resultados.append(d)
 
-        # AGREGAR SIEMPRE CONSUMIDOR FINAL
+        # AGREGAR SIEMPRE CONSUMIDOR FINAL (Requerido por SRI)
         consumidor_final = {
             "uid": None,
             "tipo_identificacion_sri": "07",
@@ -298,9 +297,12 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
         }
 
     except Exception as e:
-        print(f"[Bulk Search Error] {str(e)}")
-        # Es mejor relanzar el error original para debuggear o uno genérico
-        raise HTTPException(status_code=500, detail="Error interno consultando clientes.")
+        # Log del error real para debug
+        print(f"❌ Error en búsqueda por UID: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Error al procesar la búsqueda por identificadores únicos."
+        )
     
 
 # ==========================================
