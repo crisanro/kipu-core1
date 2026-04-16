@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from app.schemas.cliente import ClienteCreate, ClienteUpdate
@@ -255,20 +255,19 @@ async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str,
 # ==========================================
 async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: AsyncSession):
     try:
-        # 1. Filtrar solo los términos que tengan formato UUID válido para evitar errores de cast en Postgres
         uuids_validos = []
         for t in terminos:
             try:
-                # Validamos que sea un UUID real
                 uuid_obj = uuid.UUID(t)
                 uuids_validos.append(str(uuid_obj))
             except ValueError:
-                continue # Si no es UUID, lo ignoramos en esta búsqueda específica
+                continue
 
         resultados = []
 
         if uuids_validos:
-            # Usamos id::text para comparar de forma segura el UUID de la tabla con el string
+            # 1. Definimos la query usando :uids
+            # 2. Usamos .bindparams para decirle a SQLAlchemy que 'uids' es una lista expandible
             query = text("""
                 SELECT 
                     id as uid, 
@@ -281,21 +280,21 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
                 FROM clientes_emisor
                 WHERE emisor_id = :eid 
                 AND id::text IN :uids
-            """)
+            """).bindparams(bindparam("uids", expanding=True))
             
+            # Ejecutamos pasando la lista directamente (no hace falta tuple() aquí)
             res = await db.execute(query, {
                 "eid": emisor_id, 
-                "uids": tuple(uuids_validos)
+                "uids": uuids_validos
             })
             
-            # Convertimos los objetos Row a diccionarios serializables
             for r in res.fetchall():
                 d = dict(r._mapping)
-                d["uid"] = str(d["uid"])  # Convertimos el objeto UUID a string
+                d["uid"] = str(d["uid"])
                 resultados.append(d)
 
-        # 2. Agregar Consumidor Final (obligatorio por lógica de negocio)
-        consumidor_final = {
+        # Consumidor Final
+        resultados.append({
             "uid": None,
             "tipo_identificacion_sri": "07",
             "identificacion": "9999999999999",
@@ -303,10 +302,7 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
             "direccion": "S/N",
             "email": "",
             "telefono": ""
-        }
-        
-        # Evitar duplicar consumidor final si ya está (opcional)
-        resultados.append(consumidor_final)
+        })
 
         return {
             "ok": True,
@@ -316,11 +312,7 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
 
     except Exception as e:
         print(f"❌ [Bulk Search Error] {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail="Error interno al buscar clientes por UID."
-        )
-    
+        raise HTTPException(status_code=500, detail="Error en la base de datos al buscar clientes.")
 
 # ==========================================
 # 5. LISTAR TODOS LOS CLIENTES (Exclusivo App)
