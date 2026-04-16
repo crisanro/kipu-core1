@@ -36,3 +36,12 @@ async def consultar_cliente(
 ):
     # ¡Corregido! Ahora usa la nueva función core
     return await consultar_cliente_por_identificacion_core(auth_data["emisor_id"], identificacion, db)
+
+@router.get("/verificar-cliente/{identificacion}")
+async def verificar_cliente(
+    identificacion: str, 
+    auth_data: dict = Depends(verify_firebase_token), 
+    db: AsyncSession = Depends(get_db)
+):
+    # Devuelve TODAS las coincidencias locales (útil por si hay pasaportes repetidos)
+    return await verificar_existencia_cliente_core(auth_data["emisor_id"], identificacion, db)
