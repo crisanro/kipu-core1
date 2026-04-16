@@ -40,7 +40,7 @@ async def consultar_cliente(
 @router.get("/verificar-cliente/{identificacion}")
 async def verificar_cliente(
     identificacion: str, 
-    auth_data: dict = Depends(verify_firebase_token), 
+    auth_data: dict = Depends(verify_api_key), 
     db: AsyncSession = Depends(get_db)
 ):
     # Devuelve TODAS las coincidencias locales (útil por si hay pasaportes repetidos)
