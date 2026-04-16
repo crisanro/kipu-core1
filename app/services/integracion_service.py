@@ -1,7 +1,7 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codigo: str, db: AsyncSession):
     query = text("""
@@ -70,9 +70,14 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
     firma_valida = False
     
     if expiracion:
-        # Normalizamos a UTC Aware para evitar el error de comparación
+        # 2. CONVERSIÓN CRÍTICA: Si es un 'date', lo pasamos a 'datetime'
+        if isinstance(expiracion, date) and not isinstance(expiracion, datetime):
+            expiracion = datetime.combine(expiracion, datetime.min.time())
+
+        # 3. Ahora sí podemos manejar la zona horaria de forma segura
         if expiracion.tzinfo is None:
             expiracion = expiracion.replace(tzinfo=timezone.utc)
+            
         firma_valida = expiracion > datetime.now(timezone.utc)
 
     return {
