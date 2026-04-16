@@ -255,13 +255,29 @@ async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str,
 # ==========================================
 async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: AsyncSession):
     try:
+        # 1. Filtrar solo los términos que tengan formato UUID válido para evitar errores de cast en Postgres
+        uuids_validos = []
+        for t in terminos:
+            try:
+                # Validamos que sea un UUID real
+                uuid_obj = uuid.UUID(t)
+                uuids_validos.append(str(uuid_obj))
+            except ValueError:
+                continue # Si no es UUID, lo ignoramos en esta búsqueda específica
+
         resultados = []
 
-        if terminos:
-            # Convertimos la lista de strings a una tupla para SQLAlchemy
-            # Usamos id::text para comparar los UUIDs de la DB con los strings recibidos
+        if uuids_validos:
+            # Usamos id::text para comparar de forma segura el UUID de la tabla con el string
             query = text("""
-                SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
+                SELECT 
+                    id as uid, 
+                    tipo_identificacion_sri, 
+                    identificacion, 
+                    razon_social, 
+                    direccion, 
+                    email, 
+                    telefono
                 FROM clientes_emisor
                 WHERE emisor_id = :eid 
                 AND id::text IN :uids
@@ -269,16 +285,16 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
             
             res = await db.execute(query, {
                 "eid": emisor_id, 
-                "uids": tuple(terminos)
+                "uids": tuple(uuids_validos)
             })
             
-            # Mapeo de resultados
+            # Convertimos los objetos Row a diccionarios serializables
             for r in res.fetchall():
                 d = dict(r._mapping)
-                d["uid"] = str(d["uid"]) # Convertir UUID objeto a string para el JSON
+                d["uid"] = str(d["uid"])  # Convertimos el objeto UUID a string
                 resultados.append(d)
 
-        # AGREGAR SIEMPRE CONSUMIDOR FINAL (Requerido por SRI)
+        # 2. Agregar Consumidor Final (obligatorio por lógica de negocio)
         consumidor_final = {
             "uid": None,
             "tipo_identificacion_sri": "07",
@@ -288,6 +304,8 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
             "email": "",
             "telefono": ""
         }
+        
+        # Evitar duplicar consumidor final si ya está (opcional)
         resultados.append(consumidor_final)
 
         return {
@@ -297,11 +315,10 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
         }
 
     except Exception as e:
-        # Log del error real para debug
-        print(f"❌ Error en búsqueda por UID: {str(e)}")
+        print(f"❌ [Bulk Search Error] {str(e)}")
         raise HTTPException(
             status_code=500, 
-            detail="Error al procesar la búsqueda por identificadores únicos."
+            detail="Error interno al buscar clientes por UID."
         )
     
 
