@@ -7,7 +7,8 @@ from app.services.cliente_service import (
     crear_cliente_core, 
     consultar_cliente_por_identificacion_core, 
     consultar_clientes_bulk_core,
-    verificar_existencia_cliente_core # Lo dejo importado por si en el futuro quieres añadir el endpoint de verificar aquí también
+    verificar_existencia_cliente_core, # Lo dejo importado por si en el futuro quieres añadir el endpoint de verificar aquí también
+    verificar_cliente_existente_flexible
 )
 
 router = APIRouter()
@@ -45,3 +46,13 @@ async def verificar_cliente(
 ):
     # Devuelve TODAS las coincidencias locales (útil por si hay pasaportes repetidos)
     return await verificar_existencia_cliente_core(auth_data["emisor_id"], identificacion, db)
+
+
+@router.get("/validar-cliente/{identificacion}")
+async def validar_cliente(
+    identificacion: str, 
+    auth_data: dict = Depends(verify_api_key), 
+    db: AsyncSession = Depends(get_db)
+):
+    # Devuelve TODAS las coincidencias locales (útil por si hay pasaportes repetidos)
+    return await verificar_cliente_existente_flexible(auth_data["emisor_id"], identificacion, db)
