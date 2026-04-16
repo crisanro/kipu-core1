@@ -28,7 +28,7 @@ URLS_SRI = {
 }
 
 # ⚠️ Cambia esta URL si tu microservicio de Node corre en otro host/puerto
-NODE_SIGNER_URL = "http://localhost:3000/api/firmar"
+NODE_SIGNER_URL = "http://kipu_signer_node:3000/api/firmar"
 
 async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSession):
     if not factura_data.get("establecimiento") or not factura_data.get("punto_emision"):
