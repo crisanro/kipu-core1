@@ -3,11 +3,13 @@ import asyncio
 import httpx
 import xmltodict
 import json
+import traceback
 from sqlalchemy import text
 from app.core.database import AsyncSessionLocal
 from app.services.storage_service import download_file, upload_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
+
 
 URLS_SRI = {
     "1": {
@@ -61,26 +63,35 @@ async def job_enviar_facturas():
                 try:
                     print(f"[SRI Job1] Enviando clave: {factura.clave_acceso}")
                     
-                    # 1. Descargar XML de MinIO
                     bucket_xml, *path_xml_parts = factura.xml_path.split('/')
                     xml_bytes = download_file(bucket_xml, '/'.join(path_xml_parts))
                     xml_base64 = base64.b64encode(xml_bytes).decode('utf-8')
                     
-                    # 2. Enviar al SRI
-                    urls = URLS_SRI[factura.ambiente]
+                    urls = URLS_SRI[str(factura.ambiente)]
                     soap_body = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion"><soapenv:Body><ec:validarComprobante><xml>{xml_base64}</xml></ec:validarComprobante></soapenv:Body></soapenv:Envelope>"""
                     
+                    print("[DEBUG] Enviando petición HTTP al SRI...")
                     res = await httpx_with_retry(urls["recepcion"], soap_body, {'Content-Type': 'text/xml'})
                     
-                    # 3. Parsear respuesta (xmltodict convierte XML a Diccionario Python)
+                    # 🔥 AQUÍ IMPRIMIMOS LA RESPUESTA CRUDA DEL SRI 🔥
+                    print(f"[DEBUG] Status Code SRI: {res.status_code}")
+                    print(f"[DEBUG] Respuesta Cruda del SRI:\n{res.text}\n")
+                    
                     json_res = xmltodict.parse(res.text)
-                    print(f"DEBUG SRI RESP: {json.dumps(json_res)}")
+                    
+                    # 🔥 Y AQUÍ IMPRIMIMOS EL DICCIONARIO PARSEADO 🔥
+                    print(f"[DEBUG] JSON Parseado:\n{json.dumps(json_res, indent=2)}\n")
+                    
                     try:
-                        resp_recepcion = json_res['soap:Envelope']['soap:Body']['ns2:validarComprobanteResponse']['RespuestaRecepcionComprobante']
-                    except KeyError:
-                        continue
+                        body = json_res.get('soap:Envelope', {}).get('soap:Body', {})
+                        resp_recepcion = body.get('ns2:validarComprobanteResponse', {}).get('RespuestaRecepcionComprobante')
+                        
+                        if not resp_recepcion:
+                            raise ValueError(f"Estructura inesperada del SRI.")
+                            
+                    except Exception as parse_err:
+                        raise Exception(f"Fallo al leer XML del SRI: {str(parse_err)}")
 
-                    # Preparamos el dict para notificar
                     fac_dict = dict(factura._mapping)
 
                     if resp_recepcion.get('estado') == 'RECIBIDA':
@@ -91,7 +102,6 @@ async def job_enviar_facturas():
                     else:
                         error_msg = json.dumps(resp_recepcion.get('comprobantes', resp_recepcion))
                         await db.execute(text("UPDATE invoices SET estado = 'DEVUELTA', mensajes_sri = :msg, fecha_envio_sri = NOW() WHERE id = :id"), {"msg": error_msg, "id": factura.id})
-                        # REEMBOLSO
                         await db.execute(text("UPDATE user_credits SET balance = balance + 1 WHERE emisor_id = :eid"), {"eid": factura.emisor_db_id})
                         await db.commit()
                         print(f"[SRI Job1] ⚠️ DEVUELTA: {factura.clave_acceso} | Crédito devuelto.")
@@ -99,7 +109,16 @@ async def job_enviar_facturas():
 
                 except Exception as err:
                     await db.rollback()
+                    await db.execute(
+                        text("UPDATE invoices SET retry_count = COALESCE(retry_count, 0) + 1 WHERE id = :id"), 
+                        {"id": factura.id}
+                    )
+                    await db.commit()
                     print(f"[SRI Job1] ❌ Error Recepción ({factura.clave_acceso}): {str(err)}")
+                    # 🔥 ESTO NOS DIRÁ LA LÍNEA EXACTA QUE LANZA EL ERROR "1" 🔥
+                    print("[DEBUG] --- TRACEBACK DEL ERROR ---")
+                    traceback.print_exc()
+                    print("-----------------------------------")
                     
         except Exception as e:
             print(f"[SRI Job1] ❌ Error Crítico: {str(e)}")
