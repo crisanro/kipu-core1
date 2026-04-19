@@ -133,7 +133,7 @@ async def job_autorizar_facturas():
             if not facturas:
                 return
 
-            NODE_PDF_URL = "http://localhost:3000/api/pdf"
+            NODE_PDF_URL = "http://kipu_signer_node:3000/api/pdf"
 
             for factura in facturas:
                 try:
