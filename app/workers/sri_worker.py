@@ -74,6 +74,7 @@ async def job_enviar_facturas():
                     
                     # 3. Parsear respuesta (xmltodict convierte XML a Diccionario Python)
                     json_res = xmltodict.parse(res.text)
+                    print(f"DEBUG SRI RESP: {json.dumps(json_res)}")
                     try:
                         resp_recepcion = json_res['soap:Envelope']['soap:Body']['ns2:validarComprobanteResponse']['RespuestaRecepcionComprobante']
                     except KeyError:
