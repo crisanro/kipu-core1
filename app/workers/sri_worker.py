@@ -3,7 +3,8 @@ import asyncio
 import httpx
 import xmltodict
 import json
-import uuid  # Agregado para procesar los UUID de la base de datos
+import uuid 
+from datetime import datetime
 from sqlalchemy import text
 from app.core.database import AsyncSessionLocal
 from app.services.storage_service import download_file, upload_file
@@ -162,7 +163,11 @@ async def job_autorizar_facturas():
 
                         if autorizacion.get('estado') == 'AUTORIZADO':
                             xml_autorizado = autorizacion['comprobante']
-                            fecha_auth = autorizacion['fechaAutorizacion']
+                            fecha_auth_str = autorizacion['fechaAutorizacion']
+                            
+                            # 🔥 FIX: Convertimos el string ISO del SRI a un objeto datetime de Python
+                            fecha_auth_obj = datetime.fromisoformat(fecha_auth_str)
+                            
                             xml_auth_path = f"authorized/{factura.ruc}/{factura.clave_acceso}.xml"
                             
                             upload_file('invoices', xml_auth_path, xml_autorizado.encode('utf-8'), 'text/xml')
@@ -176,7 +181,7 @@ async def job_autorizar_facturas():
                                         json={
                                             "xmlAutorizado": xml_autorizado,
                                             "emisor": {"contribuyente_especial": factura.contribuyente_especial},
-                                            "fechaAutorizacion": fecha_auth
+                                            "fechaAutorizacion": fecha_auth_str # Node sí espera string, le pasamos el original
                                         },
                                         timeout=15.0
                                     )
@@ -188,13 +193,17 @@ async def job_autorizar_facturas():
                                 try:
                                     pdf_bytes = download_file('invoices', factura.pdf_path.replace('invoices/', ''))
                                 except Exception:
-                                    pass # Se omite error silenciosamente en el fallback
+                                    pass
 
+                            # Pasamos el objeto fecha_auth_obj a la consulta SQL
                             await db.execute(text("UPDATE invoices SET estado = 'AUTORIZADO', xml_path = :path, fecha_autorizacion = :fecha WHERE id = :id"), 
-                                             {"path": f"invoices/{xml_auth_path}", "fecha": fecha_auth, "id": factura.id})
+                                             {"path": f"invoices/{xml_auth_path}", "fecha": fecha_auth_obj, "id": factura.id})
                             await db.commit()
                             
                             print(f"[SRI Job2] ✅ AUTORIZADO: {factura.clave_acceso}")
+                            
+                            # Actualizamos el diccionario con el string original por si el webhook se queja del objeto datetime
+                            fac_dict['fecha_autorizacion'] = fecha_auth_str
                             await notificar_cambio_estado(fac_dict, 'AUTORIZADO')
 
                             # Enviar Correo
