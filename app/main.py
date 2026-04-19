@@ -38,8 +38,8 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 1. Configurar y encender Workers al iniciar el servidor
-    scheduler.add_job(job_enviar_facturas, 'interval', minutes=2)
-    scheduler.add_job(job_autorizar_facturas, 'interval', minutes=3)
+    scheduler.add_job(job_enviar_facturas, 'interval', seconds=20, max_instances=1)
+    scheduler.add_job(job_autorizar_facturas, 'interval', seconds=30, max_instances=1)
     scheduler.start()
     print("⏰ Workers del SRI iniciados correctamente.")
     
