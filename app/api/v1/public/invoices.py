@@ -9,7 +9,7 @@ from sqlalchemy import text
 from pydantic import BaseModel
 
 from app.core.database import get_db
-from app.services.storage_service import minio_client 
+from app.services.storage_service import download_file
 from app.core.config import settings
 
 # 👇 Importamos TU función de seguridad real
@@ -22,28 +22,17 @@ class ConsultarFacturaRequest(BaseModel):
     captchaToken: str
     hpValue: Optional[str] = None
 
-# --- FUNCIONES HELPER ---
-def stream_minio_object(bucket_name: str, object_name: str):
-    response = minio_client.get_object(bucket_name, object_name)
-    try:
-        for data in response.stream(32 * 1024):
-            yield data
-    finally:
-        response.close()
-        response.release_conn()
-
-
 # ── Descarga PDF ──────────────────────────────────────────────────────────────
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str, 
-    # ❌ QUITAMOS EL DEPENDS DE SEGURIDAD AQUÍ PARA QUE CUALQUIERA CON EL LINK PUEDA BAJARLO
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
+        # 1. Buscar la ruta en la DB
         query = text("SELECT pdf_path FROM invoices WHERE clave_acceso = :clave")
         result = await db.execute(query, {"clave": clave_acceso})
         row = result.fetchone()
@@ -51,19 +40,22 @@ async def get_pdf(
         if not row or not row.pdf_path:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
+        # 2. Separar bucket y nombre de archivo
         parts = row.pdf_path.split('/')
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
-        # NOTA: 'inline' hace que el PDF se abra en el navegador (para leerlo ahí). 
-        # Si prefieres que se descargue a la computadora/celular directamente, cambia 'inline' por 'attachment'
+        # 3. Consumir TU servicio (esto nos devuelve los bytes puros)
+        file_bytes = download_file(bucket, object_name)
+
+        # 4. Devolver los bytes como un PDF
         headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
-        
-        return StreamingResponse(
-            stream_minio_object(bucket, object_name), 
+        return Response(
+            content=file_bytes, 
             media_type="application/pdf", 
             headers=headers
         )
+
     except Exception as e:
         print(f"Error Public PDF: {e}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
@@ -73,13 +65,13 @@ async def get_pdf(
 @router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
 async def get_xml(
     clave_acceso: str, 
-    # ❌ QUITAMOS EL DEPENDS DE SEGURIDAD AQUÍ TAMBIÉN
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
+        # 1. Buscar la ruta en la DB
         query = text("SELECT xml_path FROM invoices WHERE clave_acceso = :clave")
         result = await db.execute(query, {"clave": clave_acceso})
         row = result.fetchone()
@@ -87,18 +79,22 @@ async def get_xml(
         if not row or not row.xml_path:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
+        # 2. Separar bucket y nombre de archivo
         parts = row.xml_path.split('/')
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
-        # 'attachment' obliga sí o sí a descargar el archivo
+        # 3. Consumir TU servicio (devuelve bytes)
+        file_bytes = download_file(bucket, object_name)
+
+        # 4. Devolver los bytes forzando la descarga (attachment)
         headers = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
-        
-        return StreamingResponse(
-            stream_minio_object(bucket, object_name), 
+        return Response(
+            content=file_bytes, 
             media_type="application/xml", 
             headers=headers
         )
+
     except Exception as e:
         print(f"Error Public XML: {e}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
