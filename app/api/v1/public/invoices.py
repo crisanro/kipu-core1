@@ -22,42 +22,47 @@ class ConsultarFacturaRequest(BaseModel):
     captchaToken: str
     hpValue: Optional[str] = None
 
-# ── Descarga PDF ──────────────────────────────────────────────────────────────
+# ── Descarga PDF (VERSIÓN DEBUG) ──────────────────────────────────────────────
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str, 
     db: AsyncSession = Depends(get_db)
 ):
-    if not re.match(r"^\d{49}$", clave_acceso):
-        return JSONResponse(status_code=400, content={"error": "Clave inválida"})
-
     try:
-        # 1. Buscar la ruta en la DB
+        # 1. Buscamos en la DB
         query = text("SELECT pdf_path FROM invoices WHERE clave_acceso = :clave")
         result = await db.execute(query, {"clave": clave_acceso})
         row = result.fetchone()
 
         if not row or not row.pdf_path:
-            return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
+            return JSONResponse(status_code=404, content={"error": "Factura no encontrada en DB"})
 
-        # 2. Separar bucket y nombre de archivo
-        parts = row.pdf_path.split('/')
-        bucket = parts[0]
-        object_name = '/'.join(parts[1:])
+        # 2. Vamos a ver EXACTAMENTE qué nos devolvió la DB
+        ruta_db = row.pdf_path.strip().strip('/')
+        print(f"🔍 LO QUE HAY EN LA BD: '{ruta_db}'")
 
-        # 3. Consumir TU servicio (esto nos devuelve los bytes puros)
+        # 3. Extraemos el archivo asumiendo que SIEMPRE empieza con "invoices/"
+        if ruta_db.startswith("invoices/"):
+            # Le quitamos "invoices/" para que quede solo "1792.../clave.pdf"
+            object_name = ruta_db.replace("invoices/", "", 1) 
+        else:
+            # Por si acaso en la DB solo está guardado "1792.../clave.pdf"
+            object_name = ruta_db 
+
+        bucket = "invoices" # Forzamos el bucket
+
+        print(f"📦 BUCKET A BUSCAR: '{bucket}'")
+        print(f"📄 ARCHIVO A BUSCAR: '{object_name}'")
+
+        # 4. Consumimos tu servicio
         file_bytes = download_file(bucket, object_name)
 
-        # 4. Devolver los bytes como un PDF
         headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
-        return Response(
-            content=file_bytes, 
-            media_type="application/pdf", 
-            headers=headers
-        )
+        return Response(content=file_bytes, media_type="application/pdf", headers=headers)
 
     except Exception as e:
-        print(f"Error Public PDF: {e}")
+        # Esto nos dirá si falló MinIO o si falló la variable response
+        print(f"🚨 ERROR CRÍTICO EN DESCARGA: {repr(e)}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
 
 
