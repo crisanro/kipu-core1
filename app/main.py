@@ -24,6 +24,7 @@ from app.api.v1.app import (
 from app.api.v1.public import (
     clientes as clientes_public,
     integraciones as integraciones_public
+    invoices as invoices_public
 )
 from app.api.v1.admin import (
     clientes_n8n,
@@ -139,8 +140,9 @@ app.include_router(dashboard_app.router, prefix="/api/v1/app/dashboard", tags=["
 app.include_router(apikeys_app.router, prefix="/api/v1/app/apikeys", tags=["📱 App - API Keys"])
 
 # 2. CANAL: API Pública (API Key Auth)
-app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones", tags=["🌍 API Pública - Facturación"])
-app.include_router(clientes_public.router, prefix="/api/v1/public/clientes", tags=["🌍 API Pública - Clientes"])
+app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones", tags=["🌍 API Facturación"])
+app.include_router(invoices_public.router, prefix="/api/v1/public", tags=["🌍 API Facturación"])
+app.include_router(clientes_public.router, prefix="/api/v1/public/clientes", tags=["🌍 API Facturación"])
 
 # 3. CANAL: Admin / n8n / WhatsApp (Headers Internos)
 app.include_router(integraciones_n8n.router, prefix="/api/v1/admin", tags=["🤖 n8n Automations - Core"])
