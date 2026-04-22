@@ -23,7 +23,7 @@ from app.api.v1.app import (
 )
 from app.api.v1.public import (
     clientes as clientes_public,
-    integraciones as integraciones_public
+    integraciones as integraciones_public,
     invoices as invoices_public
 )
 from app.api.v1.admin import (
