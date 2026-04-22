@@ -11,8 +11,6 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.services.storage_service import download_file
 from app.core.config import settings
-
-# 👇 Importamos TU función de seguridad real
 from app.core.security import verify_public_origin 
 
 router = APIRouter()
@@ -22,12 +20,16 @@ class ConsultarFacturaRequest(BaseModel):
     captchaToken: str
     hpValue: Optional[str] = None
 
-# ── Descarga PDF (VERSIÓN DEBUG) ──────────────────────────────────────────────
+
+# ── Descarga PDF ──────────────────────────────────────────────────────────────
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str, 
     db: AsyncSession = Depends(get_db)
 ):
+    if not re.match(r"^\d{49}$", clave_acceso):
+        return JSONResponse(status_code=400, content={"error": "Clave inválida"})
+
     try:
         # 1. Buscamos en la DB
         query = text("SELECT pdf_path FROM invoices WHERE clave_acceso = :clave")
@@ -37,32 +39,21 @@ async def get_pdf(
         if not row or not row.pdf_path:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada en DB"})
 
-        # 2. Vamos a ver EXACTAMENTE qué nos devolvió la DB
+        # 2. Extracción segura (limpia espacios y barras accidentales)
         ruta_db = row.pdf_path.strip().strip('/')
-        print(f"🔍 LO QUE HAY EN LA BD: '{ruta_db}'")
+        parts = ruta_db.split('/')
+        bucket = parts[0]
+        object_name = '/'.join(parts[1:])
 
-        # 3. Extraemos el archivo asumiendo que SIEMPRE empieza con "invoices/"
-        if ruta_db.startswith("invoices/"):
-            # Le quitamos "invoices/" para que quede solo "1792.../clave.pdf"
-            object_name = ruta_db.replace("invoices/", "", 1) 
-        else:
-            # Por si acaso en la DB solo está guardado "1792.../clave.pdf"
-            object_name = ruta_db 
-
-        bucket = "invoices" # Forzamos el bucket
-
-        print(f"📦 BUCKET A BUSCAR: '{bucket}'")
-        print(f"📄 ARCHIVO A BUSCAR: '{object_name}'")
-
-        # 4. Consumimos tu servicio
+        # 3. Descarga desde MinIO
         file_bytes = download_file(bucket, object_name)
 
+        # 4. Retorno (inline = se abre en el navegador)
         headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
         return Response(content=file_bytes, media_type="application/pdf", headers=headers)
 
     except Exception as e:
-        # Esto nos dirá si falló MinIO o si falló la variable response
-        print(f"🚨 ERROR CRÍTICO EN DESCARGA: {repr(e)}")
+        print(f"Error Public PDF: {e}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
 
 
@@ -76,7 +67,7 @@ async def get_xml(
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
-        # 1. Buscar la ruta en la DB
+        # 1. Buscamos en la DB
         query = text("SELECT xml_path FROM invoices WHERE clave_acceso = :clave")
         result = await db.execute(query, {"clave": clave_acceso})
         row = result.fetchone()
@@ -84,21 +75,18 @@ async def get_xml(
         if not row or not row.xml_path:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
-        # 2. Separar bucket y nombre de archivo
-        parts = row.xml_path.split('/')
+        # 2. Extracción segura
+        ruta_db = row.xml_path.strip().strip('/')
+        parts = ruta_db.split('/')
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
-        # 3. Consumir TU servicio (devuelve bytes)
+        # 3. Descarga desde MinIO
         file_bytes = download_file(bucket, object_name)
 
-        # 4. Devolver los bytes forzando la descarga (attachment)
+        # 4. Retorno (attachment = fuerza descarga al equipo)
         headers = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
-        return Response(
-            content=file_bytes, 
-            media_type="application/xml", 
-            headers=headers
-        )
+        return Response(content=file_bytes, media_type="application/xml", headers=headers)
 
     except Exception as e:
         print(f"Error Public XML: {e}")
@@ -112,7 +100,7 @@ async def consultar_factura(
     request: Request,
     body: ConsultarFacturaRequest,
     x_n8n_api_key: Optional[str] = Header(None, alias="x-n8n-api-key"),
-    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
+    _auth = Depends(verify_public_origin), # <-- Seguridad activa solo aquí
     db: AsyncSession = Depends(get_db)
 ):
     try:
@@ -216,3 +204,4 @@ async def consultar_factura(
     except Exception as e:
         print(f"Error en validación o consulta: {e}")
         return JSONResponse(status_code=500, content={"error": "Error interno del servidor"})
+        
