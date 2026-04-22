@@ -37,7 +37,7 @@ def stream_minio_object(bucket_name: str, object_name: str):
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str, 
-    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
+    # ❌ QUITAMOS EL DEPENDS DE SEGURIDAD AQUÍ PARA QUE CUALQUIERA CON EL LINK PUEDA BAJARLO
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
@@ -55,7 +55,10 @@ async def get_pdf(
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
+        # NOTA: 'inline' hace que el PDF se abra en el navegador (para leerlo ahí). 
+        # Si prefieres que se descargue a la computadora/celular directamente, cambia 'inline' por 'attachment'
         headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
+        
         return StreamingResponse(
             stream_minio_object(bucket, object_name), 
             media_type="application/pdf", 
@@ -70,7 +73,7 @@ async def get_pdf(
 @router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
 async def get_xml(
     clave_acceso: str, 
-    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
+    # ❌ QUITAMOS EL DEPENDS DE SEGURIDAD AQUÍ TAMBIÉN
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
@@ -88,7 +91,9 @@ async def get_xml(
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
+        # 'attachment' obliga sí o sí a descargar el archivo
         headers = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
+        
         return StreamingResponse(
             stream_minio_object(bucket, object_name), 
             media_type="application/xml", 
