@@ -15,7 +15,7 @@ from app.core.config import settings
 # 👇 Importamos TU función de seguridad real
 from app.core.security import verify_public_origin 
 
-router = APIRouter(prefix="/public", tags=["Público"])
+router = APIRouter()
 
 # --- SCHEMAS ---
 class ConsultarFacturaRequest(BaseModel):
