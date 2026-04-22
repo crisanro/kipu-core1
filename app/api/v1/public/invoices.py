@@ -8,28 +8,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from pydantic import BaseModel
 
-# Tus imports de base de datos y config (Ajusta las rutas a tu proyecto)
 from app.core.database import get_db
-# Asumo que tienes tu cliente MinIO configurado en algún lado
 from app.services.storage_service import minio_client 
+from app.core.config import settings
 
-# Si tienes settings, importarlo (ej. from app.core.config import settings)
-# Usaré os.environ.get() para este ejemplo, pero cámbialo por tu settings.N8N_API_KEY si lo prefieres.
+# 👇 Importamos TU función de seguridad real
+from app.core.security import verify_public_origin 
 
-router = APIRouter()
-
+router = APIRouter(prefix="/public", tags=["Público"])
 
 # --- SCHEMAS ---
 class ConsultarFacturaRequest(BaseModel):
     captchaToken: str
     hpValue: Optional[str] = None
 
-
-# --- FUNCIONES HELPER PARA MINIO ---
+# --- FUNCIONES HELPER ---
 def stream_minio_object(bucket_name: str, object_name: str):
-    """Generador para leer el archivo de MinIO en trozos y no saturar la RAM"""
-    # Dependiendo de la librería de Minio que uses (minio-python o aioboto3), 
-    # esto puede ser síncrono o asíncrono. Asumimos el cliente oficial síncrono 'minio'.
     response = minio_client.get_object(bucket_name, object_name)
     try:
         for data in response.stream(32 * 1024):
@@ -43,14 +37,13 @@ def stream_minio_object(bucket_name: str, object_name: str):
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str, 
-    _auth = Depends(verify_public_auth),
+    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
-        # Usamos raw SQL (text) para mantener la misma lógica de Node.js
         query = text("SELECT pdf_path FROM invoices WHERE clave_acceso = :clave")
         result = await db.execute(query, {"clave": clave_acceso})
         row = result.fetchone()
@@ -58,21 +51,16 @@ async def get_pdf(
         if not row or not row.pdf_path:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
-        # Extraer bucket y ruta del archivo (Ej: "mi-bucket/facturas/archivo.pdf")
         parts = row.pdf_path.split('/')
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
-        headers = {
-            "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'
-        }
-        
+        headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
         return StreamingResponse(
             stream_minio_object(bucket, object_name), 
             media_type="application/pdf", 
             headers=headers
         )
-
     except Exception as e:
         print(f"Error Public PDF: {e}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
@@ -82,7 +70,7 @@ async def get_pdf(
 @router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
 async def get_xml(
     clave_acceso: str, 
-    _auth = Depends(verify_public_auth),
+    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
@@ -100,16 +88,12 @@ async def get_xml(
         bucket = parts[0]
         object_name = '/'.join(parts[1:])
 
-        headers = {
-            "Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'
-        }
-        
+        headers = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
         return StreamingResponse(
             stream_minio_object(bucket, object_name), 
             media_type="application/xml", 
             headers=headers
         )
-
     except Exception as e:
         print(f"Error Public XML: {e}")
         return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
@@ -122,28 +106,21 @@ async def consultar_factura(
     request: Request,
     body: ConsultarFacturaRequest,
     x_n8n_api_key: Optional[str] = Header(None, alias="x-n8n-api-key"),
-    _auth = Depends(verify_public_auth),
+    _auth = Depends(verify_public_origin), # 👈 Usamos tu seguridad
     db: AsyncSession = Depends(get_db)
 ):
     try:
-        # --- VALIDACIÓN DE BYPASS PARA N8N ---
-        # Usa os.getenv() o tu archivo de settings (ej: settings.N8N_API_KEY)
-        is_n8n_request = (x_n8n_api_key == os.getenv("N8N_API_KEY"))
+        is_n8n_request = (x_n8n_api_key == settings.N8N_API_KEY)
 
-        # --- CAPA 4: HONEYPOT (Solo si NO es n8n) ---
         if not is_n8n_request and body.hpValue:
             print(f"[SECURITY] Honeypot activado por IP: {request.client.host}")
             return JSONResponse(status_code=400, content={"error": "Bot detectado"})
 
-        # --- CAPA 5: VALIDACIÓN DE FORMATO ---
         if not re.match(r"^\d{49}$", clave_acceso):
             return JSONResponse(status_code=400, content={"error": "Clave de acceso inválida"})
 
-        # --- CAPA 2: VALIDACIÓN TURNSTILE (Omitir si es n8n) ---
         if not is_n8n_request:
-            turnstile_secret = os.getenv("TURNSTILE_SECRET_KEY")
-            
-            # Llamada asíncrona a Cloudflare usando httpx
+            turnstile_secret = settings.TURNSTILE_SECRET_KEY
             async with httpx.AsyncClient() as client:
                 cf_resp = await client.post(
                     "https://challenges.cloudflare.com/turnstile/v0/siteverify",
@@ -154,14 +131,12 @@ async def consultar_factura(
                     }
                 )
                 cf_data = cf_resp.json()
-                
                 if not cf_data.get("success"):
                     return JSONResponse(status_code=403, content={
                         "success": False,
                         "mensaje_usuario": "La verificación de seguridad ha fallado."
                     })
 
-        # --- LOGICA DE BASE DE DATOS ---
         query = text("""
             SELECT 
                 i.clave_acceso, i.secuencial, i.fecha_emision, i.estado, i.mensajes_sri,
@@ -182,11 +157,9 @@ async def consultar_factura(
                 "mensaje_usuario": "La factura no existe en nuestro sistema. Verifique la clave de acceso."
             })
 
-        # Convertimos la tupla de SQLAlchemy a un diccionario para acceder fácil
         f = factura._mapping
         estado = f["estado"]
 
-        # --- RESPUESTA SEGÚN ESTADO ---
         if estado == 'AUTORIZADO':
             return {
                 "success": True,
@@ -196,7 +169,6 @@ async def consultar_factura(
                         "emisor": f["emisor_nombre"],
                         "ruc": f["emisor_ruc"],
                         "nro": f["secuencial"],
-                        # FastAPI/Pydantic serializa datetime automáticamente, o puedes forzar string:
                         "fecha": str(f["fecha_emision"]) 
                     },
                     "totales": {"total": float(f["importe_total"])},
