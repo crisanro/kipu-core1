@@ -1,3 +1,4 @@
+#app/api/v1/app/auth.py
 import os
 import random
 import json
@@ -9,7 +10,7 @@ from firebase_admin import auth
 
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
-from app.services.storage_service import minio_client, delete_file, delete_minio_folder
+from app.services.storage_service import  delete_folder
 from app.services.mail_service import mail_service
 from app.schemas.seguridad import ResetPasswordRequest, VerifyPinRequest, RequestPinSchema # Asegúrate de tener este schema
 
@@ -18,16 +19,61 @@ router = APIRouter()
 # --- ENDPOINTS DE CORREO Y CUENTA ---
 
 @router.post("/send-verification")
-async def send_verification(auth_data: dict = Depends(verify_firebase_token)):
+async def send_verification(
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
     email = auth_data["email"]
-    user_record = auth.get_user_by_email(email)
-    if user_record.email_verified:
-        raise HTTPException(status_code=400, detail="El correo ya fue verificado.")
 
-    link = auth.generate_email_verification_link(email, auth.ActionCodeSettings(url="https://kipu.ec/login", handle_code_in_app=False))
-    html = f"<h2>Bienvenido 👋</h2><p>Haz clic para verificar tu cuenta:</p><a href='{link}'>Verificar cuenta</a>"
-    await mail_service.send_mail(to=email, subject="Verifica tu cuenta", html_content=html)
-    return {"ok": True}
+    # 1. Anti-spam: máximo 1 solicitud por minuto
+    res = await db.execute(text("""
+        SELECT last_sent FROM email_rate_limits
+        WHERE email = :email AND last_sent > NOW() - INTERVAL '1 minute'
+    """), {"email": email})
+
+    if res.fetchone():
+        raise HTTPException(
+            status_code=429,
+            detail="Ya enviamos un correo. Espera 1 minuto antes de solicitar otro."
+        )
+
+    # 2. Verificar estado en Firebase
+    try:
+        user_record = auth.get_user_by_email(email)
+        if user_record.email_verified:
+            raise HTTPException(status_code=400, detail="El correo ya fue verificado.")
+    except auth.UserNotFoundError:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado.")
+
+    # 3. Registrar intento ANTES de enviar
+    await db.execute(text("""
+        INSERT INTO email_rate_limits (email, last_sent)
+        VALUES (:email, NOW())
+        ON CONFLICT (email) DO UPDATE SET last_sent = NOW()
+    """), {"email": email})
+    await db.commit()
+
+    # 4. Generar y enviar
+    link = auth.generate_email_verification_link(
+        email,
+        auth.ActionCodeSettings(url="https://kipu.ec/login", handle_code_in_app=False)
+    )
+    html = f"""
+        <h2>Bienvenido a Kipu 👋</h2>
+        <p>Haz clic para verificar tu cuenta:</p>
+        <a href='{link}' style='background:#4F46E5;color:white;padding:12px 24px;
+        text-decoration:none;border-radius:6px;display:inline-block;'>
+        Verificar cuenta</a>
+        <p style='color:#666;font-size:12px;margin-top:16px;'>
+        Si no solicitaste esto, ignora este correo.</p>
+    """
+    await mail_service.send_mail(
+        to=email,
+        subject="Verifica tu cuenta en Kipu",
+        html_content=html
+    )
+
+    return {"ok": True, "mensaje": "Correo de verificación enviado."}
 
 
 @router.post("/reset")
@@ -93,10 +139,7 @@ async def nuke_account(auth_data: dict = Depends(verify_firebase_token), db: Asy
                 print(f"🧹 Iniciando barrido total en MinIO para el RUC: {ruc}")
                 
                 # 2. ELIMINAR CARPETAS EN MINIO (P12, Facturas, Firmadas, Autorizadas)
-                delete_minio_folder("certificates", f"{ruc}/")
-                delete_minio_folder("invoices", f"{ruc}/")
-                delete_minio_folder("invoices", f"authorized/{ruc}/")
-                delete_minio_folder("invoices", f"signed/{ruc}/")
+                delete_folder(f"{ruc}/")
 
         # 3. EL GRAN BORRADO EN DB (REACCIÓN EN CADENA)
         # Al borrar el profile, SQL borra Emisor -> Invoices -> Credits -> Transactions automáticamente.

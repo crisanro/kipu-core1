@@ -1,3 +1,4 @@
+#app/api/v1/app/estructura.py
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -6,8 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 # Asegúrate de que estas rutas de importación coincidan con tu proyecto
-from app.core.database import get_db
-from app.core.security import verify_firebase_token
+from app.core.security import verify_firebase_token, get_tenant_db
 from app.schemas.estructura import EstablecimientoCreate, PuntoEmisionCreate, EstablecimientoUpdate, PuntoEmisionUpdate
 
 
@@ -17,7 +17,7 @@ router = APIRouter()
 @router.get("/", summary="Listar establecimientos y puntos de emisión")
 async def listar_estructura(
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """Retorna la estructura jerárquica del emisor logueado."""
     emisor_id = auth_data["emisor_id"]
@@ -64,7 +64,7 @@ async def listar_estructura(
 async def crear_establecimiento(
     data: EstablecimientoCreate, 
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """Registra un establecimiento. El código se normaliza a 3 dígitos."""
     emisor_id = auth_data["emisor_id"]
@@ -109,7 +109,7 @@ async def editar_establecimiento(
     estab_id: int,
     data: EstablecimientoUpdate, 
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """Actualiza los datos (nombre, dirección, estado) de un establecimiento."""
     emisor_id = auth_data["emisor_id"]
@@ -142,7 +142,7 @@ async def editar_establecimiento(
 async def crear_punto_emision(
     data: PuntoEmisionCreate, 
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """Registra un punto de emisión dentro de un establecimiento existente."""
     emisor_id = auth_data["emisor_id"]
@@ -160,12 +160,15 @@ async def crear_punto_emision(
 
         nombre_punto = data.nombre or f"Punto {data.codigo}"
         query_insert = text("""
-            INSERT INTO puntos_emision (establecimiento_id, codigo, secuencial_actual, nombre, is_active)
-            VALUES (:estab_id, :cod, 1, :nom, true) 
+            INSERT INTO puntos_emision (establecimiento_id, emisor_id, codigo, secuencial_actual, nombre, is_active)
+            VALUES (:estab_id, :eid, :cod, 1, :nom, true) 
             RETURNING id, establecimiento_id, codigo, secuencial_actual, nombre, is_active
         """)
         res = await db.execute(query_insert, {
-            "estab_id": estab.id, "cod": str(data.codigo).zfill(3), "nom": nombre_punto
+            "estab_id": estab.id,
+            "eid":      emisor_id,
+            "cod":      str(data.codigo).zfill(3),
+            "nom":      nombre_punto
         })
         nuevo_punto = res.fetchone()
         await db.commit()
@@ -187,7 +190,7 @@ async def editar_punto_emision(
     punto_id: int,
     data: PuntoEmisionUpdate, 
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """Actualiza el nombre o el estado de un punto de emisión."""
     emisor_id = auth_data["emisor_id"]

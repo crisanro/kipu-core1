@@ -6,158 +6,163 @@ import pytz
 
 
 async def obtener_dashboard_core(
-    emisor_id: int | None, 
-    email_usuario: str, 
-    fecha_inicio: date, 
-    fecha_fin: date, 
+    emisor_id: int | None,
+    email_usuario: str,
+    fecha_inicio: date,
+    fecha_fin: date,
     db: AsyncSession
 ):
     try:
-        # 1. Perfil y Emisor (Siempre se ejecuta)
+        # 1. Perfil y Emisor (siempre en public)
         query_emisor = text("""
-            SELECT e.ruc, e.p12_path, e.p12_expiration, e.ambiente, c.balance, p.whatsapp_number 
+            SELECT e.ruc, e.p12_path, e.p12_expiration, e.ambiente, 
+                   c.balance_emision, p.whatsapp_number 
             FROM profiles p
             LEFT JOIN emisores e ON p.emisor_id = e.id 
             LEFT JOIN user_credits c ON c.emisor_id = e.id 
             WHERE LOWER(p.email) = LOWER(:email)
         """)
         res_emisor = await db.execute(query_emisor, {"email": email_usuario})
-        # Usamos .mappings() para acceder por nombre de columna fácilmente
         row_basic = res_emisor.mappings().fetchone()
 
         if not row_basic:
             data_basic = {
-                "ruc": None, "p12_expiration": None, "ambiente": None, 
-                "p12_path": None, "balance": 0, "whatsapp_number": None
+                "ruc": None, "p12_expiration": None, "ambiente": None,
+                "p12_path": None, "balance_emision": 0, "whatsapp_number": None
             }
         else:
             data_basic = dict(row_basic)
 
-        # Variables por defecto
+        # Valores por defecto
         health_stats = {"total_estab": 0, "total_puntos": 0}
         resumen = {
-            "total_facturas": 0, "subtotal_iva": 0.0, "subtotal_0": 0.0, 
+            "total_facturas": 0, "subtotal_iva": 0.0, "subtotal_0": 0.0,
             "valor_iva": 0.0, "importe_total": 0.0
         }
         facturas_map = []
         total_keys = 0
 
-        # 2. Ejecutamos el resto SOLO si ya completó el onboarding
+        # 2. Solo si tiene emisor_id → cargar datos del tenant
         if emisor_id:
+            # Setear search_path al tenant correcto
+            res_tenant = await db.execute(
+                text("SELECT tenant_schema FROM public.emisor_tenant_map WHERE emisor_id = :eid"),
+                {"eid": emisor_id}
+            )
+            tenant_row = res_tenant.fetchone()
+            if tenant_row:
+                await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
+
             # Infraestructura
-            query_infra = text("""
-                SELECT 
+            res_infra = await db.execute(text("""
+                SELECT
                     (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = :eid) as total_estab,
-                    (SELECT COUNT(*) FROM puntos_emision p 
-                     JOIN establecimientos e ON p.establecimiento_id = e.id WHERE e.emisor_id = :eid) as total_puntos
-            """)
-            res_infra = await db.execute(query_infra, {"eid": emisor_id})
+                    (SELECT COUNT(*) FROM puntos_emision p
+                     JOIN establecimientos e ON p.establecimiento_id = e.id
+                     WHERE e.emisor_id = :eid) as total_puntos
+            """), {"eid": emisor_id})
             health_stats = dict(res_infra.mappings().fetchone())
 
             # Resumen financiero
-            query_resumen = text("""
-                SELECT COUNT(id) as total_facturas, 
+            res_resumen = await db.execute(text("""
+                SELECT COUNT(id) as total_facturas,
                        COALESCE(SUM(subtotal_iva), 0) as subtotal_iva,
-                       COALESCE(SUM(subtotal_0), 0) as subtotal_0, 
+                       COALESCE(SUM(subtotal_0), 0) as subtotal_0,
                        COALESCE(SUM(valor_iva), 0) as valor_iva,
                        COALESCE(SUM(importe_total), 0) as importe_total
-                FROM invoices 
+                FROM invoices_emitidas
                 WHERE emisor_id = :eid AND fecha_emision BETWEEN :fini AND :ffin
-            """)
-            res_resumen = await db.execute(query_resumen, {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
+            """), {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
             resumen = dict(res_resumen.mappings().fetchone())
 
-            # Listado de facturas (JOIN con establecimientos y puntos)
-            query_facturas = text("""
-                SELECT f.id, f.clave_acceso, e.codigo as estab, p.codigo as punto, f.secuencial, f.estado, 
-                       f.identificacion_comprador, f.razon_social_comprador, f.subtotal_iva,
-                       f.subtotal_0, f.valor_iva, f.importe_total, f.fecha_emision
-                FROM invoices f
+            # Facturas
+            res_facturas = await db.execute(text("""
+                SELECT f.id, f.clave_acceso, e.codigo as estab, p.codigo as punto,
+                       f.secuencial, f.estado, f.identificacion_comprador,
+                       f.razon_social_comprador, f.subtotal_iva, f.subtotal_0,
+                       f.valor_iva, f.importe_total, f.fecha_emision
+                FROM invoices_emitidas f
                 JOIN puntos_emision p ON f.punto_emision_id = p.id
                 JOIN establecimientos e ON p.establecimiento_id = e.id
                 WHERE f.emisor_id = :eid AND f.fecha_emision BETWEEN :fini AND :ffin
                 ORDER BY f.created_at DESC LIMIT 50
-            """)
-            res_facturas = await db.execute(query_facturas, {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
-            
-            # Mapeo inmediato de facturas
+            """), {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
+
             for f in res_facturas.mappings():
                 facturas_map.append({
-                    "id": str(f["id"]),
-                    "clave_acceso": f["clave_acceso"],
-                    "numero": f"{f['estab']}-{f['punto']}-{f['secuencial']}",
+                    "id":             str(f["id"]),
+                    "clave_acceso":   f["clave_acceso"],
+                    "numero":         f"{f['estab']}-{f['punto']}-{f['secuencial']}",
                     "cliente_nombre": f["razon_social_comprador"],
-                    "cliente_id": f["identificacion_comprador"],
-                    "subtotal_15": float(f["subtotal_iva"]),
-                    "subtotal_0": float(f["subtotal_0"]),
-                    "iva": float(f["valor_iva"]),
-                    "total": float(f["importe_total"]),
-                    "estado": f["estado"],
-                    "fecha": f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"])
+                    "cliente_id":     f["identificacion_comprador"],
+                    "subtotal_15":    float(f["subtotal_iva"]),
+                    "subtotal_0":     float(f["subtotal_0"]),
+                    "iva":            float(f["valor_iva"]),
+                    "total":          float(f["importe_total"]),
+                    "estado":         f["estado"],
+                    "fecha":          f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"])
                 })
 
             # API Keys
-            query_keys = text("SELECT COUNT(*) FROM api_keys WHERE emisor_id = :eid AND revoked = false")
-            res_keys = await db.execute(query_keys, {"eid": emisor_id})
+            res_keys = await db.execute(
+                text("SELECT COUNT(*) FROM public.api_keys WHERE emisor_id = :eid AND revoked = false"),
+                {"eid": emisor_id}
+            )
             total_keys = res_keys.scalar() or 0
 
-        # --- Lógica de validación de firma ---
-        tz = pytz.timezone('America/Guayaquil')
-        # Usamos date para comparar con p12_expiration si es tipo DATE en Postgres
-        hoy = datetime.now(tz).date() 
-        
+        # 3. Firma
+        tz         = pytz.timezone('America/Guayaquil')
+        hoy        = datetime.now(tz).date()
         expiracion = data_basic.get("p12_expiration")
-        # Si la DB devuelve datetime, convertimos a date para comparar manzanas con manzanas
         if isinstance(expiracion, datetime):
             expiracion = expiracion.date()
 
         firma_vigente = False
-        firma_alerta = None if emisor_id else "Configuración inicial pendiente"
+        firma_alerta  = None if emisor_id else "Configuración inicial pendiente"
 
         if expiracion:
-            firma_vigente = expiracion > hoy
             dias_restantes = (expiracion - hoy).days
-
+            firma_vigente  = dias_restantes > 0
+            fecha_fmt      = expiracion.strftime("%d/%m/%Y")
             if dias_restantes <= 0:
-                firma_alerta = "Firma caducada"
-                firma_vigente = False # Forzamos por seguridad
+                firma_alerta  = "Firma caducada"
+                firma_vigente = False
             elif dias_restantes <= 30:
-                firma_alerta = f"Firma próxima a caducar ({dias_restantes} días)"
+                firma_alerta  = f"Firma próxima a caducar ({dias_restantes} días)"
 
+        # 4. Respuesta — siempre la misma estructura
         return {
             "ok": True,
             "data": {
                 "health": {
-                    "ruc": bool(data_basic.get("ruc")),
-                    "ambiente_produccion": data_basic.get("ambiente") == 2,
-                    "firma_configurada": bool(data_basic.get("p12_path")),
-                    "firma_vigente": firma_vigente,
-                    "firma_alerta": firma_alerta,
+                    "ruc":                           bool(data_basic.get("ruc")),
+                    "ambiente_produccion":           data_basic.get("ambiente") == 2,
+                    "firma_configurada":             bool(data_basic.get("p12_path")),
+                    "firma_vigente":                 firma_vigente,
+                    "firma_alerta":                  firma_alerta,
                     "establecimientos_configurados": int(health_stats["total_estab"]) > 0,
-                    "puntos_emision_configurados": int(health_stats["total_puntos"]) > 0,
-                    "creditos_disponibles": data_basic.get("balance") or 0,
-                    "usuario_nuevo": not emisor_id,
-                    "tiene_api_key": total_keys > 0,
-                    "whatsapp_vinculado": bool(data_basic.get("whatsapp_number")),
-                    "whatsapp_numero": data_basic.get("whatsapp_number")
+                    "puntos_emision_configurados":   int(health_stats["total_puntos"]) > 0,
+                    "creditos_disponibles":          data_basic.get("balance_emision") or 0,
+                    "usuario_nuevo":                 not emisor_id,
+                    "tiene_api_key":                 total_keys > 0,
+                    "whatsapp_vinculado":            bool(data_basic.get("whatsapp_number")),
+                    "whatsapp_numero":               data_basic.get("whatsapp_number")
                 },
                 "resumen": {
                     "total_facturas": int(resumen["total_facturas"]),
-                    "subtotal_iva": float(resumen["subtotal_iva"]),
-                    "subtotal_0": float(resumen["subtotal_0"]),
-                    "valor_iva": float(resumen["valor_iva"]),
-                    "importe_total": float(resumen["importe_total"])
+                    "subtotal_iva":   float(resumen["subtotal_iva"]),
+                    "subtotal_0":     float(resumen["subtotal_0"]),
+                    "valor_iva":      float(resumen["valor_iva"]),
+                    "importe_total":  float(resumen["importe_total"])
                 },
                 "facturas": facturas_map
             }
         }
 
     except Exception as e:
-        # Importante: imprimir el error completo para debuggear
         import traceback
         traceback.print_exc()
-        return {"ok": False, "error": f"Error interno: {str(e)}"}
-    
+        return {"ok": False, "error": f"Error interno: {str(e)}"}   
 
 async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: AsyncSession):
     try:
@@ -189,7 +194,7 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
                 COALESCE(c.email, i.email_comprador) AS email_comprador,
                 c.telefono AS telefono_comprador
                 
-            FROM invoices i
+            FROM invoices_emitidas i
             LEFT JOIN clientes_emisor c ON i.cliente_emisor_id = c.id
             LEFT JOIN puntos_emision pe ON i.punto_emision_id = pe.id
             LEFT JOIN establecimientos est ON pe.establecimiento_id = est.id

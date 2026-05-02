@@ -1,5 +1,5 @@
-version: '3.8'
-
+version: "3.8"
+ 
 services:
   api-core:
     build: .
@@ -8,13 +8,27 @@ services:
       - "8002:8000"
     env_file:
       - .env
-    # Esto permite que el código se actualice en el contenedor al editarlo (solo para desarrollo)
     volumes:
       - .:/app
     restart: always
-    networks:          # ← mismo nivel que ports, volumes, etc.
+    depends_on:
+      - redis
+    networks:
       - red_infraestructura
-
+ 
+  redis:
+    image: redis:7-alpine
+    container_name: kipu_redis
+    restart: always
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    networks:
+      - red_infraestructura
+ 
 networks:
   red_infraestructura:
     external: true

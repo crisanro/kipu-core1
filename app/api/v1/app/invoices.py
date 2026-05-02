@@ -1,7 +1,7 @@
+#app/api/v1/app/invoices.py
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import get_db
-from app.core.security import verify_firebase_token
+from app.core.security import verify_firebase_token, get_tenant_db
 from app.schemas.factura import FacturaCreate
 from app.utils.sri_service import emitir_factura_core
 from app.services.invoice_service import obtener_historial_core
@@ -12,7 +12,7 @@ router = APIRouter()
 async def emitir_factura_app(
     factura_data: FacturaCreate, 
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """
     Genera, firma, almacena y registra una factura electrónica en formato SRI. 
@@ -24,7 +24,7 @@ async def emitir_factura_app(
 @router.get("/history", summary="Obtener historial de facturas")
 async def historial_facturas(
     auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """
     Retorna el listado de las últimas 50 facturas emitidas por el emisor, 

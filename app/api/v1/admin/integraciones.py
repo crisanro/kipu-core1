@@ -1,3 +1,4 @@
+#app/api/v1/admin/integraciones.py
 import random
 from fastapi import APIRouter, Depends, Query, Body, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,9 +97,21 @@ async def admin_check_status(
 # 👇 LA JOYA DE LA CORONA: EMISIÓN VÍA WHATSAPP
 @router.post("/invoice-whatsapp", summary="Emitir factura vía WhatsApp (n8n)")
 async def admin_invoice_whatsapp(
-    factura_data: dict = Body(...), # Aquí el body puede ser cualquier dict por ahora
-    auth: dict = Depends(verify_whatsapp_service), # <--- Aquí extrae el emisor_id del número!
+    factura_data: dict = Body(...),
+    auth: dict = Depends(verify_whatsapp_service),
     db: AsyncSession = Depends(get_db)
 ):
-    # Consumimos el servicio "Core" de facturación que creaste antes
-    return await emitir_factura_core(factura_data, auth["emisor_id"], db)
+    emisor_id = auth["emisor_id"]
+
+    res_tenant = await db.execute(text("""
+        SELECT tenant_schema FROM public.emisor_tenant_map
+        WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    tenant_row = res_tenant.fetchone()
+
+    if not tenant_row:
+        raise HTTPException(status_code=500, detail="Tenant no encontrado.")
+
+    await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
+
+    return await emitir_factura_core(factura_data, emisor_id, db)

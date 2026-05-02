@@ -1,133 +1,177 @@
+# app/utils/sri_service.py
 import json
 import base64
 import httpx
 import asyncio
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from sqlalchemy import text, select
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from app.schemas.cliente import ClienteCreate
 from app.services.cliente_service import crear_cliente_core
 from app.utils.calculadora import calcular_totales_e_impuestos
 from app.utils.crypto import generar_clave_acceso, decrypt_password
-from app.services.storage_service import upload_file, download_file
+from app.services.storage_service import upload_file, download_file, delete_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
+from app.core.database import get_redis
 import pytz
 
-# URLs de los Web Services del SRI
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+
 URLS_SRI = {
-    "1": { # Pruebas
-        "recepcion": "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
+    "1": {  # Pruebas
+        "recepcion":    "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
         "autorizacion": "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
     },
-    "2": { # Producción
-        "recepcion": "https://cel.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
+    "2": {  # Producción
+        "recepcion":    "https://cel.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
         "autorizacion": "https://cel.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
     }
 }
 
-# ⚠️ Cambia esta URL si tu microservicio de Node corre en otro host/puerto
-NODE_SIGNER_URL = "http://kipu_signer_node:3000/api/firmar"
+NODE_SIGNER_URL       = "http://kipu_signer_node:3000/api/firmar"
+NODE_PDF_URL          = "http://kipu_signer_node:3000/api/pdf"
+SEMAFORO_KEY          = "kipu:semaforo:facturas_activas"
+QUEUE_FACTURAS        = "kipu:queue:facturas_sri"
+MAX_FACTURAS_SIMULTANEAS = 10
+
+
+# =============================================================================
+# HELPERS DE SEMÁFORO Y COLA
+# =============================================================================
+
+async def semaforo_adquirir(redis) -> bool:
+    """
+    Intenta adquirir un slot de procesamiento.
+    Retorna True si hay capacidad, False si el servidor está saturado.
+    """
+    activas = await redis.incr(SEMAFORO_KEY)
+    if activas > MAX_FACTURAS_SIMULTANEAS:
+        await redis.decr(SEMAFORO_KEY)
+        return False
+    await redis.expire(SEMAFORO_KEY, 60)  # auto-expirar por si un request muere
+    return True
+
+
+async def semaforo_liberar(redis) -> None:
+    """Libera el slot al terminar el procesamiento."""
+    await redis.decr(SEMAFORO_KEY)
+
+
+async def queue_push(redis, factura_id: str, emisor_id: int, xml_path: str, ambiente: int) -> None:
+    """Encola una factura para ser procesada por el worker del SRI."""
+    payload = json.dumps({
+        "factura_id": factura_id,
+        "emisor_id":  emisor_id,
+        "xml_path":   xml_path,
+        "ambiente":   ambiente,
+        "retries":    0,
+        "queued_at":  datetime.utcnow().isoformat()
+    })
+    await redis.rpush(QUEUE_FACTURAS, payload)
+
+
+# =============================================================================
+# FUNCIÓN PRINCIPAL
+# =============================================================================
 
 async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSession):
+
     if not factura_data.get("establecimiento") or not factura_data.get("punto_emision"):
         raise HTTPException(status_code=400, detail="Los campos 'establecimiento' y 'punto_emision' son requeridos.")
 
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 0: Resolución de Identidad del Cliente (Prioridad ID)
+    # BLOQUE 0: Resolución de identidad del cliente
     # ─────────────────────────────────────────────────────────────
-    cliente_id = factura_data.get("cliente_id")
+    cliente_id  = factura_data.get("cliente_id")
     cliente_obj = factura_data.get("cliente")
-    
+
     cliente_emisor_id = None
     cliente_final = {
         "identificacion": None,
-        "razon_social": None,
-        "email": None,
-        "direccion": "S/N",
-        "telefono": "",
-        "tipo_id": "05"
+        "razon_social":   None,
+        "email":          None,
+        "direccion":      "S/N",
+        "telefono":       "",
+        "tipo_id":        "05"
     }
 
-    # 1. PRIORIDAD ABSOLUTA: cliente_id (si existe y no es "")
     if cliente_id and str(cliente_id).strip() != "":
-        query_cli = text("""
-            SELECT id, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono 
-            FROM clientes_emisor 
+        res_cli = await db.execute(text("""
+            SELECT id, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
+            FROM clientes_emisor
             WHERE id = :cid AND emisor_id = :eid
-        """)
-        res_cli = await db.execute(query_cli, {"cid": cliente_id, "eid": emisor_id})
+        """), {"cid": cliente_id, "eid": emisor_id})
         row_cli = res_cli.fetchone()
-        
+
         if row_cli:
-            cliente_emisor_id = row_cli.id
+            cliente_emisor_id             = row_cli.id
             cliente_final["identificacion"] = row_cli.identificacion
-            cliente_final["razon_social"] = row_cli.razon_social
-            cliente_final["email"] = row_cli.email
-            cliente_final["direccion"] = row_cli.direccion
-            cliente_final["telefono"] = row_cli.telefono
-            cliente_final["tipo_id"] = row_cli.tipo_identificacion_sri
+            cliente_final["razon_social"]   = row_cli.razon_social
+            cliente_final["email"]          = row_cli.email
+            cliente_final["direccion"]      = row_cli.direccion
+            cliente_final["telefono"]       = row_cli.telefono
+            cliente_final["tipo_id"]        = row_cli.tipo_identificacion_sri
         else:
             raise HTTPException(status_code=404, detail="El 'cliente_id' proporcionado no existe.")
 
-    # 2. SEGUNDA OPCIÓN: Si no hubo ID, usar el objeto "cliente"
     elif cliente_obj:
         cliente_final["identificacion"] = cliente_obj.get("identificacion")
-        cliente_final["razon_social"] = cliente_obj.get("razonSocial") or cliente_obj.get("nombre")
-        cliente_final["email"] = cliente_obj.get("email")
-        cliente_final["direccion"] = cliente_obj.get("direccion", "S/N")
-        cliente_final["telefono"] = cliente_obj.get("telefono", "")
-        cliente_final["tipo_id"] = cliente_obj.get("tipoId") or cliente_obj.get("tipo_id") or "05"
+        cliente_final["razon_social"]   = cliente_obj.get("razonSocial") or cliente_obj.get("nombre")
+        cliente_final["email"]          = cliente_obj.get("email")
+        cliente_final["direccion"]      = cliente_obj.get("direccion", "S/N")
+        cliente_final["telefono"]       = cliente_obj.get("telefono", "")
+        cliente_final["tipo_id"]        = cliente_obj.get("tipoId") or cliente_obj.get("tipo_id") or "05"
 
-        # Intentamos registrarlo para que en la próxima ya tenga ID
         try:
             nuevo_cliente = ClienteCreate(
-                tipo_identificacion_sri=cliente_final["tipo_id"],
-                identificacion=cliente_final["identificacion"],
-                razon_social=cliente_final["razon_social"],
-                direccion=cliente_final["direccion"],
-                email=cliente_final["email"] or "",
-                telefono=cliente_final["telefono"] or ""
+                tipo_identificacion_sri = cliente_final["tipo_id"],
+                identificacion          = cliente_final["identificacion"],
+                razon_social            = cliente_final["razon_social"],
+                direccion               = cliente_final["direccion"],
+                email                   = cliente_final["email"] or "",
+                telefono                = cliente_final["telefono"] or ""
             )
-            res_creacion = await crear_cliente_core(emisor_id, nuevo_cliente, db, lanzar_error_si_existe=False)
+            res_creacion      = await crear_cliente_core(emisor_id, nuevo_cliente, db, lanzar_error_si_existe=False)
             cliente_emisor_id = res_creacion.get("uid")
         except Exception as e_cli:
-            print(f"⚠️ Nota: Cliente no persistido, se usará modo invitado: {e_cli}")
+            print(f"⚠️ Cliente no persistido, modo invitado: {e_cli}")
 
-    # 3. VALIDACIÓN FINAL: Si no hay identificación tras ambos pasos, error.
     if not cliente_final["identificacion"]:
         raise HTTPException(status_code=400, detail="Debe proporcionar un 'cliente_id' válido o un objeto 'cliente' completo.")
 
-    
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 1: Base de Datos y Generación de Datos (Transacción)
+    # BLOQUE 1: DB — validar créditos, obtener punto, generar datos
     # ─────────────────────────────────────────────────────────────
     try:
-        # 1. Obtener emisor y bloquear créditos (FOR UPDATE)
-        query_emisor = text("""
-            SELECT e.*, c.balance 
-            FROM emisores e 
-            JOIN user_credits c ON e.id = c.emisor_id 
+        # 1. Obtener emisor y bloquear créditos (FOR UPDATE evita race conditions)
+        res_emisor = await db.execute(text("""
+            SELECT e.*, c.balance_emision
+            FROM emisores e
+            JOIN user_credits c ON e.id = c.emisor_id
             WHERE e.id = :emisor_id FOR UPDATE
-        """)
-        res_emisor = await db.execute(query_emisor, {"emisor_id": emisor_id})
+        """), {"emisor_id": emisor_id})
         emisor = res_emisor.fetchone()
 
-        if not emisor or emisor.balance <= 0:
+        if not emisor or emisor.balance_emision <= 0:
             raise HTTPException(status_code=402, detail="Créditos insuficientes.")
 
         # 2. Obtener punto de emisión
-        query_pto = text("""
-            SELECT p.id as punto_id, p.codigo as punto_codigo, e.codigo as estab_codigo, 
-                   e.direccion as direccion_establecimiento, e.nombre_comercial as nombre_establecimiento
+        res_pto = await db.execute(text("""
+            SELECT p.id as punto_id, p.codigo as punto_codigo,
+                   e.codigo as estab_codigo,
+                   e.direccion as direccion_establecimiento,
+                   e.nombre_comercial as nombre_establecimiento
             FROM puntos_emision p
             JOIN establecimientos e ON p.establecimiento_id = e.id
             WHERE e.codigo = :estab AND p.codigo = :pto AND e.emisor_id = :emisor_id
-        """)
-        res_pto = await db.execute(query_pto, {
-            "estab": str(factura_data["establecimiento"]).zfill(3),
-            "pto": str(factura_data["punto_emision"]).zfill(3),
+        """), {
+            "estab":     str(factura_data["establecimiento"]).zfill(3),
+            "pto":       str(factura_data["punto_emision"]).zfill(3),
             "emisor_id": emisor_id
         })
         punto_emision = res_pto.fetchone()
@@ -135,64 +179,65 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         if not punto_emision:
             raise HTTPException(status_code=404, detail="Establecimiento y Punto no existen o no te pertenecen.")
 
-        # 3. Generar secuencial atómico
-        res_sec = await db.execute(text("SELECT generar_secuencial(:pto_id)"), {"pto_id": punto_emision.punto_id})
-        secuencial_raw = res_sec.scalar()
-        secuencial = str(secuencial_raw).zfill(9)
+        # 3. Secuencial atómico
+        res_sec    = await db.execute(text("SELECT generar_secuencial(:pto_id)"), {"pto_id": punto_emision.punto_id})
+        secuencial = str(res_sec.scalar()).zfill(9)
 
-        # 4. Fechas y Cálculos
-        tz = pytz.timezone('America/Guayaquil')
-        ahora_ecuador = datetime.now(tz)
+        # 4. Fechas y cálculos
+        tz              = pytz.timezone('America/Guayaquil')
+        ahora_ecuador   = datetime.now(tz)
         fecha_formato_clave = ahora_ecuador.strftime('%Y-%m-%d')
-        fecha_formato_sri = ahora_ecuador.strftime('%d/%m/%Y')
+        fecha_formato_sri   = ahora_ecuador.strftime('%d/%m/%Y')
 
-        calculos = calcular_totales_e_impuestos(factura_data.get("items", []))
-        
+        calculos     = calcular_totales_e_impuestos(factura_data.get("items", []))
         clave_acceso = generar_clave_acceso(
-            fecha=fecha_formato_clave, tipo_comprobante='01', ruc=emisor.ruc, 
-            ambiente=emisor.ambiente, serie=f"{punto_emision.estab_codigo}{punto_emision.punto_codigo}", 
-            secuencial=secuencial
+            fecha             = fecha_formato_clave,
+            tipo_comprobante  = '01',
+            ruc               = emisor.ruc,
+            ambiente          = emisor.ambiente,
+            serie             = f"{punto_emision.estab_codigo}{punto_emision.punto_codigo}",
+            secuencial        = secuencial
         )
 
         nombre_comercial_final = punto_emision.nombre_establecimiento or emisor.nombre_comercial or emisor.razon_social
-        direccion_est_final = punto_emision.direccion_establecimiento or emisor.direccion_matriz
-        
-        # 5. Construir objeto XML para Node.js (Usando cliente_final)
+        direccion_est_final    = punto_emision.direccion_establecimiento or emisor.direccion_matriz
+
+        # 5. Construir XML object para Node.js
         xml_obj = {
             "factura": {
-                "@id": "comprobante",
+                "@id":      "comprobante",
                 "@version": "1.1.0",
                 "infoTributaria": {
-                    "ambiente": emisor.ambiente,
-                    "tipoEmision": "1",
-                    "razonSocial": emisor.razon_social,
+                    "ambiente":        emisor.ambiente,
+                    "tipoEmision":     "1",
+                    "razonSocial":     emisor.razon_social,
                     "nombreComercial": nombre_comercial_final,
-                    "ruc": emisor.ruc,
-                    "claveAcceso": clave_acceso,
-                    "codDoc": "01",
-                    "estab": punto_emision.estab_codigo,
-                    "ptoEmi": punto_emision.punto_codigo,
-                    "secuencial": secuencial,
-                    "dirMatriz": emisor.direccion_matriz
+                    "ruc":             emisor.ruc,
+                    "claveAcceso":     clave_acceso,
+                    "codDoc":          "01",
+                    "estab":           punto_emision.estab_codigo,
+                    "ptoEmi":          punto_emision.punto_codigo,
+                    "secuencial":      secuencial,
+                    "dirMatriz":       emisor.direccion_matriz
                 },
                 "infoFactura": {
-                    "fechaEmision": fecha_formato_sri,
-                    "dirEstablecimiento": direccion_est_final,
-                    "obligadoContabilidad": getattr(emisor, 'obligado_contabilidad', 'NO'),
-                    "tipoIdentificacionComprador": cliente_final["tipo_id"],
-                    "razonSocialComprador": cliente_final["razon_social"],
-                    "identificacionComprador": cliente_final["identificacion"],
-                    "totalSinImpuestos": calculos["totales"]["totalSinImpuestos"],
-                    "totalDescuento": calculos["totales"]["totalDescuento"],
-                    "totalConImpuestos": {"totalImpuesto": calculos["totalConImpuestosXml"]},
-                    "propina": "0.00",
-                    "importeTotal": calculos["totales"]["importeTotal"],
-                    "moneda": "DOLAR",
+                    "fechaEmision":                 fecha_formato_sri,
+                    "dirEstablecimiento":           direccion_est_final,
+                    "obligadoContabilidad":         getattr(emisor, 'obligado_contabilidad', 'NO'),
+                    "tipoIdentificacionComprador":  cliente_final["tipo_id"],
+                    "razonSocialComprador":         cliente_final["razon_social"],
+                    "identificacionComprador":      cliente_final["identificacion"],
+                    "totalSinImpuestos":            calculos["totales"]["totalSinImpuestos"],
+                    "totalDescuento":               calculos["totales"]["totalDescuento"],
+                    "totalConImpuestos":            {"totalImpuesto": calculos["totalConImpuestosXml"]},
+                    "propina":                      "0.00",
+                    "importeTotal":                 calculos["totales"]["importeTotal"],
+                    "moneda":                       "DOLAR",
                     "pagos": {
                         "pago": [{
-                            "formaPago": p.get("forma_pago", p.get("formaPago", "01")),
-                            "total": f"{float(p['total']):.2f}",
-                            "plazo": p.get("plazo", "0"),
+                            "formaPago":    p.get("forma_pago", p.get("formaPago", "01")),
+                            "total":        f"{float(p['total']):.2f}",
+                            "plazo":        p.get("plazo", "0"),
                             "unidadTiempo": p.get("unidad_tiempo", p.get("unidadTiempo", "dias"))
                         } for p in factura_data.get("pagos", [])]
                     }
@@ -202,250 +247,315 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                 }
             }
         }
-        
-        # ... (Lógica de infoAdicional y corrección de listas de impuestos se mantiene igual) ...
-        # (Asegúrate de incluir aquí el bloque que formatea xml_obj["factura"]["infoAdicional"])
 
-        await db.commit()
 
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
+        print(f"❌ Error en Bloque 1: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Bloque 1 Error: {str(e)}")
-
+    
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 2: Microservicio de Node.js
+    # BLOQUE 2: Firmar XML en Node.js
     # ─────────────────────────────────────────────────────────────
     try:
-        bucket_p12, *path_parts = emisor.p12_path.split('/')
-        full_path_p12 = '/'.join(path_parts)
-        p12_bytes = download_file(bucket_p12, full_path_p12)
+        # Descargar P12 desde storage (MinIO hoy, R2 después — misma interfaz)
+        p12_bytes  = download_file(emisor.p12_path)
         p12_base64 = base64.b64encode(p12_bytes).decode('utf-8')
 
         async with httpx.AsyncClient() as client:
             res_node = await client.post(
                 NODE_SIGNER_URL,
                 json={
-                    "xmlObj": xml_obj,
+                    "xmlObj":  xml_obj,
                     "emisor": {
-                        "p12_pass": decrypt_password(emisor.p12_pass), 
-                        "ruc": emisor.ruc,
+                        "p12_pass":    decrypt_password(emisor.p12_pass),
+                        "ruc":         emisor.ruc,
                         "razon_social": emisor.razon_social,
-                        "ambiente": emisor.ambiente
+                        "ambiente":    emisor.ambiente
                     },
                     "p12Base64": p12_base64
                 },
-                timeout=25.0 
+                timeout=25.0
             )
-            
+
         signer_data = res_node.json()
         if not signer_data.get("ok"):
             raise ValueError(f"Node Error: {signer_data.get('error')}")
 
         xml_firmado_str = signer_data["xmlFirmado"]
-        pdf_bytes = base64.b64decode(signer_data["pdfBase64"])
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Falla técnica en firma: {str(e)}")
-
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 3: Guardar en MinIO, descontar crédito e Insertar Factura
-    # ─────────────────────────────────────────────────────────────
-    try:
-        xml_path_rel = f"{emisor.ruc}/{clave_acceso}.xml"
-        pdf_path_rel = f"{emisor.ruc}/{clave_acceso}.pdf"
-
-        # 1. Subir archivos
-        upload_file("invoices", xml_path_rel, xml_firmado_str.encode('utf-8'), "text/xml")
-        upload_file("invoices", pdf_path_rel, pdf_bytes, "application/pdf")
-
-        # 2. Descontar crédito
-        await db.execute(
-            text("UPDATE user_credits SET balance = balance - 1 WHERE emisor_id = :eid"), 
-            {"eid": emisor_id}
-        )
-
-        # 3. INSERT con los datos que resolvimos en el BLOQUE 0
-        query_insert = text("""
-            INSERT INTO invoices (
-                emisor_id, punto_emision_id, cliente_emisor_id, secuencial, fecha_emision, clave_acceso,
-                estado, identificacion_comprador, razon_social_comprador, importe_total,
-                subtotal_iva, subtotal_0, valor_iva, xml_path, pdf_path, datos_factura,
-                email_comprador
-            ) VALUES (
-                :emisor_id, :pto_id, :cliente_emisor_id, :sec, :fecha, :clave, 'FIRMADO', :id_comp, :razon_comp,
-                :total, :sub_iva, :sub_0, :val_iva, :xml_path, :pdf_path, :datos_fac, :email_comp
-            ) RETURNING id
-        """)
-        
-        res_insert = await db.execute(query_insert, {
-            "emisor_id": emisor_id, 
-            "pto_id": punto_emision.punto_id, 
-            "cliente_emisor_id": cliente_emisor_id, # El UUID que encontramos o creamos
-            "sec": secuencial,
-            "fecha": ahora_ecuador.date(),
-            "clave": clave_acceso, 
-            
-            # AQUÍ ES DONDE USAS LAS LLAVES DE CLIENTE_FINAL:
-            "id_comp": cliente_final["identificacion"],
-            "razon_comp": cliente_final["razon_social"],
-            "email_comp": cliente_final["email"],
-            
-            "total": calculos["totales"]["importeTotal"], 
-            "sub_iva": calculos["totales"]["subtotal_iva"],
-            "sub_0": calculos["totales"]["subtotal_0"], 
-            "val_iva": calculos["totales"]["totalIva"],
-            "xml_path": f"invoices/{xml_path_rel}", 
-            "pdf_path": f"invoices/{pdf_path_rel}",
-            "datos_fac": json.dumps(xml_obj["factura"])
-        })
-        
-        factura_id = res_insert.scalar()
-        await db.commit()
 
     except Exception as e:
         await db.rollback()
-        print(f"❌ Error en Bloque 3: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 4: Fast-Track al SRI (Recepción y Autorización)
-    # ─────────────────────────────────────────────────────────────
+        print(f"❌ Error en Bloque 1: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Bloque 2 Error: {str(e)}")
     
-    urls = URLS_SRI[str(emisor.ambiente)]
-    xml_base64 = base64.b64encode(xml_firmado_str.encode('utf-8')).decode('utf-8')
-    
-    # CORRECCIÓN AQUÍ: Cambiamos cliente_data por cliente_final
-    factura_notificar = {
-        "id": str(factura_id), 
-        "clave_acceso": clave_acceso, 
-        "email_comprador": cliente_final["email"], # 👈 Corregido
-        "razon_social_comprador": cliente_final["razon_social"], # 👈 Corregido
-        "secuencial": secuencial, 
-        "importe_total": calculos["totales"]["importeTotal"],
-        "pdf_path": f"invoices/{pdf_path_rel}", 
-        "ambiente": emisor.ambiente,
-        "ruc": emisor.ruc, 
-        "emisor_db_id": str(emisor_id), 
-        "razon_social": emisor.razon_social
-    }
+    # ─────────────────────────────────────────────────────────────
+    # BLOQUE 3: Guardar XML firmado, descontar crédito, INSERT factura
+    # ─────────────────────────────────────────────────────────────
+    xml_firmado_path  = None
+    factura_id        = None
+    factura_notificar = None
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client_sri:
-            # 1. RECEPCIÓN
-            soap_rec = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion"><soapenv:Body><ec:validarComprobante><xml>{xml_base64}</xml></ec:validarComprobante></soapenv:Body></soapenv:Envelope>"""
-            
-            res_rec = await client_sri.post(urls["recepcion"], content=soap_rec, headers={"Content-Type": "text/xml"})
-            
-            # Simple parsing buscando RECIBIDA o DEVUELTA (usando string match para evitar XML Parser pesado si no es necesario)
-            if "RECIBIDA" in res_rec.text:
-                await db.execute(text("UPDATE invoices SET estado = 'RECIBIDA', fecha_envio_sri = NOW() WHERE id = :fid"), {"fid": factura_id})
-                await db.commit()
-                await notificar_cambio_estado(factura_notificar, "RECIBIDA")
-                
-                # 2. AUTORIZACIÓN (Pausas cortas)
-                soap_auth = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.autorizacion"><soapenv:Body><ec:autorizacionComprobante><claveAccesoComprobante>{clave_acceso}</claveAccesoComprobante></ec:autorizacionComprobante></soapenv:Body></soapenv:Envelope>"""
-                
-                for pausa in [1.2, 1.8, 2.5]: # Segundos
-                    await asyncio.sleep(pausa)
-                    try:
-                        res_auth = await client_sri.post(urls["autorizacion"], content=soap_auth, headers={"Content-Type": "text/xml"})
-                        
-                        if "AUTORIZADO" in res_auth.text and "NO AUTORIZADO" not in res_auth.text:
-                            # 1. Extraer la Fecha y el XML Autorizado con ElementTree
-                            import xml.etree.ElementTree as ET
-                            root_auth = ET.fromstring(res_auth.text)
-                            auth_node = root_auth.find(".//autorizacion")
-                            
-                            fecha_auth = None
-                            xml_autorizado = xml_firmado_str # Fallback
-                            
-                            if auth_node is not None:
-                                fecha_auth = auth_node.findtext("fechaAutorizacion")
-                                xml_autorizado = auth_node.findtext("comprobante") or xml_firmado_str
-                            
-                            # 2. 🚀 PEDIR EL NUEVO PDF A NODE.JS
-                            try:
-                                res_pdf = await client_sri.post(
-                                    NODE_SIGNER_URL.replace("/firmar", "/pdf"), # Cambia la ruta a /pdf
-                                    json={
-                                        "xmlAutorizado": xml_autorizado,
-                                        "emisor": {"contribuyente_especial": getattr(emisor, 'contribuyente_especial', '')},
-                                        "fechaAutorizacion": fecha_auth
-                                    },
-                                    timeout=15.0
-                                )
-                                if res_pdf.status_code == 200 and res_pdf.json().get("ok"):
-                                    pdf_bytes = base64.b64decode(res_pdf.json()["pdfBase64"])
-                                    # 3. Sobreescribir el PDF viejo en MinIO
-                                    upload_file("invoices", pdf_path_rel, pdf_bytes, "application/pdf")
-                            except Exception as e_pdf:
-                                print(f"[FAST-TRACK] ⚠️ Error actualizando PDF en Node: {str(e_pdf)}")
-                                # Si falla Node, enviamos el viejo que ya tenemos en memoria (pdf_bytes)
+        # Path del XML firmado (temporal — se reemplaza por el autorizado)
+        xml_firmado_path = f"{emisor.ruc}/facturas/{ahora_ecuador.year}/{ahora_ecuador.month:02d}/{clave_acceso}_firmado.xml"
 
-                            # 4. Actualizar BD
-                            await db.execute(text("UPDATE invoices SET estado = 'AUTORIZADO', fecha_autorizacion = NOW() WHERE id = :fid"), {"fid": factura_id})
-                            await db.commit()
-                            await notificar_cambio_estado(factura_notificar, "AUTORIZADO")
-                            
-                            # 5. Enviar correo con el PDF ya actualizado
-                            if factura_notificar["email_comprador"]:
-                                await mail_service.send_mail(
-                                    to=factura_notificar["email_comprador"],
-                                    subject=f"Factura Electrónica - {emisor.razon_social} - {secuencial}",
-                                    html_content=f"Su factura {secuencial} ha sido autorizada por el SRI.",
-                                    attachments=[
-                                        {"filename": f"{clave_acceso}.xml", "content": xml_autorizado.encode('utf-8'), "maintype": "text", "subtype": "xml"},
-                                        {"filename": f"{clave_acceso}.pdf", "content": pdf_bytes, "maintype": "application", "subtype": "pdf"}
-                                    ]
-                                )
-                            print(f"[FAST-TRACK] ⭐ ÉXITO: {clave_acceso}")
-                            break
-                            
-                    except Exception as e:
-                        continue # Reintentar siguiente ciclo
-                        
-            elif "DEVUELTA" in res_rec.text:
-                # Extraer mensajes del XML de respuesta
-                import xml.etree.ElementTree as ET
-                root_res = ET.fromstring(res_rec.text)
-                
-                lista_errores = []
-                # El SRI devuelve los errores en etiquetas <mensaje>
-                for msg in root_res.findall(".//mensaje"):
-                    lista_errores.append({
-                        "identificador": msg.findtext("identificador"),
-                        "mensaje": msg.findtext("mensaje"),
-                        "informacionAdicional": msg.findtext("informacionAdicional"),
-                        "tipo": msg.findtext("tipo")
-                    })
+        # 1. Subir XML firmado al storage
+        upload_file(xml_firmado_path, xml_firmado_str.encode('utf-8'), "text/xml")
 
-                error_json = json.dumps(lista_errores)
-                
-                await db.execute(text(
-                    "UPDATE invoices SET estado = 'DEVUELTA', mensajes_sri = :msg WHERE id = :fid"
-                ), {"msg": error_json, "fid": factura_id})
-                
-                # Devolver crédito
-                await db.execute(text(
-                    "UPDATE user_credits SET balance = balance + 1 WHERE emisor_id = :eid"
-                ), {"eid": emisor_id})
-                
-                await db.commit()
-                await notificar_cambio_estado(factura_notificar, "DEVUELTA")
+        # 2. Descontar crédito
+        await db.execute(text("""
+            UPDATE public.user_credits
+            SET balance_emision = balance_emision - 1
+            WHERE emisor_id = :eid
+        """), {"eid": emisor_id})
+
+        # 3. INSERT factura — sin pdf_path (PDF bajo demanda)
+        res_insert = await db.execute(text("""
+            INSERT INTO invoices_emitidas (
+                emisor_id, punto_emision_id, cliente_emisor_id,
+                secuencial, fecha_emision, clave_acceso, estado,
+                identificacion_comprador, razon_social_comprador,
+                importe_total, subtotal_iva, subtotal_0, valor_iva,
+                xml_path, pdf_path, datos_factura, email_comprador
+            ) VALUES (
+                :emisor_id, :pto_id, :cliente_emisor_id,
+                :sec, :fecha, :clave, 'FIRMADO',
+                :id_comp, :razon_comp,
+                :total, :sub_iva, :sub_0, :val_iva,
+                :xml_path, NULL, :datos_fac, :email_comp
+            ) RETURNING id
+        """), {
+            "emisor_id":        emisor_id,
+            "pto_id":           punto_emision.punto_id,
+            "cliente_emisor_id": cliente_emisor_id,
+            "sec":              secuencial,
+            "fecha":            ahora_ecuador.date(),
+            "clave":            clave_acceso,
+            "id_comp":          cliente_final["identificacion"],
+            "razon_comp":       cliente_final["razon_social"],
+            "email_comp":       cliente_final["email"],
+            "total":            calculos["totales"]["importeTotal"],
+            "sub_iva":          calculos["totales"]["subtotal_iva"],
+            "sub_0":            calculos["totales"]["subtotal_0"],
+            "val_iva":          calculos["totales"]["totalIva"],
+            "xml_path":         xml_firmado_path,
+            "datos_fac":        json.dumps(xml_obj["factura"])
+        })
+
+        factura_id = res_insert.scalar()
+        await db.commit()
+
+        # Datos para notificaciones y correos
+        factura_notificar = {
+            "id":                     str(factura_id),
+            "clave_acceso":           clave_acceso,
+            "email_comprador":        cliente_final["email"],
+            "razon_social_comprador": cliente_final["razon_social"],
+            "secuencial":             secuencial,
+            "importe_total":          calculos["totales"]["importeTotal"],
+            "xml_firmado_path":       xml_firmado_path,
+            "ambiente":               emisor.ambiente,
+            "ruc":                    emisor.ruc,
+            "emisor_db_id":           str(emisor_id),
+            "razon_social":           emisor.razon_social
+        }
 
     except Exception as e:
-        print(f"[FAST-TRACK] ℹ️ SRI asíncrono o timeout para {clave_acceso}: {str(e)}")
+        await db.rollback()
+        print(f"❌ Error en Bloque 1: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Bloque 3 Error: {str(e)}")
 
-    # 5. Consulta final del estado
-    final_state_res = await db.execute(text("SELECT estado FROM invoices WHERE id = :fid"), {"fid": factura_id})
-    estado_final = final_state_res.scalar()
+    # ─────────────────────────────────────────────────────────────
+    # BLOQUE 4: ¿Flujo híbrido o cola?
+    #
+    # Si hay capacidad → intentar autorizar ahora (fast-track)
+    # Si no hay capacidad → encolar para el worker
+    # En ambos casos el worker recoge lo que no se autorizó
+    # ─────────────────────────────────────────────────────────────
+    redis        = await get_redis()
+    hay_capacidad = await semaforo_adquirir(redis)
+    estado_final  = "FIRMADO"
 
+    if hay_capacidad:
+        try:
+            urls    = URLS_SRI[str(emisor.ambiente)]
+            xml_b64 = base64.b64encode(xml_firmado_str.encode('utf-8')).decode('utf-8')
+
+            async with httpx.AsyncClient(timeout=10.0) as client_sri:
+
+                # ── Recepción ──────────────────────────────────────────────
+                soap_rec = (
+                    f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+                    f'xmlns:ec="http://ec.gob.sri.ws.recepcion">'
+                    f'<soapenv:Body><ec:validarComprobante><xml>{xml_b64}</xml>'
+                    f'</ec:validarComprobante></soapenv:Body></soapenv:Envelope>'
+                )
+                res_rec = await client_sri.post(
+                    urls["recepcion"], content=soap_rec, headers={"Content-Type": "text/xml"}
+                )
+
+                if "RECIBIDA" in res_rec.text:
+                    await db.execute(text("""
+                        UPDATE invoices_emitidas
+                        SET estado = 'RECIBIDA', fecha_envio_sri = NOW()
+                        WHERE id = :fid
+                    """), {"fid": factura_id})
+                    await db.commit()
+                    await notificar_cambio_estado(factura_notificar, "RECIBIDA")
+
+                    # ── Autorización (3 intentos rápidos) ─────────────────
+                    soap_auth = (
+                        f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+                        f'xmlns:ec="http://ec.gob.sri.ws.autorizacion">'
+                        f'<soapenv:Body><ec:autorizacionComprobante>'
+                        f'<claveAccesoComprobante>{clave_acceso}</claveAccesoComprobante>'
+                        f'</ec:autorizacionComprobante></soapenv:Body></soapenv:Envelope>'
+                    )
+
+                    for pausa in [1.2, 1.8, 2.5]:
+                        await asyncio.sleep(pausa)
+                        try:
+                            res_auth = await client_sri.post(
+                                urls["autorizacion"], content=soap_auth, headers={"Content-Type": "text/xml"}
+                            )
+
+                            if "AUTORIZADO" in res_auth.text and "NO AUTORIZADO" not in res_auth.text:
+                                root_auth      = ET.fromstring(res_auth.text)
+                                auth_node      = root_auth.find(".//autorizacion")
+                                fecha_auth     = None
+                                xml_autorizado = xml_firmado_str  # fallback
+
+                                if auth_node is not None:
+                                    fecha_auth     = auth_node.findtext("fechaAutorizacion")
+                                    xml_autorizado = auth_node.findtext("comprobante") or xml_firmado_str
+
+                                # Subir XML autorizado (reemplaza al firmado)
+                                xml_auth_path = (
+                                    f"{emisor.ruc}/facturas/"
+                                    f"{ahora_ecuador.year}/{ahora_ecuador.month:02d}/"
+                                    f"{clave_acceso}.xml"
+                                )
+                                upload_file(xml_auth_path, xml_autorizado.encode('utf-8'), "text/xml")
+
+                                # Eliminar XML firmado — ya no sirve
+                                try:
+                                    delete_file(xml_firmado_path)
+                                except Exception:
+                                    pass
+
+                                # Actualizar DB
+                                await db.execute(text("""
+                                    UPDATE invoices_emitidas
+                                    SET estado             = 'AUTORIZADO',
+                                        xml_path          = :xml_path,
+                                        pdf_path          = NULL,
+                                        fecha_autorizacion = NOW()
+                                    WHERE id = :fid
+                                """), {"xml_path": xml_auth_path, "fid": factura_id})
+                                await db.commit()
+                                await notificar_cambio_estado(factura_notificar, "AUTORIZADO")
+
+                                # Enviar correo con link de descarga (sin adjuntar PDF)
+                                if factura_notificar.get("email_comprador"):
+                                    await mail_service.send_mail(
+                                        to=factura_notificar["email_comprador"],
+                                        subject=f"Factura Electrónica - {emisor.razon_social} - {secuencial}",
+                                        html_content=(
+                                            f"<h2>Su factura ha sido autorizada ✅</h2>"
+                                            f"<p>Estimado/a {cliente_final['razon_social']},</p>"
+                                            f"<p>Su comprobante <strong>{secuencial}</strong> "
+                                            f"ha sido autorizado por el SRI.</p>"
+                                            f"<p><a href='https://kipu.ec/facturas/{clave_acceso}'>"
+                                            f"Ver y descargar factura</a></p>"
+                                        )
+                                    )
+
+                                estado_final = "AUTORIZADO"
+                                print(f"[FAST-TRACK] ⭐ AUTORIZADO: {clave_acceso}")
+                                break
+
+                        except Exception:
+                            continue  # reintentar siguiente pausa
+
+                    # Si no autorizó en los 3 intentos queda en RECIBIDA
+                    # job_autorizar_facturas lo recogerá automáticamente
+                    if estado_final != "AUTORIZADO":
+                        estado_final = "RECIBIDA"
+
+                elif "DEVUELTA" in res_rec.text:
+                    root_res      = ET.fromstring(res_rec.text)
+                    lista_errores = [
+                        {
+                            "identificador":        msg.findtext("identificador"),
+                            "mensaje":              msg.findtext("mensaje"),
+                            "informacionAdicional": msg.findtext("informacionAdicional"),
+                            "tipo":                 msg.findtext("tipo")
+                        }
+                        for msg in root_res.findall(".//mensaje")
+                    ]
+
+                    # Eliminar XML firmado — no tiene valor
+                    try:
+                        delete_file(xml_firmado_path)
+                    except Exception:
+                        pass
+
+                    await db.execute(text("""
+                        UPDATE invoices_emitidas
+                        SET estado       = 'DEVUELTA',
+                            mensajes_sri = :msg,
+                            xml_path     = NULL
+                        WHERE id = :fid
+                    """), {"msg": json.dumps(lista_errores), "fid": factura_id})
+
+                    # Devolver crédito
+                    await db.execute(text("""
+                        UPDATE public.user_credits
+                        SET balance_emision = balance_emision + 1
+                        WHERE emisor_id = :eid
+                    """), {"eid": emisor_id})
+
+                    await db.commit()
+                    await notificar_cambio_estado(factura_notificar, "DEVUELTA")
+                    estado_final = "DEVUELTA"
+
+                else:
+                    # SRI no respondió con estado reconocido — worker lo recogerá
+                    estado_final = "FIRMADO"
+
+        except Exception as e:
+            await db.rollback()
+            print(f"❌ Error en Bloque 1: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Bloque 4 Error: {str(e)}")
+
+        finally:
+            await semaforo_liberar(redis)
+
+    else:
+        # ── Servidor saturado → encolar ────────────────────────────
+        await queue_push(redis, str(factura_id), emisor_id, xml_firmado_path, emisor.ambiente)
+        estado_final = "FIRMADO"
+        print(f"[Cola] Factura encolada por saturación: {clave_acceso}")
+
+    # ─────────────────────────────────────────────────────────────
+    # RESPUESTA FINAL
+    # ─────────────────────────────────────────────────────────────
     return {
-        "ok": True,
-        "id": factura_id,
+        "ok":          True,
+        "id":          str(factura_id),
         "claveAcceso": clave_acceso,
-        "estado": estado_final,
-        "mensaje": "Factura autorizada exitosamente." if estado_final == 'AUTORIZADO' else "Comprobante en proceso."
+        "estado":      estado_final,
+        "mensaje":     "Factura autorizada exitosamente." if estado_final == "AUTORIZADO"
+                       else "Comprobante recibido. Será autorizado en breve."
     }
-
-

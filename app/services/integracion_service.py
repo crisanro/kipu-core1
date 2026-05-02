@@ -37,7 +37,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             e.nombre_comercial, 
             e.ambiente,
             e.p12_expiration,
-            COALESCE(c.balance, 0) AS creditos_disponibles,
+            COALESCE(c.balance_emision, 0) AS creditos_disponibles,
             (
                 SELECT json_agg(last_docs)
                 FROM (
@@ -45,7 +45,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
                         id, fecha_emision, estado, identificacion_comprador,
                         razon_social_comprador, importe_total AS total,
                         clave_acceso, created_at
-                    FROM invoices 
+                    FROM invoices_emitidas 
                     WHERE emisor_id = e.id
                     ORDER BY created_at DESC
                     LIMIT 20

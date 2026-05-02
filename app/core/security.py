@@ -1,8 +1,11 @@
+#app/core/security.py
+
 import hashlib
 from fastapi import Header, HTTPException, Depends, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
+from app.core.database import get_db_for_tenant
 from app.core.config import settings
 from firebase_admin import auth
 
@@ -108,3 +111,25 @@ async def verify_whatsapp_service(
         raise HTTPException(status_code=404, detail="Número de WhatsApp no vinculado a Kipu.")
 
     return {"role": "internal_service", "source": "whatsapp", "emisor_id": profile.emisor_id}
+
+
+async def get_tenant_db(auth_data: dict = Depends(verify_firebase_token)):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=403, detail="Emisor no provisionado")
+    async for session in get_db_for_tenant(emisor_id):
+        yield session
+
+async def get_tenant_db_api_key(api_data: dict = Depends(verify_api_key)):
+    emisor_id = api_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=403, detail="Emisor no encontrado")
+    async for session in get_db_for_tenant(emisor_id):
+        yield session
+
+async def get_tenant_db_whatsapp(auth_data: dict = Depends(verify_whatsapp_service)):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=403, detail="Emisor no encontrado")
+    async for session in get_db_for_tenant(emisor_id):
+        yield session

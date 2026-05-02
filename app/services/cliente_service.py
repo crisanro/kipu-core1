@@ -376,7 +376,7 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
                 i.importe_total,
                 i.fecha_emision,
                 i.estado
-            FROM invoices i
+            FROM invoices_emitidas i
             JOIN puntos_emision p ON i.punto_emision_id = p.id
             JOIN establecimientos e ON p.establecimiento_id = e.id
             WHERE i.cliente_emisor_id = :cid AND i.emisor_id = :eid

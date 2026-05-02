@@ -1,3 +1,5 @@
+#app/core/firebase.py
+# 
 import firebase_admin
 from firebase_admin import credentials
 from app.core.config import settings

@@ -1,8 +1,9 @@
+#app/api/v1/app/dashboard.py
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
 from app.core.database import get_db
-from app.core.security import verify_firebase_token
+from app.core.security import verify_firebase_token, get_tenant_db
 from app.services.dashboard_service import obtener_dashboard_core, consultar_detalle_factura_core
 
 router = APIRouter()
@@ -32,7 +33,7 @@ async def get_dashboard(
 async def get_detalle_factura(
     factura_id: str,
     auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db)
 ):
     """
     Retorna toda la información de una factura (ítems, pagos, totales) 

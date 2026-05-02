@@ -4,6 +4,8 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from app.core.database import close_redis
+
 
 # Importamos la inicialización de Firebase (Esto lo enciende automáticamente)
 import app.core.firebase 
@@ -38,17 +40,17 @@ scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Configurar y encender Workers al iniciar el servidor
-    scheduler.add_job(job_enviar_facturas, 'interval', seconds=20, max_instances=1)
-    scheduler.add_job(job_autorizar_facturas, 'interval', seconds=30, max_instances=1)
+    
+    scheduler.add_job(job_enviar_facturas,    "interval", seconds=20, max_instances=1)
+    scheduler.add_job(job_autorizar_facturas, "interval", seconds=30, max_instances=1)
     scheduler.start()
-    print("⏰ Workers del SRI iniciados correctamente.")
-    
-    yield # Aquí FastAPI atiende las peticiones HTTP
-    
-    # 2. Apagar Workers suavemente al detener el servidor
+    print("⏰ Workers del SRI iniciados.")
+ 
+    yield
+ 
     scheduler.shutdown()
-    print("💤 Workers del SRI detenidos.")
+    await close_redis()
+    print("💤 Workers y Redis detenidos.")
 
 # ─── INICIALIZACIÓN DE FASTAPI ────────────────────────────────────────────────
 app = FastAPI(

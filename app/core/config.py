@@ -1,3 +1,5 @@
+#app/core/config.py
+
 import os
 import json
 import boto3
@@ -37,11 +39,6 @@ class Settings(BaseSettings):
     FIREBASE_PRIVATE_KEY: str
     N8N_API_KEY: str = Field(validation_alias="KIPU_CORE_KEY")
     WEB_HOOK_NOTIFICACIONES: str
-    MINIO_ENDPOINT: str = "api-s3.kipu.ec"
-    MINIO_PORT: int = 443
-    MINIO_USE_SSL: bool = True
-    MINIO_ROOT_USER: str
-    MINIO_ROOT_PASSWORD: str
     ENCRYPTION_KEY: str
     TURNSTILE_SECRET_KEY: str
     SMTP_HOST: str
@@ -52,6 +49,12 @@ class Settings(BaseSettings):
     PORT: int = 3000
     FRONTEND_URL: str
     DEBUG_SIGNER: bool = False
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    R2_ACCOUNT_ID:        str
+    R2_ACCESS_KEY_ID:     str
+    R2_SECRET_ACCESS_KEY: str
+    R2_BUCKET_NAME:       str
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 """
@@ -72,11 +75,6 @@ except Exception:
     print("⚠️ Faltan variables locales, yendo a buscar a AWS Secrets Manager...")
     aws_secrets = get_aws_secret()
     
-    # 💡 TRUCO: Quitamos de los secretos de AWS las variables que queremos forzar en local
-    # Así, Pydantic usará el valor por defecto que pusiste en la clase (api-s3.kipu.ec)
-    aws_secrets.pop("MINIO_ENDPOINT", None)
-    aws_secrets.pop("MINIO_PORT", None)
-    aws_secrets.pop("MINIO_USE_SSL", None)
     
     try:
         settings = Settings(**aws_secrets)

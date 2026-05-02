@@ -1,7 +1,7 @@
+#app/api/v1/public/integraciones.py
 from fastapi import APIRouter, Depends, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import get_db
-from app.core.security import verify_api_key
+from app.core.security import verify_api_key, get_tenant_db_api_key
 from app.schemas.integracion import ValidatePuntoRequest
 from app.services.integracion_service import validar_estructura_core, obtener_status_core
 from app.utils.sri_service import emitir_factura_core
@@ -12,7 +12,7 @@ router = APIRouter()
 async def api_validate_structure(
     request: ValidatePuntoRequest, 
     auth: dict = Depends(verify_api_key), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db_api_key)
 ):
     """
     Verifica si una combinación de códigos de establecimiento y punto 
@@ -24,7 +24,7 @@ async def api_validate_structure(
 @router.get("/status", summary="Resumen completo del estado del emisor")
 async def api_get_status(
     auth: dict = Depends(verify_api_key), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db_api_key)
 ):
     """
     Devuelve información fiscal del emisor, estado de la firma electrónica, 
@@ -37,7 +37,7 @@ async def api_get_status(
 async def api_invoice(
     factura_data: dict = Body(...), # Aquí irá el schema JSON de tu factura
     auth: dict = Depends(verify_api_key), 
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_tenant_db_api_key)
 ):
     """
     Genera, firma, almacena y registra una factura electrónica en formato SRI. 
