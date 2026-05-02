@@ -567,4 +567,3 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         "mensaje":     "Factura autorizada exitosamente." if estado_final == "AUTORIZADO"
                        else "Comprobante recibido. Será autorizado en breve."
     }
-    }
