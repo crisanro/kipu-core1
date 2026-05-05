@@ -381,15 +381,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
     # Si no hay capacidad → encolar para el worker
     # En ambos casos el worker recoge lo que no se autorizó
     # ─────────────────────────────────────────────────────────────
-    res_tenant = await db.execute(text("""
-        SELECT tenant_schema FROM public.emisor_tenant_map
-        WHERE emisor_id = :eid
-    """), {"eid": emisor_id})
-    tenant_row = res_tenant.fetchone()
-    if tenant_row:
-        await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
-
-    redis         = await get_redis()
+    redis        = await get_redis()
     hay_capacidad = await semaforo_adquirir(redis)
     estado_final  = "FIRMADO"
 
@@ -400,7 +392,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
             async with httpx.AsyncClient(timeout=10.0) as client_sri:
 
-                # ── Recepción ──────────────────────────────────────
+                # ── Recepción ──────────────────────────────────────────────
                 soap_rec = (
                     f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
                     f'xmlns:ec="http://ec.gob.sri.ws.recepcion">'
@@ -418,14 +410,9 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                         WHERE id = :fid
                     """), {"fid": factura_id})
                     await db.commit()
-
-                    # Re-setear después del commit
-                    if tenant_row:
-                        await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
-
                     await notificar_cambio_estado(factura_notificar, "RECIBIDA")
 
-                    # ── Autorización (3 intentos rápidos) ──────────
+                    # ── Autorización (3 intentos rápidos) ─────────────────
                     soap_auth = (
                         f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
                         f'xmlns:ec="http://ec.gob.sri.ws.autorizacion">'
@@ -445,12 +432,13 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                                 root_auth      = ET.fromstring(res_auth.text)
                                 auth_node      = root_auth.find(".//autorizacion")
                                 fecha_auth     = None
-                                xml_autorizado = xml_firmado_str
+                                xml_autorizado = xml_firmado_str  # fallback
 
                                 if auth_node is not None:
                                     fecha_auth     = auth_node.findtext("fechaAutorizacion")
                                     xml_autorizado = auth_node.findtext("comprobante") or xml_firmado_str
 
+                                # Subir XML autorizado (reemplaza al firmado)
                                 xml_auth_path = (
                                     f"{emisor.ruc}/facturas/"
                                     f"{ahora_ecuador.year}/{ahora_ecuador.month:02d}/"
@@ -458,15 +446,13 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                                 )
                                 upload_file(xml_auth_path, xml_autorizado.encode('utf-8'), "text/xml")
 
+                                # Eliminar XML firmado — ya no sirve
                                 try:
                                     delete_file(xml_firmado_path)
                                 except Exception:
                                     pass
 
-                                # Re-setear antes del UPDATE
-                                if tenant_row:
-                                    await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
-
+                                # Actualizar DB
                                 await db.execute(text("""
                                     UPDATE invoices_emitidas
                                     SET estado             = 'AUTORIZADO',
@@ -478,6 +464,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                                 await db.commit()
                                 await notificar_cambio_estado(factura_notificar, "AUTORIZADO")
 
+                                # Enviar correo con link de descarga (sin adjuntar PDF)
                                 if factura_notificar.get("email_comprador"):
                                     await mail_service.send_mail(
                                         to=factura_notificar["email_comprador"],
@@ -497,8 +484,10 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                                 break
 
                         except Exception:
-                            continue
+                            continue  # reintentar siguiente pausa
 
+                    # Si no autorizó en los 3 intentos queda en RECIBIDA
+                    # job_autorizar_facturas lo recogerá automáticamente
                     if estado_final != "AUTORIZADO":
                         estado_final = "RECIBIDA"
 
@@ -514,14 +503,11 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                         for msg in root_res.findall(".//mensaje")
                     ]
 
+                    # Eliminar XML firmado — no tiene valor
                     try:
                         delete_file(xml_firmado_path)
                     except Exception:
                         pass
-
-                    # Re-setear antes del UPDATE
-                    if tenant_row:
-                        await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
 
                     await db.execute(text("""
                         UPDATE invoices_emitidas
@@ -531,6 +517,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                         WHERE id = :fid
                     """), {"msg": json.dumps(lista_errores), "fid": factura_id})
 
+                    # Devolver crédito
                     await db.execute(text("""
                         UPDATE public.user_credits
                         SET balance_emision = balance_emision + 1
@@ -542,16 +529,21 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                     estado_final = "DEVUELTA"
 
                 else:
+                    # SRI no respondió con estado reconocido — worker lo recogerá
                     estado_final = "FIRMADO"
 
         except Exception as e:
-            print(f"[FAST-TRACK] ℹ️ SRI timeout para {clave_acceso}: {str(e)}")
-            estado_final = "FIRMADO"
+            await db.rollback()
+            print(f"❌ Error en Bloque 1: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Bloque 4 Error: {str(e)}")
 
         finally:
             await semaforo_liberar(redis)
 
     else:
+        # ── Servidor saturado → encolar ────────────────────────────
         await queue_push(redis, str(factura_id), emisor_id, xml_firmado_path, emisor.ambiente)
         estado_final = "FIRMADO"
         print(f"[Cola] Factura encolada por saturación: {clave_acceso}")
