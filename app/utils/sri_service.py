@@ -509,6 +509,9 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                     except Exception:
                         pass
 
+                    if tenant_row:
+                        await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
+
                     await db.execute(text("""
                         UPDATE invoices_emitidas
                         SET estado       = 'DEVUELTA',
