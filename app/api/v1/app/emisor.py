@@ -19,7 +19,7 @@ from app.utils.crypto import encrypt_password
 router = APIRouter()
 
 #NODE_VALIDATOR_URL = os.getenv("NODE_VALIDATOR_URL", "http://localhost:3000/api/validar-p12")
-NODE_VALIDATOR_URL = "http://localhost:3000/api/validar-p12"
+NODE_VALIDATOR_URL = "http://kipu_signer_node/api/validar-p12"
 
 
 def validar_ruc_ecuador(ruc: str):
