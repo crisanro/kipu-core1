@@ -381,10 +381,18 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
     # Si no hay capacidad → encolar para el worker
     # En ambos casos el worker recoge lo que no se autorizó
     # ─────────────────────────────────────────────────────────────
-    redis        = await get_redis()
+    tenant_row = None
+    res_tenant = await db.execute(text("""
+        SELECT tenant_schema FROM public.emisor_tenant_map
+        WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    tenant_row = res_tenant.fetchone()
+    if tenant_row:
+        await db.execute(text(f"SET search_path TO {tenant_row.tenant_schema}, public"))
+
+    redis         = await get_redis()
     hay_capacidad = await semaforo_adquirir(redis)
     estado_final  = "FIRMADO"
-
     if hay_capacidad:
         try:
             urls    = URLS_SRI[str(emisor.ambiente)]
