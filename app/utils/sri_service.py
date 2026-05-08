@@ -290,7 +290,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
     except Exception as e:
         await db.rollback()
-        print(f"❌ Error en Bloque 1: {str(e)}")
+        print(f"❌ Error en Bloque 2: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Bloque 2 Error: {str(e)}")
@@ -369,7 +369,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
     except Exception as e:
         await db.rollback()
-        print(f"❌ Error en Bloque 1: {str(e)}")
+        print(f"❌ Error en Bloque 3: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Bloque 3 Error: {str(e)}")
@@ -534,7 +534,7 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
 
         except Exception as e:
             await db.rollback()
-            print(f"❌ Error en Bloque 1: {str(e)}")
+            print(f"❌ Error en Bloque 4: {str(e)}")
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Bloque 4 Error: {str(e)}")
