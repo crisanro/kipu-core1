@@ -1,4 +1,5 @@
 # app/workers/sri_worker.py
+# app/workers/sri_worker.py
 
 import base64
 import asyncio
@@ -71,6 +72,7 @@ async def job_enviar_facturas():
                 return
 
             for schema in schemas:
+                # Setear search_path al tenant
                 await db.execute(text(f"SET search_path TO {schema}, public"))
 
                 result = await db.execute(text("""
@@ -95,11 +97,11 @@ async def job_enviar_facturas():
                     try:
                         print(f"[SRI Job1] Enviando clave: {factura.clave_acceso}")
 
-                        # Descargar XML firmado de R2 — path directo sin bucket
+                        # Descargar XML firmado de R2
                         xml_bytes  = download_file(factura.xml_path)
                         xml_base64 = base64.b64encode(xml_bytes).decode('utf-8')
 
-                        urls     = URLS_SRI[str(factura.ambiente)]
+                        urls      = URLS_SRI[str(factura.ambiente)]
                         soap_body = (
                             f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
                             f'xmlns:ec="http://ec.gob.sri.ws.recepcion">'
@@ -124,6 +126,8 @@ async def job_enviar_facturas():
                                 fac_dict[key] = str(value)
 
                         if resp_recepcion.get('estado') == 'RECIBIDA':
+                            # Re-setear search_path antes del UPDATE (se pierde tras cada commit)
+                            await db.execute(text(f"SET search_path TO {schema}, public"))
                             await db.execute(text("""
                                 UPDATE invoices_emitidas
                                 SET estado = 'RECIBIDA', fecha_envio_sri = NOW()
@@ -135,16 +139,6 @@ async def job_enviar_facturas():
 
                         else:
                             error_msg = json.dumps(resp_recepcion.get('comprobantes', resp_recepcion))
-                            await db.execute(text("""
-                                UPDATE invoices_emitidas
-                                SET estado = 'DEVUELTA', mensajes_sri = :msg, fecha_envio_sri = NOW()
-                                WHERE id = :id
-                            """), {"msg": error_msg, "id": factura.id})
-                            await db.execute(text("""
-                                UPDATE public.user_credits
-                                SET balance_emision = balance_emision + 1
-                                WHERE emisor_id = :eid
-                            """), {"eid": factura.emisor_db_id})
 
                             # Eliminar XML firmado — no sirve si fue devuelto
                             try:
@@ -152,18 +146,36 @@ async def job_enviar_facturas():
                             except Exception:
                                 pass
 
+                            # Re-setear search_path antes del UPDATE
+                            await db.execute(text(f"SET search_path TO {schema}, public"))
+                            await db.execute(text("""
+                                UPDATE invoices_emitidas
+                                SET estado = 'DEVUELTA', mensajes_sri = :msg, fecha_envio_sri = NOW(),
+                                    xml_path = NULL
+                                WHERE id = :id
+                            """), {"msg": error_msg, "id": factura.id})
+                            await db.execute(text("""
+                                UPDATE public.user_credits
+                                SET balance_emision = balance_emision + 1
+                                WHERE emisor_id = :eid
+                            """), {"eid": factura.emisor_db_id})
                             await db.commit()
                             print(f"[SRI Job1] ⚠️ DEVUELTA: {factura.clave_acceso} | Crédito devuelto.")
                             await notificar_cambio_estado(fac_dict, 'DEVUELTA', resp_recepcion)
 
                     except Exception as err:
                         await db.rollback()
-                        await db.execute(text("""
-                            UPDATE invoices_emitidas
-                            SET retry_count = COALESCE(retry_count, 0) + 1
-                            WHERE id = :id
-                        """), {"id": factura.id})
-                        await db.commit()
+                        try:
+                            # Re-setear search_path antes del UPDATE de retry
+                            await db.execute(text(f"SET search_path TO {schema}, public"))
+                            await db.execute(text("""
+                                UPDATE invoices_emitidas
+                                SET retry_count = COALESCE(retry_count, 0) + 1
+                                WHERE id = :id
+                            """), {"id": factura.id})
+                            await db.commit()
+                        except Exception:
+                            await db.rollback()
                         print(f"[SRI Job1] ❌ Error Recepción ({factura.clave_acceso}): {str(err)}")
 
         except Exception as e:
@@ -182,6 +194,7 @@ async def job_autorizar_facturas():
                 return
 
             for schema in schemas:
+                # Setear search_path al tenant
                 await db.execute(text(f"SET search_path TO {schema}, public"))
 
                 result = await db.execute(text("""
@@ -235,9 +248,8 @@ async def job_autorizar_facturas():
                                 fecha_auth_str = autorizacion['fechaAutorizacion']
                                 fecha_auth_obj = datetime.fromisoformat(fecha_auth_str)
 
-                                # Path del XML autorizado en R2 — reemplaza al firmado
-                                ahora          = datetime.now()
-                                xml_auth_path  = (
+                                ahora         = datetime.now()
+                                xml_auth_path = (
                                     f"{factura.ruc}/facturas/"
                                     f"{ahora.year}/{ahora.month:02d}/"
                                     f"{factura.clave_acceso}.xml"
@@ -246,14 +258,15 @@ async def job_autorizar_facturas():
                                 # Subir XML autorizado a R2
                                 upload_file(xml_auth_path, xml_autorizado.encode('utf-8'), 'text/xml')
 
-                                # Eliminar XML firmado — ya no sirve
+                                # Eliminar XML firmado
                                 if factura.xml_path:
                                     try:
                                         delete_file(factura.xml_path)
                                     except Exception:
                                         pass
 
-                                # Actualizar DB — sin pdf_path, PDF bajo demanda
+                                # Re-setear search_path antes del UPDATE
+                                await db.execute(text(f"SET search_path TO {schema}, public"))
                                 await db.execute(text("""
                                     UPDATE invoices_emitidas
                                     SET estado             = 'AUTORIZADO',
@@ -268,7 +281,6 @@ async def job_autorizar_facturas():
                                 fac_dict['fecha_autorizacion'] = fecha_auth_str
                                 await notificar_cambio_estado(fac_dict, 'AUTORIZADO')
 
-                                # Enviar correo con link — sin adjuntar PDF
                                 if factura.email_comprador:
                                     try:
                                         await mail_service.send_mail(
@@ -289,6 +301,15 @@ async def job_autorizar_facturas():
                                 estado_final = 'RECHAZADO' if autorizacion.get('estado') == 'NO AUTORIZADO' else autorizacion.get('estado')
                                 msg          = json.dumps(autorizacion.get('mensajes', {}))
 
+                                # Eliminar XML firmado
+                                if factura.xml_path:
+                                    try:
+                                        delete_file(factura.xml_path)
+                                    except Exception:
+                                        pass
+
+                                # Re-setear search_path antes del UPDATE
+                                await db.execute(text(f"SET search_path TO {schema}, public"))
                                 await db.execute(text("""
                                     UPDATE invoices_emitidas
                                     SET estado       = :est,
@@ -296,21 +317,13 @@ async def job_autorizar_facturas():
                                         xml_path     = NULL
                                     WHERE id = :id
                                 """), {"est": estado_final, "msg": msg, "id": factura.id})
-
                                 await db.execute(text("""
                                     UPDATE public.user_credits
                                     SET balance_emision = balance_emision + 1
                                     WHERE emisor_id = :eid
                                 """), {"eid": factura.emisor_db_id})
-
-                                # Eliminar XML firmado — no sirve
-                                if factura.xml_path:
-                                    try:
-                                        delete_file(factura.xml_path)
-                                    except Exception:
-                                        pass
-
                                 await db.commit()
+
                                 print(f"[SRI Job2] ⚠️ {estado_final}: {factura.clave_acceso} | Crédito devuelto.")
                                 await notificar_cambio_estado(fac_dict, estado_final, autorizacion.get('mensajes'))
 
