@@ -1,4 +1,3 @@
-#app/api/v1/app/apikeys.py
 import os
 import hashlib
 from typing import List
