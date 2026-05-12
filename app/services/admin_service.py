@@ -15,22 +15,24 @@ async def recargar_creditos_core(data: TopupRequest, db: AsyncSession):
 
         if not emisor_row:
             raise HTTPException(status_code=404, detail=f"Emisor con RUC {data.ruc} no encontrado")
+        
         emisor_id = emisor_row.id
 
         # 2. Incrementar balance
+        # AJUSTE: Cambiamos 'balance' por 'balance_emision' (que es el campo real ahora)
         query_update = text("""
             UPDATE user_credits 
-            SET balance = balance + :amount, last_updated = NOW() 
+            SET balance_emision = balance_emision + :amount, last_updated = NOW() 
             WHERE emisor_id = :eid 
-            RETURNING balance
+            RETURNING balance_emision
         """)
         res_update = await db.execute(query_update, {"amount": data.amount, "eid": emisor_id})
         nuevo_balance = res_update.scalar()
 
         # 3. Registrar Log
         query_log = text("""
-            INSERT INTO transaction_logs (target_emisor_id, amount, action_type, description)
-            VALUES (:eid, :amount, 'STRIPE_RECHARGE', :desc)
+            INSERT INTO transaction_logs (target_emisor_id, amount, action_type, description, created_at)
+            VALUES (:eid, :amount, 'STRIPE_RECHARGE', :desc, NOW())
         """)
         desc = f"Recarga n8n - Ref: {data.reference_id or 'N/A'}"
         await db.execute(query_log, {"eid": emisor_id, "amount": data.amount, "desc": desc})
@@ -80,12 +82,15 @@ async def solicitar_pin_core(data: RequestPin, db: AsyncSession):
 
         # 5. Generar e Insertar
         pin = str(random.randint(100000, 999999))
+        
+        # AJUSTE: Para evitar líos de zona horaria entre Python y Postgres, 
+        # a veces es mejor dejar que la DB maneje el tiempo o asegurar UTC.
         tz = pytz.timezone('America/Guayaquil')
         expires_at = datetime.now(tz) + timedelta(minutes=10)
 
         await db.execute(text("""
-            INSERT INTO auth_challenges (emisor_id, email, whatsapp_number, pin, tipo_accion, expires_at)
-            VALUES (:eid, :email, :phone, :pin, :accion, :exp)
+            INSERT INTO auth_challenges (emisor_id, email, whatsapp_number, pin, tipo_accion, expires_at, created_at)
+            VALUES (:eid, :email, :phone, :pin, :accion, :exp, NOW())
         """), {"eid": user_row.emisor_id, "email": email_fmt, "phone": data.whatsapp_number, 
                "pin": pin, "accion": data.tipo_accion, "exp": expires_at})
 
@@ -103,14 +108,16 @@ async def solicitar_pin_core(data: RequestPin, db: AsyncSession):
 async def chequear_estado_ws_core(whatsapp_number: str, db: AsyncSession):
     try:
         query = text("""
-            SELECT p.email, p.full_name, e.id as emisor_id, e.razon_social, e.ruc, c.balance
+            SELECT p.email, p.full_name, e.id as emisor_id, e.razon_social, e.ruc, c.balance_emision
             FROM profiles p
             JOIN emisores e ON p.emisor_id = e.id
             JOIN user_credits c ON e.id = c.emisor_id
             WHERE p.whatsapp_number = :phone
         """)
         res = await db.execute(query, {"phone": whatsapp_number})
-        data = res.fetchone()
+        
+        # AJUSTE: Usamos .mappings() para evitar errores de acceso por atributo en algunas versiones de SQLAlchemy
+        data = res.mappings().fetchone()
 
         if not data:
             return {
@@ -125,30 +132,33 @@ async def chequear_estado_ws_core(whatsapp_number: str, db: AsyncSession):
             JOIN establecimientos e ON p.establecimiento_id = e.id
             WHERE e.emisor_id = :eid AND e.codigo = '001' AND p.codigo = '333'
         """)
-        res_pto = await db.execute(query_pto, {"eid": data.emisor_id})
+        res_pto = await db.execute(query_pto, {"eid": data["emisor_id"]})
         
         if not res_pto.fetchone():
             return {
-                "ok": False, "codigo_error": "POINT_NOT_CONFIGURED",
-                "mensaje_cliente": f"⚠️ Hola {data.razon_social}, para facturar por WhatsApp debes tener habilitado el Establecimiento 001 - Punto de Emisión 333."
+                "ok": True, "codigo_error": "POINT_NOT_CONFIGURED",
+                "mensaje_cliente": f"⚠️ Hola {data['razon_social']}, para facturar por WhatsApp debes tener habilitado el Establecimiento 001 - Punto de Emisión 333."
             }
 
         # Check Créditos
-        if data.balance <= 0:
+        # AJUSTE: Referencia a 'balance_emision'
+        if data["balance_emision"] <= 0:
             return {
                 "ok": True, "has_credits": False, "codigo_error": "USER_NOT_CREDITS",
-                "data": {"nombre": data.full_name, "empresa": data.razon_social},
-                "mensaje_cliente": f"⚠️ Hola {data.razon_social}, no tienes créditos disponibles."
+                "data": {"nombre": data["full_name"], "empresa": data["razon_social"]},
+                "mensaje_cliente": f"⚠️ Hola {data['razon_social']}, no tienes créditos disponibles."
             }
 
         return {
             "ok": True, "has_credits": True,
             "data": {
-                "emisor_id": data.emisor_id, "nombre": data.full_name, "empresa": data.razon_social,
-                "ruc": data.ruc, "balance": data.balance, "establecimiento": "001", "punto_emision": "333"
+                "emisor_id": data["emisor_id"], "nombre": data["full_name"], "empresa": data["razon_social"],
+                "ruc": data["ruc"], "balance": data["balance_emision"], "establecimiento": "001", "punto_emision": "333"
             },
-            "mensaje_cliente": f"✅ Hola {data.full_name}, estás listo para facturar (Punto 001-333). Tienes {data.balance} créditos."
+            "mensaje_cliente": f"✅ Hola {data['full_name']}, estás listo para facturar (Punto 001-333). Tienes {data['balance_emision']} créditos."
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"[Check WS Error] {str(e)}")
         return {"ok": False, "mensaje_cliente": "❌ Error técnico al verificar cuenta."}

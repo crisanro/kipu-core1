@@ -19,3 +19,8 @@ class PuntoEmisionCreate(BaseModel):
 class PuntoEmisionUpdate(BaseModel):
     nombre: Optional[str] = None
     is_active: Optional[bool] = None
+
+
+class WhatsappConfigUpdate(BaseModel):
+    establecimiento: str | None = None
+    punto_emision:   str | None = None

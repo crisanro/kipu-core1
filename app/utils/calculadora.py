@@ -1,11 +1,12 @@
 # app/utils/calculadora.py
 
 # Mapeo de códigos SRI actualizado al 2026
+# Importante: El código 4 para 15% y 5 para 5% son los oficiales según ficha técnica
 CODIGOS_IVA = {
     0:  {"codigo": "2", "codigoPorcentaje": "0"}, # 0%
     12: {"codigo": "2", "codigoPorcentaje": "2"}, # 12%
     15: {"codigo": "2", "codigoPorcentaje": "4"}, # 15% 
-    5:  {"codigo": "2", "codigoPorcentaje": "5"}  # 5% (Construcción)
+    5:  {"codigo": "2", "codigoPorcentaje": "5"}  # 5% (Construcción / Otros)
 }
 
 def calcular_totales_e_impuestos(items: list) -> dict:
@@ -15,32 +16,33 @@ def calcular_totales_e_impuestos(items: list) -> dict:
     detalles_xml = []
 
     for item in items:
-        # Extracción segura compatible con múltiples formatos del front
+        # Extracción segura
         cantidad = float(item.get("cantidad", 0))
         precio_unitario = float(item.get("precioUnitario", item.get("precio", 0)))
         descuento = float(item.get("descuento", 0))
 
-        precio_total_sin_impuesto = (cantidad * precio_unitario) - descuento
+        # Precio Total del ítem (Base para el impuesto)
+        # AJUSTE: Redondeo a 2 decimales en cada paso para evitar errores de coma flotante
+        precio_total_sin_impuesto = round((cantidad * precio_unitario) - descuento, 2)
+        
         total_sin_impuestos += precio_total_sin_impuesto
         total_descuento += descuento
 
-        # --- LÓGICA DE NORMALIZACIÓN DE TARIFA ---
+        # --- LÓGICA DE TARIFA ---
         tarifa_raw = 0.0
         if "tarifaIva" in item:
             tarifa_raw = float(item["tarifaIva"])
         elif item.get("impuestos") and len(item["impuestos"]) > 0:
             tarifa_raw = float(item["impuestos"][0].get("tarifa", 0))
 
-        # Si mandas 0.15, lo convertimos a 15
+        # Normalización (0.15 -> 15)
         tarifa = (tarifa_raw * 100) if (0 < tarifa_raw < 1) else tarifa_raw
-        
-        # Convertir a entero (15.0 -> 15) para buscar en el diccionario
-        tarifa_int = int(tarifa) if tarifa.is_integer() else tarifa
+        tarifa_int = int(round(tarifa)) # Redondeo al entero más cercano por si viene 14.99
 
-        # Buscamos en el mapa. Si no existe, por seguridad cae en IVA 0
         info_sri = CODIGOS_IVA.get(tarifa_int, CODIGOS_IVA[0])
         
-        valor_impuesto = precio_total_sin_impuesto * (tarifa / 100.0)
+        # AJUSTE: El valor del impuesto se redondea a 2 decimales por ítem
+        valor_impuesto = round(precio_total_sin_impuesto * (tarifa_int / 100.0), 2)
 
         # Acumular para el bloque <totalConImpuestos>
         if tarifa_int not in impuestos_acumulados:
@@ -52,13 +54,13 @@ def calcular_totales_e_impuestos(items: list) -> dict:
                 "tarifa": tarifa_int
             }
         
-        impuestos_acumulados[tarifa_int]["baseImponible"] += precio_total_sin_impuesto
-        impuestos_acumulados[tarifa_int]["valor"] += valor_impuesto
+        impuestos_acumulados[tarifa_int]["baseImponible"] = round(impuestos_acumulados[tarifa_int]["baseImponible"] + precio_total_sin_impuesto, 2)
+        impuestos_acumulados[tarifa_int]["valor"] = round(impuestos_acumulados[tarifa_int]["valor"] + valor_impuesto, 2)
 
-        # Armar el detalle para el XML
+        # Detalle para el XML
         detalles_xml.append({
-            "codigoPrincipal": item.get("codigoPrincipal", item.get("codigo", "")),
-            "descripcion": item.get("descripcion", item.get("nombre", "")),
+            "codigoPrincipal": str(item.get("codigoPrincipal", item.get("codigo", "S/C"))),
+            "descripcion": item.get("descripcion", item.get("nombre", "PRODUCTO SIN NOMBRE")).strip().upper(),
             "cantidad": f"{cantidad:.2f}",
             "precioUnitario": f"{precio_unitario:.2f}",
             "descuento": f"{descuento:.2f}",
@@ -74,7 +76,7 @@ def calcular_totales_e_impuestos(items: list) -> dict:
             }
         })
 
-    # Procesar Acumulados
+    # Totales Finales
     total_con_impuestos_xml = []
     subtotal_0 = 0.0
     subtotal_iva = 0.0
@@ -94,7 +96,8 @@ def calcular_totales_e_impuestos(items: list) -> dict:
         else:
             subtotal_iva += imp["baseImponible"]
 
-    importe_total = total_sin_impuestos + total_iva_general
+    # AJUSTE: El importe total final debe ser la suma de los redondeados
+    importe_total = round(total_sin_impuestos + total_iva_general, 2)
 
     return {
         "detallesXml": detalles_xml,

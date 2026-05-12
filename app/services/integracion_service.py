@@ -3,7 +3,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from datetime import datetime, timezone, date
 
+# ==========================================
+# 1. VALIDAR ESTRUCTURA (Establecimiento/Punto)
+# ==========================================
 async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codigo: str, db: AsyncSession):
+    # AJUSTE: Mantenemos la lógica de JOIN, pero nos aseguramos de que apunte a las tablas correctas
     query = text("""
         SELECT p.id, p.secuencial_actual, e.direccion
         FROM puntos_emision p
@@ -28,8 +32,12 @@ async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codig
     }
 
 
+# ==========================================
+# 2. OBTENER STATUS INTEGRAL DEL EMISOR
+# ==========================================
 async def obtener_status_core(emisor_id: int, db: AsyncSession):
-    # Usamos bindparam por seguridad extra aunque ya uses diccionarios
+    # AJUSTE 1: Tabla 'invoices' -> 'invoices_emitidas'
+    # AJUSTE 2: Columna 'balance' -> 'balance_emision'
     query = text("""
         SELECT
             e.ruc, 
@@ -37,7 +45,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             e.nombre_comercial, 
             e.ambiente,
             e.p12_expiration,
-            COALESCE(c.balance, 0) AS creditos_disponibles,
+            COALESCE(c.balance_emision, 0) AS creditos_disponibles,
             (
                 SELECT json_agg(last_docs)
                 FROM (
@@ -45,7 +53,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
                         id, fecha_emision, estado, identificacion_comprador,
                         razon_social_comprador, importe_total AS total,
                         clave_acceso, created_at
-                    FROM invoices 
+                    FROM invoices_emitidas 
                     WHERE emisor_id = e.id
                     ORDER BY created_at DESC
                     LIMIT 20
@@ -62,7 +70,6 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
     if not row:
         raise HTTPException(status_code=404, detail="Emisor no encontrado")
 
-    # Mapping es más limpio en SQLAlchemy 2.0
     data = row._mapping
 
     # Lógica de Firma Electrónica
@@ -70,15 +77,18 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
     firma_valida = False
     
     if expiracion:
-        # 2. CONVERSIÓN CRÍTICA: Si es un 'date', lo pasamos a 'datetime'
+        # Conversión de 'date' a 'datetime' para comparación segura
         if isinstance(expiracion, date) and not isinstance(expiracion, datetime):
             expiracion = datetime.combine(expiracion, datetime.min.time())
 
-        # 3. Ahora sí podemos manejar la zona horaria de forma segura
+        # Manejo de zona horaria UTC para comparación contra datetime.now(timezone.utc)
         if expiracion.tzinfo is None:
             expiracion = expiracion.replace(tzinfo=timezone.utc)
             
         firma_valida = expiracion > datetime.now(timezone.utc)
+
+    # Cálculo de días restantes de forma segura
+    dias_restantes = (expiracion - datetime.now(timezone.utc)).days if expiracion else 0
 
     return {
         "ok": True,
@@ -90,7 +100,7 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             "firma": {
                 "valida": firma_valida,
                 "vencimiento": expiracion.isoformat() if expiracion else None,
-                "dias_restantes": (expiracion - datetime.now(timezone.utc)).days if expiracion else 0
+                "dias_restantes": dias_restantes
             },
         },
         "creditos": data["creditos_disponibles"],

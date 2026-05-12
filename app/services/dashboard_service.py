@@ -1,9 +1,9 @@
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import pytz
-
+import traceback
 
 async def obtener_dashboard_core(
     emisor_id: int | None, 
@@ -13,155 +13,161 @@ async def obtener_dashboard_core(
     db: AsyncSession
 ):
     try:
-        # 1. Perfil y Emisor (Siempre se ejecuta)
-        query_emisor = text("""
-            SELECT e.ruc, e.p12_path, e.p12_expiration, e.ambiente, c.balance, p.whatsapp_number 
+        # ─────────────────────────────────────────────────────────────
+        # QUERY 1: Todo el "header" — emisor + infra + api_keys
+        # Sin filtro de fechas — estos datos no cambian por período
+        # ─────────────────────────────────────────────────────────────
+        query_header = text("""
+            SELECT 
+                e.ruc, e.p12_path, e.p12_expiration, e.ambiente,
+                c.balance_emision AS balance, 
+                p.whatsapp_number, 
+                e.id AS emisor_db_id,
+                (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = e.id) AS total_estab,
+                (SELECT COUNT(*) FROM puntos_emision   WHERE emisor_id = e.id) AS total_puntos,
+                (SELECT COUNT(*) FROM api_keys         WHERE emisor_id = e.id AND revoked = false) AS total_keys
             FROM profiles p
-            LEFT JOIN emisores e ON p.emisor_id = e.id 
-            LEFT JOIN user_credits c ON c.emisor_id = e.id 
+            LEFT JOIN emisores e     ON p.emisor_id  = e.id
+            LEFT JOIN user_credits c ON c.emisor_id  = e.id
             WHERE LOWER(p.email) = LOWER(:email)
         """)
-        res_emisor = await db.execute(query_emisor, {"email": email_usuario})
-        # Usamos .mappings() para acceder por nombre de columna fácilmente
-        row_basic = res_emisor.mappings().fetchone()
+        res_header = await db.execute(query_header, {"email": email_usuario})
+        row_header = res_header.mappings().fetchone()
 
-        if not row_basic:
-            data_basic = {
-                "ruc": None, "p12_expiration": None, "ambiente": None, 
-                "p12_path": None, "balance": 0, "whatsapp_number": None
+        if not row_header:
+            data_header = {
+                "ruc": None, "p12_expiration": None, "ambiente": None,
+                "p12_path": None, "balance": 0, "whatsapp_number": None,
+                "emisor_db_id": None, "total_estab": 0, "total_puntos": 0, "total_keys": 0
             }
         else:
-            data_basic = dict(row_basic)
+            data_header = dict(row_header)
 
-        # Variables por defecto
-        health_stats = {"total_estab": 0, "total_puntos": 0}
+        current_emisor_id = emisor_id or data_header.get("emisor_db_id")
+
+        # ─────────────────────────────────────────────────────────────
+        # QUERY 2: Facturas del período — resumen se calcula en Python
+        # El frontend controla fecha_inicio y fecha_fin libremente
+        # ─────────────────────────────────────────────────────────────
+        facturas_map = []
         resumen = {
-            "total_facturas": 0, "subtotal_iva": 0.0, "subtotal_0": 0.0, 
+            "total_facturas": 0, "subtotal_iva": 0.0, "subtotal_0": 0.0,
             "valor_iva": 0.0, "importe_total": 0.0
         }
-        facturas_map = []
-        total_keys = 0
 
-        # 2. Ejecutamos el resto SOLO si ya completó el onboarding
-        if emisor_id:
-            # Infraestructura
-            query_infra = text("""
-                SELECT 
-                    (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = :eid) as total_estab,
-                    (SELECT COUNT(*) FROM puntos_emision p 
-                     JOIN establecimientos e ON p.establecimiento_id = e.id WHERE e.emisor_id = :eid) as total_puntos
-            """)
-            res_infra = await db.execute(query_infra, {"eid": emisor_id})
-            health_stats = dict(res_infra.mappings().fetchone())
-
-            # Resumen financiero
-            query_resumen = text("""
-                SELECT COUNT(id) as total_facturas, 
-                       COALESCE(SUM(subtotal_iva), 0) as subtotal_iva,
-                       COALESCE(SUM(subtotal_0), 0) as subtotal_0, 
-                       COALESCE(SUM(valor_iva), 0) as valor_iva,
-                       COALESCE(SUM(importe_total), 0) as importe_total
-                FROM invoices 
-                WHERE emisor_id = :eid AND fecha_emision BETWEEN :fini AND :ffin
-            """)
-            res_resumen = await db.execute(query_resumen, {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
-            resumen = dict(res_resumen.mappings().fetchone())
-
-            # Listado de facturas (JOIN con establecimientos y puntos)
+        if current_emisor_id:
             query_facturas = text("""
-                SELECT f.id, f.clave_acceso, e.codigo as estab, p.codigo as punto, f.secuencial, f.estado, 
-                       f.identificacion_comprador, f.razon_social_comprador, f.subtotal_iva,
-                       f.subtotal_0, f.valor_iva, f.importe_total, f.fecha_emision
-                FROM invoices f
-                JOIN puntos_emision p ON f.punto_emision_id = p.id
+                SELECT 
+                    f.id, f.clave_acceso, f.secuencial, f.estado,
+                    f.identificacion_comprador, f.razon_social_comprador,
+                    f.subtotal_iva, f.subtotal_0, f.valor_iva, f.importe_total,
+                    f.fecha_emision,
+                    e.codigo AS estab,
+                    p.codigo AS punto
+                FROM invoices_emitidas f
+                JOIN puntos_emision  p ON f.punto_emision_id  = p.id
                 JOIN establecimientos e ON p.establecimiento_id = e.id
-                WHERE f.emisor_id = :eid AND f.fecha_emision BETWEEN :fini AND :ffin
-                ORDER BY f.created_at DESC LIMIT 50
+                WHERE f.emisor_id    = :eid
+                  AND f.fecha_emision BETWEEN :fini AND :ffin
+                ORDER BY f.fecha_emision DESC, f.created_at DESC
+                LIMIT 100
             """)
-            res_facturas = await db.execute(query_facturas, {"eid": emisor_id, "fini": fecha_inicio, "ffin": fecha_fin})
-            
-            # Mapeo inmediato de facturas
+            res_facturas = await db.execute(query_facturas, {
+                "eid":  current_emisor_id,
+                "fini": fecha_inicio,
+                "ffin": fecha_fin
+            })
+
+            subtotal_iva = subtotal_0 = valor_iva = importe_total = 0.0
+            total_autorizadas = 0
+
             for f in res_facturas.mappings():
                 facturas_map.append({
-                    "id": str(f["id"]),
-                    "clave_acceso": f["clave_acceso"],
-                    "numero": f"{f['estab']}-{f['punto']}-{f['secuencial']}",
+                    "id":            str(f["id"]),
+                    "clave_acceso":  f["clave_acceso"],
+                    "numero":        f"{f['estab']}-{f['punto']}-{f['secuencial']}",
                     "cliente_nombre": f["razon_social_comprador"],
-                    "cliente_id": f["identificacion_comprador"],
-                    "subtotal_15": float(f["subtotal_iva"]),
-                    "subtotal_0": float(f["subtotal_0"]),
-                    "iva": float(f["valor_iva"]),
-                    "total": float(f["importe_total"]),
-                    "estado": f["estado"],
-                    "fecha": f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"])
+                    "cliente_id":    f["identificacion_comprador"],
+                    "subtotal_15":   float(f["subtotal_iva"]),
+                    "subtotal_0":    float(f["subtotal_0"]),
+                    "iva":           float(f["valor_iva"]),
+                    "total":         float(f["importe_total"]),
+                    "estado":        f["estado"],
+                    "fecha":         f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"])
                 })
+                # Resumen solo con AUTORIZADAS
+                if f["estado"] == "AUTORIZADO":
+                    subtotal_iva      += float(f["subtotal_iva"])
+                    subtotal_0        += float(f["subtotal_0"])
+                    valor_iva         += float(f["valor_iva"])
+                    importe_total     += float(f["importe_total"])
+                    total_autorizadas += 1
 
-            # API Keys
-            query_keys = text("SELECT COUNT(*) FROM api_keys WHERE emisor_id = :eid AND revoked = false")
-            res_keys = await db.execute(query_keys, {"eid": emisor_id})
-            total_keys = res_keys.scalar() or 0
+            resumen = {
+                "total_facturas": total_autorizadas,
+                "subtotal_iva":   round(subtotal_iva,  2),
+                "subtotal_0":     round(subtotal_0,    2),
+                "valor_iva":      round(valor_iva,     2),
+                "importe_total":  round(importe_total, 2),
+            }
 
-        # --- Lógica de validación de firma ---
-        tz = pytz.timezone('America/Guayaquil')
-        # Usamos date para comparar con p12_expiration si es tipo DATE en Postgres
-        hoy = datetime.now(tz).date() 
-        
-        expiracion = data_basic.get("p12_expiration")
-        # Si la DB devuelve datetime, convertimos a date para comparar manzanas con manzanas
+        # ─────────────────────────────────────────────────────────────
+        # Lógica de firma — sin query extra, datos ya están en header
+        # ─────────────────────────────────────────────────────────────
+        tz  = pytz.timezone('America/Guayaquil')
+        hoy = datetime.now(tz).date()
+
+        expiracion = data_header.get("p12_expiration")
         if isinstance(expiracion, datetime):
             expiracion = expiracion.date()
 
         firma_vigente = False
-        firma_alerta = None if emisor_id else "Configuración inicial pendiente"
+        firma_alerta  = None if current_emisor_id else "Configuración inicial pendiente"
 
         if expiracion:
-            firma_vigente = expiracion > hoy
             dias_restantes = (expiracion - hoy).days
-
             if dias_restantes <= 0:
-                firma_alerta = "Firma caducada"
-                firma_vigente = False # Forzamos por seguridad
+                firma_alerta  = "Firma caducada"
+                firma_vigente = False
             elif dias_restantes <= 30:
-                firma_alerta = f"Firma próxima a caducar ({dias_restantes} días)"
+                firma_alerta  = f"Firma próxima a caducar ({dias_restantes} días)"
+                firma_vigente = True
+            else:
+                firma_vigente = True
 
         return {
             "ok": True,
             "data": {
                 "health": {
-                    "ruc": bool(data_basic.get("ruc")),
-                    "ambiente_produccion": data_basic.get("ambiente") == 2,
-                    "firma_configurada": bool(data_basic.get("p12_path")),
-                    "firma_vigente": firma_vigente,
-                    "firma_alerta": firma_alerta,
-                    "establecimientos_configurados": int(health_stats["total_estab"]) > 0,
-                    "puntos_emision_configurados": int(health_stats["total_puntos"]) > 0,
-                    "creditos_disponibles": data_basic.get("balance") or 0,
-                    "usuario_nuevo": not emisor_id,
-                    "tiene_api_key": total_keys > 0,
-                    "whatsapp_vinculado": bool(data_basic.get("whatsapp_number")),
-                    "whatsapp_numero": data_basic.get("whatsapp_number")
+                    "ruc":                          bool(data_header.get("ruc")),
+                    "ambiente_produccion":          data_header.get("ambiente") == 2,
+                    "firma_configurada":            bool(data_header.get("p12_path")),
+                    "firma_vigente":                firma_vigente,
+                    "firma_alerta":                 firma_alerta,
+                    "establecimientos_configurados": int(data_header.get("total_estab", 0)) > 0,
+                    "puntos_emision_configurados":  int(data_header.get("total_puntos", 0)) > 0,
+                    "creditos_disponibles":         data_header.get("balance") or 0,
+                    "usuario_nuevo":                not current_emisor_id,
+                    "tiene_api_key":                int(data_header.get("total_keys", 0)) > 0,
+                    "whatsapp_vinculado":           bool(data_header.get("whatsapp_number")),
+                    "whatsapp_numero":              data_header.get("whatsapp_number")
                 },
-                "resumen": {
-                    "total_facturas": int(resumen["total_facturas"]),
-                    "subtotal_iva": float(resumen["subtotal_iva"]),
-                    "subtotal_0": float(resumen["subtotal_0"]),
-                    "valor_iva": float(resumen["valor_iva"]),
-                    "importe_total": float(resumen["importe_total"])
-                },
-                "facturas": facturas_map
+                "resumen":  resumen,
+                "facturas": facturas_map,
+                "periodo": {
+                    "desde": fecha_inicio.isoformat(),
+                    "hasta": fecha_fin.isoformat()
+                }
             }
         }
 
     except Exception as e:
-        # Importante: imprimir el error completo para debuggear
-        import traceback
         traceback.print_exc()
         return {"ok": False, "error": f"Error interno: {str(e)}"}
-    
 
 async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: AsyncSession):
     try:
-        # Añadimos los JOIN para establecimientos y puntos de emisión
+        # AJUSTE: Tabla 'invoices_emitidas'
         query = text("""
             SELECT 
                 i.id AS factura_id,
@@ -179,8 +185,6 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
                 i.mensajes_sri,
                 i.xml_path,
                 i.pdf_path,
-                
-                -- Datos del cliente
                 c.id AS cliente_uid,
                 c.tipo_identificacion_sri,
                 COALESCE(c.identificacion, i.identificacion_comprador) AS identificacion_comprador,
@@ -188,8 +192,7 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
                 c.direccion AS direccion_comprador,
                 COALESCE(c.email, i.email_comprador) AS email_comprador,
                 c.telefono AS telefono_comprador
-                
-            FROM invoices i
+            FROM invoices_emitidas i
             LEFT JOIN clientes_emisor c ON i.cliente_emisor_id = c.id
             LEFT JOIN puntos_emision pe ON i.punto_emision_id = pe.id
             LEFT JOIN establecimientos est ON pe.establecimiento_id = est.id
@@ -200,42 +203,34 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
         factura = res.fetchone()
 
         if not factura:
-            raise HTTPException(status_code=404, detail="Factura no encontrada o no pertenece a este emisor.")
+            raise HTTPException(status_code=404, detail="Factura no encontrada.")
 
         row_dict = dict(factura._mapping)
         
-        # Armamos el número completo (ej: 001-001-000000123)
-        estab = row_dict["estab_codigo"] or "000"
-        pto_emi = row_dict["pto_emi_codigo"] or "000"
-        numero_completo = f"{estab}-{pto_emi}-{row_dict['secuencial']}"
+        # Limpieza de info adicional
+        # AJUSTE: Añadimos validación para que no rompa si 'datos_factura' es None o no tiene la llave
+        datos = row_dict.get("datos_factura") or {}
+        info_raw = datos.get("infoAdicional", {}).get("campoAdicional", [])
         
-        # ==========================================
-        # 🧹 LIMPIEZA DEL FANTASMA DEL XML
-        # ==========================================
-        info_raw = row_dict["datos_factura"].get("infoAdicional", {}).get("campoAdicional", [])
-        
-        # Si el XMLdict lo convirtió en un objeto en vez de lista (pasa cuando hay 1 solo item), lo forzamos a lista
         if isinstance(info_raw, dict):
             info_raw = [info_raw]
             
-        # Transformamos las llaves feas a algo limpio para el frontend
         info_limpia = [
             {"nombre": item.get("@nombre", ""), "valor": item.get("#text", "")} 
             for item in info_raw if isinstance(item, dict)
         ]
-        # ==========================================
         
         return {
             "ok": True,
             "factura": {
                 "id": str(row_dict["factura_id"]),
-                "numero_completo": numero_completo,       
+                "numero_completo": f"{row_dict['estab_codigo'] or '000'}-{row_dict['pto_emi_codigo'] or '000'}-{row_dict['secuencial']}",       
                 "secuencial": row_dict["secuencial"],     
                 "clave_acceso": row_dict["clave_acceso"],
                 "fecha_emision": row_dict["fecha_emision"].strftime('%Y-%m-%d') if row_dict["fecha_emision"] else None,
                 "estado": row_dict["estado"],
                 "totales": {
-                    "importe_total": float(row_dict["importe_total"]),
+                    "importe_total": float(row_dict["importe_total"] or 0),
                     "subtotal_iva": float(row_dict["subtotal_iva"] or 0),
                     "subtotal_0": float(row_dict["subtotal_0"] or 0),
                     "valor_iva": float(row_dict["valor_iva"] or 0)
@@ -245,27 +240,19 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
                     "pdf": row_dict["pdf_path"]
                 },
                 "mensajes_sri": row_dict["mensajes_sri"],
-                
-                # Extracción de JSON
-                "detalles": row_dict["datos_factura"].get("detalles", {}).get("detalle", []),
-                "pagos": row_dict["datos_factura"].get("infoFactura", {}).get("pagos", {}).get("pago", []),
-                
-                # ¡Aquí inyectamos la lista ya limpiecita!
+                "detalles": datos.get("detalles", {}).get("detalle", []),
+                "pagos": datos.get("infoFactura", {}).get("pagos", {}).get("pago", []),
                 "info_adicional": info_limpia 
             },
             "cliente": {
                 "uid": str(row_dict["cliente_uid"]) if row_dict["cliente_uid"] else None,
-                "tipo_identificacion_sri": row_dict["tipo_identificacion_sri"],
                 "identificacion": row_dict["identificacion_comprador"],
                 "razon_social": row_dict["razon_social_comprador"],
-                "direccion": row_dict["direccion_comprador"],
-                "email": row_dict["email_comprador"],
-                "telefono": row_dict["telefono_comprador"]
+                "email": row_dict["email_comprador"]
             }
         }
-
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"Error consultando detalle de factura: {e}")
-        raise HTTPException(status_code=500, detail="Error interno al obtener los detalles de la factura.")
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Error interno.")

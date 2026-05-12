@@ -3,6 +3,7 @@ from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from app.schemas.cliente import ClienteCreate, ClienteUpdate
+from datetime import date, datetime
 
 # ==========================================
 # FUNCIONES AUXILIARES
@@ -69,11 +70,14 @@ def validar_documento_ecuador(documento: str):
         if es_valido:
             return True, "", "04"
         return False, "El número de RUC no es válido.", ""
+    
+    return False, "Documento no reconocido.", ""
 
 
 # ==========================================
-# 1. CREAR CLIENTE
+# 1. GESTIÓN DE CLIENTES (CREATE / UPDATE)
 # ==========================================
+
 async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSession, lanzar_error_si_existe: bool = True):
     try:
         # Verificación de duplicados
@@ -86,7 +90,7 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
                 raise HTTPException(status_code=400, detail="EL CLIENTE YA EXISTE EN SU BASE DE DATOS.")
             return {"ok": True, "mensaje": "CLIENTE YA EXISTÍA", "uid": str(row_existente.id)}
 
-        # --- NORMALIZACIÓN A MAYÚSCULAS ---
+        # --- NORMALIZACIÓN ---
         razon_social_up = cliente.razon_social.strip().upper() if cliente.razon_social else "CLIENTE SIN NOMBRE"
         direccion_up = cliente.direccion.strip().upper() if cliente.direccion else "SIN DIRECCION"
         email_low = cliente.email.strip().lower() if cliente.email else None
@@ -110,8 +114,8 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
                 sujeto_global_id = sg_row.id
             else:
                 insert_sg = text("""
-                    INSERT INTO sujetos_global (tipo_identificacion_sri, identificacion, razon_social)
-                    VALUES (:tipo, :ident, :razon) RETURNING id
+                    INSERT INTO sujetos_global (tipo_identificacion_sri, identificacion, codigo_pais, razon_social)
+                    VALUES (:tipo, :ident, 'EC', :razon) RETURNING id
                 """)
                 res_ins = await db.execute(insert_sg, {"tipo": tipo_sri, "ident": cliente.identificacion, "razon": razon_social_up})
                 sujeto_global_id = res_ins.scalar()
@@ -136,10 +140,13 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
         await db.commit()
         return {"ok": True, "mensaje": "CLIENTE CREADO EXITOSAMENTE.", "uid": str(uid)}
         
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception as e:
         await db.rollback()
-        raise e
-    
+        print(f"Error creando cliente: {e}")
+        raise HTTPException(status_code=500, detail="ERROR AL CREAR EL CLIENTE.")
 
 
 async def actualizar_cliente_core(emisor_id: int, cliente_id: str, datos: ClienteUpdate, db: AsyncSession):
@@ -160,14 +167,13 @@ async def actualizar_cliente_core(emisor_id: int, cliente_id: str, datos: Client
         set_parts = []
 
         for k, v in campos_raw.items():
-            if k == "identificacion": continue # Bloqueado
+            if k == "identificacion": continue # Bloqueado por seguridad
             
-            # --- NORMALIZACIÓN TOTAL ---
             if isinstance(v, str):
                 if k in ["razon_social", "direccion"]:
-                    val = v.strip().upper() # TODO A MAYÚSCULAS
+                    val = v.strip().upper() 
                 elif k == "email":
-                    val = v.strip().lower() # Email minúsculas
+                    val = v.strip().lower() 
                 else:
                     val = v.strip()
             else:
@@ -180,16 +186,21 @@ async def actualizar_cliente_core(emisor_id: int, cliente_id: str, datos: Client
         await db.execute(text(sql), update_params)
         await db.commit()
 
-        return {"ok": True, "mensaje": "DATOS ACTUALIZADOS EN MAYÚSCULAS CORRECTAMENTE."}
+        return {"ok": True, "mensaje": "DATOS ACTUALIZADOS CORRECTAMENTE."}
 
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception as e:
         await db.rollback()
+        print(f"Error actualizando cliente: {e}")
         raise HTTPException(status_code=500, detail="ERROR AL ACTUALIZAR EL CLIENTE.")
 
 
 # ==========================================
-# 2. CONSULTAR UN CLIENTE ESPECÍFICO
+# 2. CONSULTAS INDIVIDUALES Y BÚSQUEDAS
 # ==========================================
+
 async def consultar_cliente_por_identificacion_core(emisor_id: int, identificacion: str, db: AsyncSession):
     # 1. Buscar en la base local del EMISOR
     query_local = text("""
@@ -198,38 +209,35 @@ async def consultar_cliente_por_identificacion_core(emisor_id: int, identificaci
         WHERE emisor_id = :eid AND identificacion = :ident
     """)
     res_local = await db.execute(query_local, {"eid": emisor_id, "ident": identificacion})
-    row = res_local.fetchone()
+    row = res_local.mappings().fetchone()
 
     if row:
         return {
             "ok": True,
             "vinculado_al_emisor": True,
-            "data": dict(row._mapping)
+            "data": dict(row)
         }
 
-    # 2. Si no existe local, buscar en sujetos_global (Para autocompletar nombre de RUCs/Cédulas)
+    # 2. Si no existe local, buscar en sujetos_global
     query_global = text("""
         SELECT id as sujeto_global_id, tipo_identificacion_sri, identificacion, razon_social
         FROM sujetos_global
         WHERE identificacion = :ident
     """)
     res_global = await db.execute(query_global, {"ident": identificacion})
-    row_g = res_global.fetchone()
+    row_g = res_global.mappings().fetchone()
 
     if row_g:
         return {
             "ok": True,
             "vinculado_al_emisor": False,
-            "mensaje": "Encontrado en base unificada. Se registrará al emitir factura.",
-            "data": dict(row_g._mapping)
+            "mensaje": "Encontrado en base unificada.",
+            "data": dict(row_g)
         }
 
     raise HTTPException(status_code=404, detail="Cliente no encontrado.")
 
 
-# ==========================================
-# 3. VERIFICAR EXISTENCIA (LISTA DE COINCIDENCIAS)
-# ==========================================
 async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str, db: AsyncSession):
     query = text("""
         SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
@@ -238,7 +246,7 @@ async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str,
     """)
     
     res = await db.execute(query, {"eid": emisor_id, "ident": identificacion})
-    rows = res.fetchall()
+    rows = res.mappings().fetchall()
 
     if not rows:
         return {"existe": False, "coincidencias": []}
@@ -246,13 +254,10 @@ async def verificar_existencia_cliente_core(emisor_id: int, identificacion: str,
     return {
         "existe": True,
         "cantidad": len(rows),
-        "coincidencias": [dict(r._mapping) for r in rows]
+        "coincidencias": [dict(r) for r in rows]
     }
 
 
-# ==========================================
-# 4. BÚSQUEDA MASIVA + CONSUMIDOR FINAL
-# ==========================================
 async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: AsyncSession):
     try:
         uuids_validos = []
@@ -266,34 +271,20 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
         resultados = []
 
         if uuids_validos:
-            # 1. Definimos la query usando :uids
-            # 2. Usamos .bindparams para decirle a SQLAlchemy que 'uids' es una lista expandible
             query = text("""
-                SELECT 
-                    id as uid, 
-                    tipo_identificacion_sri, 
-                    identificacion, 
-                    razon_social, 
-                    direccion, 
-                    email, 
-                    telefono
+                SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
                 FROM clientes_emisor
-                WHERE emisor_id = :eid 
-                AND id::text IN :uids
+                WHERE emisor_id = :eid AND id::text IN :uids
             """).bindparams(bindparam("uids", expanding=True))
             
-            # Ejecutamos pasando la lista directamente (no hace falta tuple() aquí)
-            res = await db.execute(query, {
-                "eid": emisor_id, 
-                "uids": uuids_validos
-            })
+            res = await db.execute(query, {"eid": emisor_id, "uids": uuids_validos})
             
-            for r in res.fetchall():
-                d = dict(r._mapping)
+            for r in res.mappings().fetchall():
+                d = dict(r)
                 d["uid"] = str(d["uid"])
                 resultados.append(d)
 
-        # Consumidor Final
+        # Añadir Consumidor Final por defecto
         resultados.append({
             "uid": None,
             "tipo_identificacion_sri": "07",
@@ -304,128 +295,105 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
             "telefono": ""
         })
 
-        return {
-            "ok": True,
-            "total_encontrados": len(resultados),
-            "data": resultados
-        }
+        return {"ok": True, "total_encontrados": len(resultados), "data": resultados}
 
     except Exception as e:
-        print(f"❌ [Bulk Search Error] {str(e)}")
-        raise HTTPException(status_code=500, detail="Error en la base de datos al buscar clientes.")
+        print(f"❌ [Bulk Search Error] {e}")
+        raise HTTPException(status_code=500, detail="Error al buscar clientes.")
 
-# ==========================================
-# 5. LISTAR TODOS LOS CLIENTES (Exclusivo App)
-# ==========================================
+
 async def consultar_todos_clientes_core(emisor_id: int, db: AsyncSession):
     try:
         query = text("""
-            SELECT 
-                id as uid, 
-                tipo_identificacion_sri, 
-                identificacion, 
-                razon_social, 
-                direccion, 
-                email, 
-                telefono,
-                created_at
+            SELECT id as uid, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono, created_at
             FROM clientes_emisor
             WHERE emisor_id = :eid
             ORDER BY razon_social ASC
         """)
-        
         res = await db.execute(query, {"eid": emisor_id})
-        rows = res.fetchall()
-
-        return {
-            "ok": True,
-            "total": len(rows),
-            "data": [dict(r._mapping) for r in rows]
-        }
-
+        rows = res.mappings().fetchall()
+        return {"ok": True, "total": len(rows), "data": [dict(r) for r in rows]}
     except Exception as e:
-        print(f"Error consultando listado completo de clientes: {e}")
-        raise HTTPException(status_code=500, detail="Error interno al obtener los clientes.")
-    
+        raise HTTPException(status_code=500, detail="Error al obtener listado de clientes.")
+
 
 # ==========================================
-# 6. DETALLE DE CLIENTE Y SU HISTORIAL (Por UUID)
+# 3. DETALLES E HISTORIAL
 # ==========================================
+
 async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: AsyncSession):
     try:
-        # 1. Obtenemos datos básicos del cliente
-        query_cliente = text("""
+        # Una sola query — cliente + facturas con LEFT JOIN
+        query = text("""
             SELECT 
-                id, tipo_identificacion_sri, identificacion, 
-                razon_social, direccion, email, telefono
-            FROM clientes_emisor
-            WHERE id = :cid AND emisor_id = :eid
-        """)
-        res_cliente = await db.execute(query_cliente, {"cid": cliente_id, "eid": emisor_id})
-        cliente = res_cliente.fetchone()
-
-        if not cliente:
-            raise HTTPException(status_code=404, detail="EL CLIENTE NO EXISTE O NO LE PERTENECE.")
-
-        # 2. Obtenemos facturas con el número formateado (Est-Punto-Secuencial)
-        # Usamos un JOIN con establecimientos y puntos_emision para armar el número completo
-        query_facturas = text("""
-            SELECT 
-                i.id,
-                e.codigo || '-' || p.codigo || '-' || i.secuencial AS numero_factura,
+                c.id, c.tipo_identificacion_sri, c.identificacion, c.razon_social, 
+                c.direccion, c.email, c.telefono,
+                i.id AS factura_id,
+                est.codigo || '-' || p.codigo || '-' || i.secuencial AS numero_factura,
                 i.importe_total,
                 i.fecha_emision,
                 i.estado
-            FROM invoices i
-            JOIN puntos_emision p ON i.punto_emision_id = p.id
-            JOIN establecimientos e ON p.establecimiento_id = e.id
-            WHERE i.cliente_emisor_id = :cid AND i.emisor_id = :eid
-            ORDER BY i.fecha_emision DESC
+            FROM clientes_emisor c
+            LEFT JOIN invoices_emitidas i  ON i.cliente_emisor_id = c.id AND i.emisor_id = :eid
+            LEFT JOIN puntos_emision p      ON i.punto_emision_id  = p.id
+            LEFT JOIN establecimientos est  ON p.establecimiento_id = est.id
+            WHERE c.id = :cid AND c.emisor_id = :eid
+            ORDER BY i.created_at DESC
         """)
-        
-        res_facturas = await db.execute(query_facturas, {"cid": cliente_id, "eid": emisor_id})
-        facturas = res_facturas.fetchall()
+        res = await db.execute(query, {"cid": cliente_id, "eid": emisor_id})
+        rows = res.mappings().fetchall()
 
-        # 3. Procesamiento simplificado
+        if not rows:
+            raise HTTPException(status_code=404, detail="EL CLIENTE NO EXISTE.")
+
+        # Datos del cliente — mismos en todas las filas
+        first = rows[0]
+        cliente = {
+            "id":                    str(first["id"]),
+            "tipo_identificacion_sri": first["tipo_identificacion_sri"],
+            "identificacion":        first["identificacion"],
+            "razon_social":          first["razon_social"],
+            "direccion":             first["direccion"],
+            "email":                 first["email"],
+            "telefono":              first["telefono"],
+        }
+
         lista_facturas = []
-        total_facturado = 0.0
+        total_facturado = 0.0  # solo AUTORIZADAS
 
-        for f in facturas:
-            monto = float(f.importe_total) if f.importe_total else 0.0
-            total_facturado += monto
-            
+        for f in rows:
+            if f["factura_id"] is None:
+                continue  # cliente existe pero sin facturas
+            monto = float(f["importe_total"]) if f["importe_total"] else 0.0
             lista_facturas.append({
-                "id": str(f.id),
-                "numero_factura": f.numero_factura,
-                "importe_total": monto,
-                "fecha_emision": f.fecha_emision.strftime('%Y-%m-%d') if f.fecha_emision else None,
-                "estado": f.estado
+                "id":             str(f["factura_id"]),
+                "numero_factura": f["numero_factura"],
+                "importe_total":  monto,
+                "fecha_emision":  f["fecha_emision"].strftime('%Y-%m-%d') if f["fecha_emision"] else None,
+                "estado":         f["estado"]
             })
+            if f["estado"] == "AUTORIZADO":
+                total_facturado += monto
 
         return {
             "ok": True,
-            "cliente": dict(cliente._mapping),
+            "cliente": cliente,
             "resumen": {
-                "total_facturas": len(lista_facturas),
-                "suma_facturada": round(total_facturado, 2)
+                "total_facturas":  len(lista_facturas),
+                "suma_facturada":  round(total_facturado, 2)
             },
             "facturas": lista_facturas
         }
 
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ Error consultando detalle cliente: {e}")
-        raise HTTPException(status_code=500, detail="ERROR INTERNO AL CONSULTAR EL HISTORIAL.")
-    
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail="ERROR AL CONSULTAR HISTORIAL.")
+
 
 async def verificar_cliente_existente_flexible(emisor_id: int, busqueda: str, db: AsyncSession):
-    """
-    Busca un cliente por UUID (id) o por Identificación (Cédula/RUC).
-    Retorna True/False y el UID encontrado.
-    """
     try:
-        # 1. Determinar si la búsqueda es un UUID o una Identificación
         es_uuid = False
         try:
             uuid.UUID(busqueda)
@@ -433,38 +401,19 @@ async def verificar_cliente_existente_flexible(emisor_id: int, busqueda: str, db
         except ValueError:
             es_uuid = False
 
-        # 2. Construir la consulta según el tipo de dato
         if es_uuid:
-            sql = text("""
-                SELECT id FROM clientes_emisor 
-                WHERE emisor_id = :eid AND id = :busqueda
-            """)
+            sql = text("SELECT id FROM clientes_emisor WHERE emisor_id = :eid AND id = :busqueda")
         else:
-            # Si no es UUID, asumimos que es identificación (limpiamos el string por si acaso)
-            ident_limpia = busqueda.replace("-", "").replace(".", "").strip()
-            sql = text("""
-                SELECT id FROM clientes_emisor 
-                WHERE emisor_id = :eid AND identificacion = :busqueda
-            """)
-            busqueda = ident_limpia
+            busqueda = busqueda.replace("-", "").replace(".", "").strip()
+            sql = text("SELECT id FROM clientes_emisor WHERE emisor_id = :eid AND identificacion = :busqueda")
 
-        # 3. Ejecutar
         res = await db.execute(sql, {"eid": emisor_id, "busqueda": busqueda})
         row = res.fetchone()
 
         if row:
-            return {
-                "valido": True,
-                "existe": True,
-                "uid": str(row.id)
-            }
+            return {"valido": True, "existe": True, "uid": str(row.id)}
         
-        return {
-            "valido": True, 
-            "existe": False, 
-            "uid": None
-        }
+        return {"valido": True, "existe": False, "uid": None}
 
     except Exception as e:
-        print(f"Error en verificación flexible: {e}")
         return {"valido": False, "existe": False, "uid": None}
