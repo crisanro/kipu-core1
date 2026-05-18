@@ -13,6 +13,8 @@ from app.utils.crypto import generar_clave_acceso, decrypt_password
 from app.services.storage_service import upload_file, download_file, delete_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
+from app.core.config import settings
+
 import pytz
 
 URLS_SRI = {
@@ -25,7 +27,7 @@ URLS_SRI = {
         "autorizacion": "https://cel.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
     }
 }
-NODE_SIGNER_URL = "http://localhost:3000/api/firmar"
+NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
 async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSession):
     if not factura_data.get("establecimiento") or not factura_data.get("punto_emision"):

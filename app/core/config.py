@@ -33,6 +33,8 @@ def get_aws_secret():
 
 class Settings(BaseSettings):
     DATABASE_URL: str = Field(validation_alias="DATABASE_URL_KIPU")
+    REDIS_URL: str 
+    NODE_SIGNER_URL: str
     FIREBASE_PROJECT_ID: str
     FIREBASE_CLIENT_EMAIL: str
     FIREBASE_PRIVATE_KEY_ID: str
@@ -49,12 +51,13 @@ class Settings(BaseSettings):
     PORT: int = 3000
     FRONTEND_URL: str
     DEBUG_SIGNER: bool = False
-    REDIS_URL: str = "redis://localhost:6379/0"
+    
 
     R2_ACCOUNT_ID:        str
     R2_ACCESS_KEY_ID:     str
     R2_SECRET_ACCESS_KEY: str
     R2_BUCKET_NAME:       str
+    R2_PUBLIC_URL:        str
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 """
@@ -82,3 +85,13 @@ except Exception:
     except Exception as final_error:
         print(f"❌ Error fatal de configuración: {final_error}")
         raise final_error    
+    
+
+# Sobreescribir con .env local si existen — tienen prioridad
+if os.getenv("DATABASE_URL"):
+    settings.DATABASE_URL = os.getenv("DATABASE_URL")
+if os.getenv("REDIS_URL"):
+    settings.REDIS_URL = os.getenv("REDIS_URL")
+if os.getenv("NODE_SIGNER_URL"):
+    settings.NODE_SIGNER_URL = os.getenv("NODE_SIGNER_URL")
+

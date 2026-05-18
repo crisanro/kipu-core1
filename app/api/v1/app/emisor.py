@@ -1,45 +1,42 @@
+# app/api/v1/app/emisor.py
 import time
 import httpx
 import base64
 import os
-from datetime import datetime
-from typing import Optional
-from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException, status
+from datetime import datetime, date
+from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Importaciones de tu core
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.schemas.emisor import OnboardingRequest, EmisorUpdate
 from app.services.storage_service import upload_file, delete_folder
 from app.utils.crypto import encrypt_password
+from app.core.cache import cache_get, cache_set, cache_delete, invalidate_emisor, CK, TTL
+from app.core.rate_limit import RateLimit, RateLimitScope
+from app.core.security import validar_y_quemar_pin
+from app.core.config import settings
+
 
 router = APIRouter()
 
-# --- CONFIGURACIÓN ---
-NODE_VALIDATOR_URL = os.getenv("NODE_VALIDATOR_URL", "http://localhost:3000/api/validar-p12")
+NODE_VALIDATOR_URL = f"{settings.NODE_SIGNER_URL}/api/validar-p12"
+
+
+# ── Validación RUC ─────────────────────────────────────────────────────────────
 
 def validar_ruc_ecuador(ruc: str):
-    """
-    Valida estrictamente un RUC de 13 dígitos para el onboarding.
-    Retorna (bool, mensaje_error)
-    """
     ruc = ruc.strip()
-    
     if not ruc.isdigit() or len(ruc) != 13:
         return False, "El RUC debe tener exactamente 13 dígitos numéricos."
-    
     if not ruc.endswith("001"):
         return False, "El RUC debe terminar en 001."
-        
     provincia = int(ruc[0:2])
     if provincia < 1 or provincia > 24:
         return False, "Los dos primeros dígitos (provincia) son inválidos."
-        
     tercer_digito = int(ruc[2])
-    
-    # --- PERSONA NATURAL (Menor a 6) ---
+
     if tercer_digito < 6:
         coeficientes = [2, 1, 2, 1, 2, 1, 2, 1, 2]
         digitos = [int(x) for x in ruc[:9]]
@@ -50,8 +47,6 @@ def validar_ruc_ecuador(ruc: str):
         verificador = 0 if suma % 10 == 0 else 10 - (suma % 10)
         if verificador != int(ruc[9]):
             return False, "El número de cédula base del RUC es incorrecto."
-            
-    # --- PERSONA JURÍDICA (9) ---
     elif tercer_digito == 9:
         coeficientes = [4, 3, 2, 7, 6, 5, 4, 3, 2]
         digitos = [int(x) for x in ruc[:9]]
@@ -59,8 +54,6 @@ def validar_ruc_ecuador(ruc: str):
         verificador = 0 if suma % 11 == 0 else 11 - (suma % 11)
         if verificador != int(ruc[9]):
             return False, "El RUC jurídico no supera la validación de módulo 11."
-
-    # --- ENTIDAD PÚBLICA (6) ---
     elif tercer_digito == 6:
         coeficientes = [3, 2, 7, 6, 5, 4, 3, 2]
         digitos = [int(x) for x in ruc[:8]]
@@ -68,124 +61,112 @@ def validar_ruc_ecuador(ruc: str):
         verificador = 0 if suma % 11 == 0 else 11 - (suma % 11)
         if verificador != int(ruc[8]):
             return False, "El RUC público no supera la validación de módulo 11."
-    
     else:
         return False, "El tercer dígito del RUC es inválido."
-            
     return True, ""
 
 
+def mayusculas(texto: str | None) -> str | None:
+    """Convierte a mayúsculas y limpia espacios. Retorna None si está vacío."""
+    return texto.strip().upper() if texto and texto.strip() else None
+
+# ── POST /onboarding ───────────────────────────────────────────────────────────
+
 @router.post("/onboarding", summary="Registro inicial (Onboarding)", status_code=201)
 async def onboarding(
-    data: OnboardingRequest, 
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    data: OnboardingRequest,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.AUTH, use_ip=True)),
 ):
     if auth_data.get("emisor_id"):
         return {"ok": False, "mensaje": "Tu cuenta ya tiene una empresa vinculada."}
-    
+
     es_valido, mensaje_error = validar_ruc_ecuador(data.ruc)
     if not es_valido:
         raise HTTPException(status_code=400, detail=mensaje_error)
-    
-    try:
-        razon_social_up      = data.razon_social.upper()
-        nombre_comercial_up  = (data.nombre_comercial or data.razon_social).upper()
-        direccion_up         = data.direccion_matriz.upper()
 
-        # 1. Crear emisor
+    try:
+        razon_social_up     = mayusculas(data.razon_social)
+        nombre_comercial_up = mayusculas(data.nombre_comercial)
+        direccion_up        = mayusculas(data.direccion_matriz)
+
         res_emisor = await db.execute(text("""
             INSERT INTO emisores (
                 ruc, razon_social, nombre_comercial,
-                direccion_matriz, obligado_contabilidad, contribuyente_especial,
-                ambiente
+                direccion_matriz, obligado_contabilidad, contribuyente_especial, ambiente
             )
             VALUES (:ruc, :rs, :nc, :dir, :obl, :ce, 1)
             RETURNING id
         """), {
-            "ruc": data.ruc,
-            "rs":  razon_social_up,
-            "nc":  nombre_comercial_up,
-            "dir": direccion_up,
-            "obl": (data.obligado_contabilidad or 'NO').upper(),
+            "ruc": data.ruc, "rs": razon_social_up, "nc": nombre_comercial_up,
+            "dir": direccion_up, "obl": (data.obligado_contabilidad or 'NO').upper(),
             "ce":  (data.contribuyente_especial or '').upper(),
         })
         new_emisor_id = res_emisor.scalar()
 
-        # 2. Crear perfil
         full_name_up = (data.full_name or data.razon_social).upper()
         await db.execute(text("""
             INSERT INTO profiles (firebase_uid, emisor_id, email, full_name, role)
             VALUES (:uid, :eid, :email, :fname, 'admin')
         """), {
-            "uid":   auth_data["uid"],
-            "eid":   new_emisor_id,
-            "email": auth_data["email"].lower(),
-            "fname": full_name_up,
+            "uid": auth_data["uid"], "eid": new_emisor_id,
+            "email": auth_data["email"].lower(), "fname": full_name_up,
         })
 
-        # 3. Créditos iniciales — ahora con balance_emision y balance_recepcion
         await db.execute(text("""
             INSERT INTO user_credits (emisor_id, balance_emision, balance_recepcion)
             VALUES (:eid, 10, 0)
         """), {"eid": new_emisor_id})
 
-        # 4. Registrar transacción del bono de bienvenida
         await db.execute(text("""
             INSERT INTO credit_transactions
                 (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
-            VALUES
-                (:eid, 'BONO', 10, 0.00, 'SISTEMA', 'REGALO POR APERTURA DE CUENTA')
+            VALUES (:eid, 'BONO', 10, 0.00, 'SISTEMA', 'REGALO POR APERTURA DE CUENTA')
         """), {"eid": new_emisor_id})
 
         await db.commit()
-        return {
-            "ok":        True,
-            "mensaje":   "EMPRESA Y PERFIL CONFIGURADOS CORRECTAMENTE.",
-            "emisor_id": new_emisor_id,
-        }
+        return {"ok": True, "mensaje": "EMPRESA Y PERFIL CONFIGURADOS CORRECTAMENTE.", "emisor_id": new_emisor_id}
 
     except Exception as e:
         await db.rollback()
-        import traceback
-        print(traceback.format_exc())
+        import traceback; traceback.print_exc()
         if "23505" in str(e):
             raise HTTPException(status_code=400, detail="EL RUC INGRESADO YA ESTÁ REGISTRADO.")
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL PROCESAR EL REGISTRO.")
-    
+
+
+# ── POST /firma ────────────────────────────────────────────────────────────────
 
 @router.post("/firma", summary="Subir firma electrónica (P12)")
 async def upload_p12(
-    password: str = Form(...), 
-    file: UploadFile = File(...), 
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    password: str = Form(...),
+    file: UploadFile = File(...),
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.AUTH)),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
-    
-    # 1. Obtener RUC
+
     res_emisor = await db.execute(
-        text("SELECT ruc, p12_path FROM emisores WHERE id = :eid"), 
-        {"eid": emisor_id}
+        text("SELECT ruc, p12_path FROM emisores WHERE id = :eid"), {"eid": emisor_id}
     )
     emisor = res_emisor.fetchone()
     if not emisor:
         raise HTTPException(status_code=404, detail="EMISOR NO ENCONTRADO.")
-    
-    # 2. Validar archivo
+
     if not file.filename.lower().endswith('.p12'):
         raise HTTPException(status_code=400, detail="EL ARCHIVO DEBE SER UN FORMATO .P12 VÁLIDO.")
 
     file_bytes = await file.read()
     p12_base64 = base64.b64encode(file_bytes).decode('utf-8')
 
-    # 3. Validación en Node.js
     async with httpx.AsyncClient() as client:
         try:
             res_node = await client.post(
-                NODE_VALIDATOR_URL, 
+                NODE_VALIDATOR_URL,
                 json={"p12Base64": p12_base64, "password": password, "ruc": emisor.ruc},
                 timeout=20.0
             )
@@ -193,88 +174,69 @@ async def upload_p12(
         except Exception as e:
             print(f"❌ Error conexión Node.js: {str(e)}")
             raise HTTPException(status_code=500, detail="ERROR AL CONECTAR CON EL VALIDADOR.")
-        
-    if not val.get("ok"):
-        err_msg = val.get("mensaje", "CERTIFICADO INVÁLIDO.").upper()
-        raise HTTPException(status_code=400, detail=err_msg)
 
-    # --- AQUÍ DEFINIMOS LAS VARIABLES PARA QUE ESTÉN DISPONIBLES EN TODO EL BLOQUE ---
-    p12_path_completo = None 
+    if not val.get("ok"):
+        raise HTTPException(status_code=400, detail=val.get("mensaje", "CERTIFICADO INVÁLIDO.").upper())
 
     try:
-        # 4. Limpieza Storage
         if emisor.p12_path:
             try:
                 delete_folder(f"{emisor.ruc}/firmas/")
-            except: pass
+            except:
+                pass
 
-        # 5. Subida a MinIO
-        file_name = f"{emisor.ruc}/firmas/CERTIFICADO_{emisor.ruc}.p12"
-        p12_path_completo = upload_file(file_name, file_bytes, 'application/x-pkcs12')
-        # 6. Preparar datos para DB
+        # Nombre con timestamp para evitar conflictos de caché en R2
+        p12_filename      = f"firma_{emisor.ruc}_{int(time.time())}.p12"
+        p12_path_completo = f"{emisor.ruc}/firmas/{p12_filename}"
+        upload_file(p12_path_completo, file_bytes, "application/x-pkcs12")
+
         pass_enc = encrypt_password(password)
-        
-        # Leemos la fecha de donde sea que venga (tu log mostró que viene en datos.vence)
-        raw_exp = val.get("expiration") or val.get("datos", {}).get("vence")
+
+        # Manejo robusto de fecha — el validador puede retornar en diferentes campos
+        raw_exp = val.get("expiracion") or val.get("expiration") or val.get("datos", {}).get("vence")
         if not raw_exp:
-            raise ValueError("No se encontró la fecha de expiración en la respuesta.")
-        
-        # Convertimos el string ISO a un objeto DATE real de Python
-        # Tomamos los primeros 10 caracteres 'YYYY-MM-DD' y lo convertimos
+            raise ValueError("No se encontró la fecha de expiración en la respuesta del validador.")
         fecha_objeto = datetime.strptime(str(raw_exp)[:10], '%Y-%m-%d').date()
 
-        # 7. Update en Base de Datos
-        query_update = text("""
-            UPDATE public.emisores 
-            SET 
-                p12_path = :path, 
-                p12_pass = :pass, 
-                p12_expiration = :exp, 
-                updated_at = NOW()
+        # p12_pass — nombre original de la columna en tu DB
+        await db.execute(text("""
+            UPDATE emisores
+            SET p12_path = :path, p12_pass = :pass, p12_expiration = :exp, updated_at = NOW()
             WHERE id = :eid
-        """)
-        
-        await db.execute(query_update, {
-            "path": p12_path_completo,
-            "pass": pass_enc,
-            "exp": fecha_objeto,
-            "eid": emisor_id
-        })
-        
+        """), {"path": p12_path_completo, "pass": pass_enc, "exp": fecha_objeto, "eid": emisor_id})
+
         await db.commit()
-        return {"ok": True, "mensaje": "FIRMA VINCULADA CORRECTAMENTE."}
-        
+        await invalidate_emisor(emisor_id)
+
+        return {"ok": True, "mensaje": "FIRMA ELECTRÓNICA CONFIGURADA CORRECTAMENTE.", "expiracion": str(fecha_objeto)}
+
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
         print(f"❌ ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="ERROR AL GUARDAR EN BASE DE DATOS.")
-    
+        raise HTTPException(status_code=500, detail="ERROR AL GUARDAR LA FIRMA.")
+
+
+# ── DELETE /firma ──────────────────────────────────────────────────────────────
 
 @router.delete("/firma", summary="Eliminar firma electrónica")
 async def remove_p12(
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Elimina los archivos de la firma en Storage y limpia los campos en la DB.
-    """
     emisor_id = auth_data.get("emisor_id")
-    
     if not emisor_id:
         raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
 
-    # 1. Obtener la ruta del archivo antes de borrar los datos de la DB
     res = await db.execute(
-        text("SELECT ruc, p12_path FROM emisores WHERE id = :eid"), 
-        {"eid": emisor_id}
+        text("SELECT ruc, p12_path FROM emisores WHERE id = :eid"), {"eid": emisor_id}
     )
     emisor = res.fetchone()
-
     if not emisor:
         raise HTTPException(status_code=404, detail="EMISOR NO ENCONTRADO.")
 
     try:
-        # 2. Si hay un archivo en Storage, lo eliminamos
         if emisor.p12_path:
             try:
                 delete_folder(f"{emisor.ruc}/firmas/")
@@ -282,61 +244,62 @@ async def remove_p12(
             except Exception as e:
                 print(f"⚠️ No se pudo eliminar carpeta firmas: {str(e)}")
 
-        # 3. Limpiar los campos en la Base de Datos
-        query_cleanup = text("""
-            UPDATE emisores 
-            SET 
-                p12_path = NULL, 
-                p12_pass = NULL, 
-                p12_expiration = NULL, 
-                updated_at = NOW()
+        await db.execute(text("""
+            UPDATE emisores
+            SET p12_path = NULL, p12_pass = NULL, p12_expiration = NULL, updated_at = NOW()
             WHERE id = :eid
-        """)
-        
-        await db.execute(query_cleanup, {"eid": emisor_id})
+        """), {"eid": emisor_id})
         await db.commit()
+        await invalidate_emisor(emisor_id)
 
-        return {
-            "ok": True, 
-            "mensaje": "LA FIRMA ELECTRÓNICA Y SUS DATOS HAN SIDO ELIMINADOS CORRECTAMENTE."
-        }
+        return {"ok": True, "mensaje": "LA FIRMA ELECTRÓNICA Y SUS DATOS HAN SIDO ELIMINADOS CORRECTAMENTE."}
 
     except Exception as e:
         await db.rollback()
         print(f"❌ ERROR AL ELIMINAR FIRMA: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail="ERROR INTERNO AL INTENTAR ELIMINAR LOS DATOS DE LA FIRMA."
-        )
+        raise HTTPException(status_code=500, detail="ERROR INTERNO AL INTENTAR ELIMINAR LOS DATOS DE LA FIRMA.")
 
+
+# ── GET /config — CON CACHE ────────────────────────────────────────────────────
 
 @router.get("/config", summary="Obtener configuración fiscal y de firma")
 async def get_config(
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         return {"ok": True, "configurado": False, "mensaje": "Pendiente de configuración inicial (Onboarding)."}
-    
+
+    # ── Cache hit ──
+    cache_key = CK.fmt(CK.EMISOR, eid=emisor_id)
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
+    # OPTIMIZACIÓN: JOIN con user_credits en una sola query
     res = await db.execute(text("""
-        SELECT ruc, razon_social, nombre_comercial, direccion_matriz, contribuyente_especial, 
-               obligado_contabilidad, ambiente, p12_path, p12_expiration, created_at,
-               ws_establecimiento, ws_punto_emision
-        FROM emisores WHERE id = :eid
+        SELECT
+            e.ruc, e.razon_social, e.nombre_comercial, e.direccion_matriz,
+            e.contribuyente_especial, e.obligado_contabilidad, e.ambiente,
+            e.p12_path, e.p12_expiration, e.created_at,
+            e.ws_establecimiento, e.ws_punto_emision,
+            c.balance_emision, c.balance_recepcion
+        FROM emisores e
+        LEFT JOIN user_credits c ON c.emisor_id = e.id
+        WHERE e.id = :eid
     """), {"eid": emisor_id})
     data = res.fetchone()
     if not data:
         raise HTTPException(status_code=404, detail="EMISOR NO ENCONTRADO.")
 
-    # Firma
     expiracion   = data.p12_expiration
     nombre_firma = data.p12_path.split('/')[-1] if data.p12_path else 'No configurada'
-    firma_info = {
-        "configurada":        bool(data.p12_path),
-        "nombre":             nombre_firma,
-        "expiracion":         expiracion,
-        "estado":             'PENDIENTE',
+    firma_info   = {
+        "configurada":         bool(data.p12_path),
+        "nombre":              nombre_firma,
+        "expiracion":          expiracion,
+        "estado":              'PENDIENTE',
         "mensaje_vencimiento": 'Firma no cargada'
     }
     if expiracion:
@@ -350,7 +313,6 @@ async def get_config(
         else:
             firma_info.update({"estado": 'VIGENTE',   "mensaje_vencimiento": f"Vigente hasta el {fecha_fmt}"})
 
-    # WhatsApp
     ws_configurado = bool(data.ws_establecimiento and data.ws_punto_emision)
     whatsapp_info  = {
         "configurado":     ws_configurado,
@@ -358,155 +320,119 @@ async def get_config(
         "punto_emision":   data.ws_punto_emision   if ws_configurado else None,
     }
 
-    # Legal — excluimos campos que van en sus propias secciones
-    legal_data = {
-        k: v for k, v in data._mapping.items()
-        if k not in ("p12_path", "p12_expiration", "ws_establecimiento", "ws_punto_emision")
-    }
+    _excluir = {"p12_path", "p12_expiration", "ws_establecimiento", "ws_punto_emision"}
+    legal_data = {k: v for k, v in data._mapping.items() if k not in _excluir}
 
-    return {
-        "ok":         True, 
+    response = {
+        "ok":          True,
         "configurado": True,
         "data": {
-            "legal":     legal_data,
-            "firma":     firma_info,
-            "whatsapp":  whatsapp_info
+            "legal":    legal_data,
+            "firma":    firma_info,
+            "whatsapp": whatsapp_info,
+            "creditos": {
+                "balance_emision":   data.balance_emision,
+                "balance_recepcion": data.balance_recepcion,
+            }
         }
     }
 
+    await cache_set(cache_key, response, TTL.EMISOR_PERFIL)
+    return response
+
+
+# ── PATCH /config ──────────────────────────────────────────────────────────────
 
 @router.patch("/config", summary="Actualizar configuración del emisor")
 async def update_config(
-    data: EmisorUpdate, 
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    data: EmisorUpdate,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
 
-    # Filtramos y convertimos a MAYÚSCULAS dinámicamente
     update_data = {}
     for k, v in data.model_dump().items():
-        if v is not None:
-            # Si el valor es texto, lo hacemos MAYÚSCULAS
-            update_data[k] = v.upper() if isinstance(v, str) else v
-    
+        if v is None:
+            continue
+        update_data[k] = mayusculas(v) if isinstance(v, str) else v
+
     if not update_data:
         return {"ok": True, "mensaje": "NO SE DETECTARON CAMBIOS POR APLICAR."}
-        
+
     set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
     update_data["eid"] = emisor_id
-    
+
     try:
-        query = text(f"UPDATE emisores SET {set_clause}, updated_at = NOW() WHERE id = :eid")
-        await db.execute(query, update_data)
+        await db.execute(
+            text(f"UPDATE emisores SET {set_clause}, updated_at = NOW() WHERE id = :eid"),
+            update_data
+        )
         await db.commit()
+        await invalidate_emisor(emisor_id)
         return {"ok": True, "mensaje": "CONFIGURACIÓN ACTUALIZADA CORRECTAMENTE."}
-        
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL ACTUALIZAR.")
-    
+
+
+# ── POST /produccion ───────────────────────────────────────────────────────────
+
 
 @router.post("/produccion", summary="Activar ambiente de producción")
 async def activar_produccion(
+    pin: str,                                          # ← nuevo, obligatorio
     auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
 
-    # ─── 1. Verificar estado actual del emisor ────────────────────────────────
     res = await db.execute(text("""
-        SELECT ruc, ambiente, p12_path, p12_expiration
-        FROM emisores WHERE id = :eid
+        SELECT ruc, ambiente, p12_path, p12_expiration FROM emisores WHERE id = :eid
     """), {"eid": emisor_id})
     emisor = res.fetchone()
 
     if not emisor:
         raise HTTPException(status_code=404, detail="EMISOR NO ENCONTRADO.")
-
     if emisor.ambiente == 2:
-        raise HTTPException(
-            status_code=400,
-            detail="TU CUENTA YA ESTÁ EN AMBIENTE DE PRODUCCIÓN. ESTA ACCIÓN NO SE PUEDE REVERTIR."
-        )
-
-    # ─── 2. Verificar firma configurada y vigente ─────────────────────────────
+        raise HTTPException(status_code=400, detail="TU CUENTA YA ESTÁ EN AMBIENTE DE PRODUCCIÓN. ESTA ACCIÓN NO SE PUEDE REVERTIR.")
     if not emisor.p12_path:
-        raise HTTPException(
-            status_code=400,
-            detail="DEBES CONFIGURAR TU FIRMA ELECTRÓNICA ANTES DE PASAR A PRODUCCIÓN."
-        )
-
+        raise HTTPException(status_code=400, detail="DEBES CONFIGURAR TU FIRMA ELECTRÓNICA ANTES DE PASAR A PRODUCCIÓN.")
     if not emisor.p12_expiration:
-        raise HTTPException(
-            status_code=400,
-            detail="NO SE PUDO VERIFICAR LA VIGENCIA DE TU FIRMA ELECTRÓNICA."
-        )
+        raise HTTPException(status_code=400, detail="NO SE PUDO VERIFICAR LA VIGENCIA DE TU FIRMA ELECTRÓNICA.")
+    if emisor.p12_expiration <= date.today():
+        raise HTTPException(status_code=400, detail="TU FIRMA ELECTRÓNICA ESTÁ VENCIDA. RENUÉVALA ANTES DE PASAR A PRODUCCIÓN.")
 
-    from datetime import date
-    hoy = date.today()
-    if emisor.p12_expiration <= hoy:
-        raise HTTPException(
-            status_code=400,
-            detail="TU FIRMA ELECTRÓNICA ESTÁ VENCIDA. RENUÉVALA ANTES DE PASAR A PRODUCCIÓN."
-        )
+    # ── Validar PIN de WhatsApp — siempre obligatorio ─────────────────────────
+    await validar_y_quemar_pin(db, emisor_id, pin, "ACTIVAR_PRODUCCION")
 
-    # ─── 3. Ejecutar migración a producción ───────────────────────────────────
     try:
-        # 3a. Eliminar facturas emitidas en pruebas
-        await db.execute(
-            text("DELETE FROM invoices_emitidas WHERE emisor_id = :eid"),
-            {"eid": emisor_id}
-        )
-
-        # 3b. Resetear secuenciales a 0 — el primer UPDATE los llevará a 1
-        await db.execute(
-            text("""
-                UPDATE puntos_emision SET secuencial_actual = 0
-                WHERE emisor_id = :eid
-            """),
-            {"eid": emisor_id}
-        )
-
-        # 3c. Bono de bienvenida a producción
+        await db.execute(text("DELETE FROM invoices_emitidas WHERE emisor_id = :eid"), {"eid": emisor_id})
+        await db.execute(text("UPDATE puntos_emision SET secuencial_actual = 0 WHERE emisor_id = :eid"), {"eid": emisor_id})
         await db.execute(text("""
-            UPDATE user_credits
-            SET balance_emision   = 25,
-                balance_recepcion = 0,
-                last_updated      = NOW()
+            UPDATE user_credits SET balance_emision = 25, balance_recepcion = 0, last_updated = NOW()
             WHERE emisor_id = :eid
         """), {"eid": emisor_id})
-
-        # 3d. Registrar transacciones del bono
         await db.execute(text("""
-            INSERT INTO credit_transactions
-                (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
-            VALUES
-                (:eid, 'BONO', 25, 0.00, 'SISTEMA', 'BONO DE BIENVENIDA A PRODUCCIÓN — CRÉDITOS DE EMISIÓN')
+            INSERT INTO credit_transactions (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
+            VALUES (:eid, 'BONO', 25, 0.00, 'SISTEMA', 'BONO DE BIENVENIDA A PRODUCCIÓN — CRÉDITOS DE EMISIÓN')
         """), {"eid": emisor_id})
-
-        # 3e. Cambiar ambiente a producción
-        await db.execute(text("""
-            UPDATE emisores
-            SET ambiente = 2, updated_at = NOW()
-            WHERE id = :eid
-        """), {"eid": emisor_id})
-
+        await db.execute(text("UPDATE emisores SET ambiente = 2, updated_at = NOW() WHERE id = :eid"), {"eid": emisor_id})
         await db.commit()
+        await invalidate_emisor(emisor_id)
 
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL ACTIVAR PRODUCCIÓN. INTENTA NUEVAMENTE.")
 
-    # ─── 4. Limpiar R2 — fuera de la transacción DB ───────────────────────────
-    # Si falla R2 no revertimos la DB — los archivos de prueba son desechables
     try:
-        from app.services.storage_service import delete_folder
         delete_folder(f"{emisor.ruc}/facturas/")
         print(f"[PRODUCCION] 🗑️ Carpeta facturas eliminada para RUC: {emisor.ruc}")
     except Exception as e_r2:
@@ -515,10 +441,5 @@ async def activar_produccion(
     return {
         "ok":      True,
         "mensaje": "¡BIENVENIDO A PRODUCCIÓN! TU CUENTA ESTÁ LISTA PARA EMITIR FACTURAS REALES.",
-        "data": {
-            "ambiente":           2,
-            "balance_emision":    25,
-            "balance_recepcion":  0,
-        }
+        "data":    {"ambiente": 2, "balance_emision": 25, "balance_recepcion": 0}
     }
-

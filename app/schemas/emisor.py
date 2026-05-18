@@ -11,7 +11,7 @@ class OnboardingRequest(BaseModel):
     full_name: Optional[str] = None
 
 class EmisorUpdate(BaseModel):
-    nombre_comercial: Optional[str] = Field(None, min_length=3)
-    direccion_matriz: Optional[str] = Field(None, min_length=5)
+    nombre_comercial: Optional[str] = None
+    direccion_matriz: Optional[str] = None
     contribuyente_especial: Optional[str] = Field(None, max_length=5)
     obligado_contabilidad: Optional[str] = Field(None, max_length=2) # 'SI' o 'NO'

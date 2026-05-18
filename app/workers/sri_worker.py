@@ -10,6 +10,7 @@ from app.core.database import AsyncSessionLocal
 from app.services.storage_service import download_file, upload_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
+from app.core.config import settings
 
 URLS_SRI = {
     "1": {
@@ -22,7 +23,7 @@ URLS_SRI = {
     }
 }
 
-NODE_PDF_URL = "http://kipu_signer_node:3000/api/pdf"
+NODE_PDF_URL = f"{settings.NODE_SIGNER_URL}/api/pdf"
 
 # ─── HELPER: Reintento Automático ─────────────────────────────────────────────
 async def httpx_with_retry(url: str, content: str, headers: dict, max_retries: int = 3):
@@ -213,3 +214,4 @@ async def job_autorizar_facturas():
 
         except Exception as e:
             print(f"[SRI Job2] ❌ Error Crítico: {str(e)}")
+

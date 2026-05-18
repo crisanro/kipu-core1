@@ -1,3 +1,4 @@
+#app/api/v1/app/apikeys.py
 import os
 import hashlib
 from typing import List
@@ -8,38 +9,10 @@ from sqlalchemy import text
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.schemas.seguridad import ApiKeyCreate, RequestPinSchema
+from app.core.security import validar_y_quemar_pin
 
 router = APIRouter(tags=["Seguridad"])
 
-# --- HELPERS DE LÓGICA (Manteniéndolos en el mismo archivo para simplicidad) ---
-
-async def validar_y_quemar_pin(db: AsyncSession, emisor_id: int, pin: str, tipo_accion: str):
-    """
-    Busca el PIN en auth_challenges. Si es válido, lo elimina y retorna True.
-    Si no, lanza una excepción 403.
-    """
-    query = text("""
-        DELETE FROM auth_challenges 
-        WHERE emisor_id = :eid 
-          AND pin = :pin 
-          AND tipo_accion = :tipo 
-          AND expires_at > NOW()
-        RETURNING id
-    """)
-    
-    result = await db.execute(query, {
-        "eid": emisor_id,
-        "pin": pin,
-        "tipo": tipo_accion
-    })
-    
-    if not result.fetchone():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="PIN incorrecto, expirado o ya utilizado. Solicite uno nuevo."
-        )
-    
-# --- ENDPOINTS ---
 
 @router.get("/", summary="Listar API Keys del emisor")
 async def listar_apikeys(

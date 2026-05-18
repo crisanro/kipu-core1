@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends
+#app/api/v1/public/clientes.py
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_api_key # 🔒 Seguridad API Key
@@ -15,10 +16,17 @@ router = APIRouter()
 
 @router.post("/")
 async def crear_cliente(
-    cliente_data: ClienteCreate, 
-    auth_data: dict = Depends(verify_api_key), 
+    cliente_data: ClienteCreate,
+    auth_data: dict = Depends(verify_api_key),
     db: AsyncSession = Depends(get_db)
 ):
+    # API externa — solo cédula y RUC
+    if cliente_data.tipo_identificacion_sri not in {"04", "05"}:
+        raise HTTPException(
+            status_code=400,
+            detail="LA API EXTERNA SOLO ACEPTA CÉDULA (05) Y RUC (04). "
+                   "PARA REGISTRAR PASAPORTES O EXTRANJEROS USE LA APP WEB."
+        )
     return await crear_cliente_core(auth_data["emisor_id"], cliente_data, db)
 
 @router.post("/buscar")

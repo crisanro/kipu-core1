@@ -1,5 +1,5 @@
 import hashlib
-from fastapi import Header, HTTPException, Depends, Request
+from fastapi import Header, HTTPException, Depends, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
@@ -108,3 +108,21 @@ async def verify_whatsapp_service(
         raise HTTPException(status_code=404, detail="Número de WhatsApp no vinculado a Kipu.")
 
     return {"role": "internal_service", "source": "whatsapp", "emisor_id": profile.emisor_id}
+
+
+async def validar_y_quemar_pin(db: AsyncSession, emisor_id: int, pin: str, tipo_accion: str):
+    """Busca el PIN en auth_challenges. Si es válido, lo elimina. Si no, lanza 403."""
+    query = text("""
+        DELETE FROM auth_challenges
+        WHERE emisor_id = :eid
+          AND pin = :pin
+          AND tipo_accion = :tipo
+          AND expires_at > NOW()
+        RETURNING id
+    """)
+    result = await db.execute(query, {"eid": emisor_id, "pin": pin, "tipo": tipo_accion})
+    if not result.fetchone():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PIN incorrecto, expirado o ya utilizado. Solicite uno nuevo."
+        )

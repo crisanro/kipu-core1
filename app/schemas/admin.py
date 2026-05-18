@@ -1,10 +1,18 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
 
 class TopupRequest(BaseModel):
-    ruc: str = Field(..., description="RUC del emisor", min_length=13, max_length=13)
-    amount: int = Field(..., description="Cantidad de créditos a recargar", gt=0)
-    reference_id: Optional[str] = Field(None, description="ID de referencia (ej. Stripe)")
+    ruc:          str
+    amount:       int
+    tipo:         str = Field(..., description="'emision' o 'recepcion'")
+    reference_id: Optional[str] = None
+
+    @field_validator("tipo")
+    @classmethod
+    def validar_tipo(cls, v):
+        if v not in ["emision", "recepcion"]:
+            raise ValueError("tipo debe ser 'emision' o 'recepcion'")
+        return v
 
 class RequestPin(BaseModel):
     email: EmailStr

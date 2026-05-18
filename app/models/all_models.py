@@ -153,6 +153,13 @@ class AuthChallenge(Base):
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
+class EmailRateLimit(Base):
+    """Control anti-spam para envío de correos de verificación."""
+    __tablename__ = "email_rate_limits"
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    email       = Column(String(255), unique=True, nullable=False)
+    last_sent   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
 class LeadExUsuario(Base):
     """Ex-clientes para análisis de churn y campañas de reactivación."""
     __tablename__ = "leads_ex_usuarios"
@@ -291,3 +298,5 @@ class InvoiceRecibida(Base):
     fuente                  = Column(String(10), default="MANUAL")
     procesado               = Column(Boolean, default=False)
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+

@@ -1,5 +1,6 @@
-import os
+# app/api/v1/public/invoices.py
 import re
+import base64
 import httpx
 from typing import Optional
 from fastapi import APIRouter, Depends, Request, Header
@@ -11,159 +12,166 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.services.storage_service import download_file
 from app.core.config import settings
-from app.core.security import verify_public_origin 
+from app.core.security import verify_public_origin
 
 router = APIRouter()
 
-# --- SCHEMAS ---
+NODE_PDF_URL = f"{settings.NODE_SIGNER_URL}/api/pdf"
+
+
 class ConsultarFacturaRequest(BaseModel):
     captchaToken: str
     hpValue: Optional[str] = None
 
 
-# ── Descarga PDF ──────────────────────────────────────────────────────────────
+# ── PDF — generado bajo demanda desde el XML autorizado ───────────────────────
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
-    clave_acceso: str, 
+    clave_acceso: str,
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
-        # 1. Buscamos en la DB
-        query = text("SELECT pdf_path FROM invoices WHERE clave_acceso = :clave")
-        result = await db.execute(query, {"clave": clave_acceso})
-        row = result.fetchone()
+        res = await db.execute(text("""
+            SELECT i.estado, i.xml_path, e.contribuyente_especial
+            FROM invoices_emitidas i
+            JOIN emisores e ON i.emisor_id = e.id
+            WHERE i.clave_acceso = :clave
+        """), {"clave": clave_acceso})
+        factura = res.fetchone()
 
-        if not row or not row.pdf_path:
-            return JSONResponse(status_code=404, content={"error": "Factura no encontrada en DB"})
+        if not factura:
+            return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
-        # 2. Extracción segura (limpia espacios y barras accidentales)
-        ruta_db = row.pdf_path.strip().strip('/')
-        parts = ruta_db.split('/')
-        bucket = parts[0]
-        object_name = '/'.join(parts[1:])
+        if factura.estado != 'AUTORIZADO' or not factura.xml_path:
+            return JSONResponse(status_code=404, content={"error": "Factura no autorizada o sin XML"})
 
-        # 3. Descarga desde MinIO
-        file_bytes = download_file(bucket, object_name)
+        # Descargar XML desde R2
+        xml_bytes = download_file(factura.xml_path)
+        xml_str   = xml_bytes.decode('utf-8')
 
-        # 4. Retorno (inline = se abre en el navegador)
-        headers = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
-        return Response(content=file_bytes, media_type="application/pdf", headers=headers)
+        # Generar PDF en Node.js bajo demanda
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res_pdf = await client.post(
+                NODE_PDF_URL,
+                json={
+                    "xmlAutorizado":     xml_str,
+                    "emisor":            {"contribuyente_especial": factura.contribuyente_especial or ""},
+                    "fechaAutorizacion": None
+                }
+            )
+
+        if res_pdf.status_code != 200 or not res_pdf.json().get("ok"):
+            return JSONResponse(status_code=500, content={"error": "Error generando PDF"})
+
+        pdf_bytes = base64.b64decode(res_pdf.json()["pdfBase64"])
+        headers   = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
+        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
     except Exception as e:
         print(f"Error Public PDF: {e}")
-        return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
+        return JSONResponse(status_code=500, content={"error": "Error generando PDF"})
 
 
-# ── Descarga XML ──────────────────────────────────────────────────────────────
+# ── XML — descarga directa desde R2 ───────────────────────────────────────────
 @router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
 async def get_xml(
-    clave_acceso: str, 
+    clave_acceso: str,
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
 
     try:
-        # 1. Buscamos en la DB
-        query = text("SELECT xml_path FROM invoices WHERE clave_acceso = :clave")
-        result = await db.execute(query, {"clave": clave_acceso})
-        row = result.fetchone()
+        res = await db.execute(text("""
+            SELECT estado, xml_path FROM invoices_emitidas
+            WHERE clave_acceso = :clave
+        """), {"clave": clave_acceso})
+        factura = res.fetchone()
 
-        if not row or not row.xml_path:
+        if not factura:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
 
-        # 2. Extracción segura
-        ruta_db = row.xml_path.strip().strip('/')
-        parts = ruta_db.split('/')
-        bucket = parts[0]
-        object_name = '/'.join(parts[1:])
+        if factura.estado != 'AUTORIZADO' or not factura.xml_path:
+            return JSONResponse(status_code=404, content={"error": "Factura no autorizada o sin XML"})
 
-        # 3. Descarga desde MinIO
-        file_bytes = download_file(bucket, object_name)
-
-        # 4. Retorno (attachment = fuerza descarga al equipo)
-        headers = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
+        file_bytes = download_file(factura.xml_path)
+        headers    = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
         return Response(content=file_bytes, media_type="application/xml", headers=headers)
 
     except Exception as e:
         print(f"Error Public XML: {e}")
-        return JSONResponse(status_code=404, content={"error": "Archivo no encontrado"})
+        return JSONResponse(status_code=500, content={"error": "Archivo no encontrado"})
 
 
-# ── Consulta de Factura ────────────────────────────────────────────────────────
+# ── Consultar factura ──────────────────────────────────────────────────────────
 @router.post("/consultar/{clave_acceso}", summary="Consultar factura por clave de acceso")
 async def consultar_factura(
     clave_acceso: str,
     request: Request,
     body: ConsultarFacturaRequest,
     x_n8n_api_key: Optional[str] = Header(None, alias="x-n8n-api-key"),
-    _auth = Depends(verify_public_origin), # <-- Seguridad activa solo aquí
+    _auth=Depends(verify_public_origin),
     db: AsyncSession = Depends(get_db)
 ):
     try:
         is_n8n_request = (x_n8n_api_key == settings.N8N_API_KEY)
 
         if not is_n8n_request and body.hpValue:
-            print(f"[SECURITY] Honeypot activado por IP: {request.client.host}")
             return JSONResponse(status_code=400, content={"error": "Bot detectado"})
 
         if not re.match(r"^\d{49}$", clave_acceso):
             return JSONResponse(status_code=400, content={"error": "Clave de acceso inválida"})
 
         if not is_n8n_request:
-            turnstile_secret = settings.TURNSTILE_SECRET_KEY
             async with httpx.AsyncClient() as client:
                 cf_resp = await client.post(
                     "https://challenges.cloudflare.com/turnstile/v0/siteverify",
                     data={
-                        "secret": turnstile_secret,
+                        "secret":   settings.TURNSTILE_SECRET_KEY,
                         "response": body.captchaToken,
                         "remoteip": request.client.host
                     }
                 )
-                cf_data = cf_resp.json()
-                if not cf_data.get("success"):
+                if not cf_resp.json().get("success"):
                     return JSONResponse(status_code=403, content={
-                        "success": False,
+                        "success":         False,
                         "mensaje_usuario": "La verificación de seguridad ha fallado."
                     })
 
-        query = text("""
-            SELECT 
+        res = await db.execute(text("""
+            SELECT
                 i.clave_acceso, i.secuencial, i.fecha_emision, i.estado, i.mensajes_sri,
                 i.razon_social_comprador, i.identificacion_comprador,
                 i.importe_total, i.subtotal_iva, i.subtotal_0, i.valor_iva,
-                e.razon_social as emisor_nombre, e.ruc as emisor_ruc
-            FROM invoices i
+                e.razon_social AS emisor_nombre, e.ruc AS emisor_ruc
+            FROM invoices_emitidas i
             JOIN emisores e ON i.emisor_id = e.id
             WHERE i.clave_acceso = :clave
-        """)
-        
-        result = await db.execute(query, {"clave": clave_acceso})
-        factura = result.fetchone()
+        """), {"clave": clave_acceso})
+        factura = res.fetchone()
 
         if not factura:
             return JSONResponse(status_code=404, content={
-                "success": False,
+                "success":         False,
                 "mensaje_usuario": "La factura no existe en nuestro sistema. Verifique la clave de acceso."
             })
 
-        f = factura._mapping
+        f      = factura._mapping
         estado = f["estado"]
 
         if estado == 'AUTORIZADO':
             return {
                 "success": True,
-                "estado": "AUTORIZADO",
+                "estado":  "AUTORIZADO",
                 "data": {
                     "cabecera": {
                         "emisor": f["emisor_nombre"],
-                        "ruc": f["emisor_ruc"],
-                        "nro": f["secuencial"],
-                        "fecha": str(f["fecha_emision"]) 
+                        "ruc":    f["emisor_ruc"],
+                        "nro":    f["secuencial"],
+                        "fecha":  str(f["fecha_emision"])
                     },
                     "totales": {"total": float(f["importe_total"])},
                     "links": {
@@ -175,33 +183,32 @@ async def consultar_factura(
 
         elif estado in ['RECIBIDO', 'EN PROCESO']:
             return JSONResponse(status_code=200, content={
-                "success": False,
-                "estado": estado,
+                "success":         False,
+                "estado":          estado,
                 "mensaje_usuario": "Tu factura ha sido recibida por el SRI y está en proceso de autorización."
             })
 
         elif estado in ['DEVUELTA', 'RECHAZADO']:
             return JSONResponse(status_code=200, content={
-                "success": False,
-                "estado": estado,
+                "success":         False,
+                "estado":          estado,
                 "mensaje_usuario": "La factura presenta inconsistencias y fue devuelta/rechazada por el SRI.",
-                "detalles_sri": f["mensajes_sri"],
-                "sugerencia": f"Por favor, contacta al emisor ({f['emisor_nombre']}) para solucionar este inconveniente."
+                "detalles_sri":    f["mensajes_sri"],
+                "sugerencia":      f"Por favor, contacta al emisor ({f['emisor_nombre']}) para solucionar este inconveniente."
             })
 
         else:
             return JSONResponse(status_code=200, content={
-                "success": False,
-                "estado": estado,
+                "success":         False,
+                "estado":          estado,
                 "mensaje_usuario": f"El comprobante se encuentra en estado: {estado}",
-                "sugerencia": "Si el problema persiste, contacta al comercio emisor."
+                "sugerencia":      "Si el problema persiste, contacta al comercio emisor."
             })
 
     except httpx.HTTPError as e:
-        print(f"Error de Cloudflare (Red): {e}")
+        print(f"Error Cloudflare: {e}")
         return JSONResponse(status_code=500, content={"error": "Error de validación externa"})
-        
+
     except Exception as e:
-        print(f"Error en validación o consulta: {e}")
+        print(f"Error consulta: {e}")
         return JSONResponse(status_code=500, content={"error": "Error interno del servidor"})
-        
