@@ -194,7 +194,6 @@ async def nuke_account(
     emisor_id = auth_data.get("emisor_id")
     uid       = auth_data["uid"]
 
-    # OPTIMIZACIÓN: una sola query con subqueries en lugar de N queries separadas
     res = await db.execute(text("""
         SELECT
             e.id, e.ruc, e.razon_social, e.ambiente, e.created_at,
@@ -212,13 +211,23 @@ async def nuke_account(
     if not row:
         raise HTTPException(status_code=404, detail="USUARIO NO ENCONTRADO.")
 
-    if emisor_id and row.ambiente == 2:
+    if emisor_id:
         if not pin:
             raise HTTPException(
                 status_code=400,
-                detail="EN MODO PRODUCCIÓN SE REQUIERE UN PIN DE CONFIRMACIÓN."
+                detail="SE REQUIERE UN PIN DE CONFIRMACIÓN."
             )
-        await validar_y_quemar_pin(db, emisor_id, pin, "NUKE")
+
+        if row.ambiente == 1:
+            # Pruebas — PIN fijo 999999, no requiere solicitud previa
+            if pin != "111111":
+                raise HTTPException(
+                    status_code=403,
+                    detail="PIN incorrecto, expirado o ya utilizado. Solicite uno nuevo."
+                )
+        else:
+            # Producción — PIN real desde auth_challenges
+            await validar_y_quemar_pin(db, emisor_id, pin, "NUKE")
 
     try:
         if emisor_id and row.ruc:
