@@ -278,7 +278,7 @@ async def consultar_clientes_bulk_core(emisor_id: int, terminos: list[str], db: 
 
         # Consumidor Final siempre al final
         resultados.append({
-            "uid": "cliente_final", "tipo_identificacion_sri": "07",
+            "uid": "cliente-final", "tipo_identificacion_sri": "07",
             "identificacion": "9999999999999", "razon_social": "CONSUMIDOR FINAL",
             "direccion": "S/N", "email": "", "telefono": ""
         })
