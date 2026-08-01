@@ -9,11 +9,14 @@ WORKDIR /app
 
 # Instalamos dependencias del sistema necesarias para:
 # - psycopg2 (libpq-dev, gcc)
-# - Pillow/Criptografía (libffi-dev)
+# - Criptografía (libffi-dev)
+# - SSL/TLS para R2 y servicios externos (ca-certificates)
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     libffi-dev \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiamos e instalamos los requerimientos
