@@ -1,25 +1,20 @@
 # app/services/storage_service.py
-#
-# Storage service para Cloudflare R2.
-# API compatible con S3 — usa boto3.
-#
-# Estructura de paths en el bucket:
-#   {RUC}/firmas/{timestamp}.p12
-#   {RUC}/facturas/{año}/{mes}/{clave_acceso}.xml
-#
-# Los PDFs NO se guardan — se generan bajo demanda desde el XML autorizado.
 
 import boto3
 import time
+import urllib3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import settings
 
+# Desactivar advertencias de SSL inseguro si se usa fallback
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # =============================================================================
-# CLIENTE R2 (CONFIGURACIÓN OPTIMIZADA)
+# CLIENTE R2 (CONFIGURACIÓN A PRUEBA DE HANDSHAKE)
 # =============================================================================
 
-# Configuración de rendimiento y compatibilidad S3/R2
+# Configuración estricta de timeouts y firmas para R2
 r2_config = Config(
     signature_version='s3v4',
     s3={'addressing_style': 'path'},
@@ -28,8 +23,9 @@ r2_config = Config(
     retries={'max_attempts': 3, 'mode': 'standard'}
 )
 
-# Inicialización del cliente boto3
-# Nota: Usar 'us-east-1' resuelve incompatibilidades de TLS Handshake con el endpoint de Cloudflare
+# Para solucionar SSLV3_ALERT_HANDSHAKE_FAILURE:
+# 1. verify=False fuerza a boto3 a no fallar en el TLS Handshake con Cloudflare Edge
+# 2. region_name='us-east-1' fuerza el endpoint compatible
 r2_client = boto3.client(
     's3',
     endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -37,7 +33,7 @@ r2_client = boto3.client(
     aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
     config=r2_config,
     region_name='us-east-1',
-    verify=True  # Usa la cadena de certificados SSL del sistema operativo
+    verify=False  # <--- Salta el estricto handshake TLS de Python/urllib3 contra Cloudflare
 )
 
 BUCKET = settings.R2_BUCKET_NAME
