@@ -7,16 +7,15 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Instalamos dependencias del sistema necesarias para:
-# - psycopg2 (libpq-dev, gcc)
-# - Criptografía (libffi-dev)
-# - SSL/TLS para R2 y servicios externos (ca-certificates)
+# Instalamos dependencias del sistema necesarias y ajustamos OpenSSL para Cloudflare R2 / SSL Handshake
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
     libffi-dev \
     ca-certificates \
+    openssl \
     && update-ca-certificates \
+    && sed -i 's/DEFAULT@SECLEVEL=2/DEFAULT@SECLEVEL=1/g' /etc/ssl/openssl.cnf \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiamos e instalamos los requerimientos
