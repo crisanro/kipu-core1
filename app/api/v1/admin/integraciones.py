@@ -30,7 +30,6 @@ async def admin_topup(
     return await recargar_creditos_core(request, db)
 
 
-
 @router.post("/request-pin", summary="Generar PIN de 2FA")
 async def request_pin(
     request: Request,
@@ -102,7 +101,6 @@ async def request_pin(
     })
     await db.commit()
     return {"ok": True, "pin": pin}
-
 
 
 @router.get("/check-status", summary="Verificar estado de cuenta WhatsApp")
@@ -184,9 +182,11 @@ async def search_by_email(
             c.balance_emision, c.balance_recepcion,
             p.email, p.full_name, p.whatsapp_number, p.firebase_uid
         FROM profiles p
-        LEFT JOIN emisores e     ON p.emisor_id = e.id
-        LEFT JOIN user_credits c ON c.emisor_id = e.id
+        LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+        LEFT JOIN emisores e         ON e.id = eu.emisor_id
+        LEFT JOIN user_credits c     ON c.emisor_id = e.id
         WHERE LOWER(p.email) = LOWER(:email)
+        LIMIT 1
     """), {"email": email.strip()})
     row = res.fetchone()
 
@@ -240,4 +240,82 @@ async def crear_notificacion(
         "mensaje":    "NOTIFICACIÓN CREADA.",
         "id":         row.id,
         "created_at": row.created_at
+    }
+
+
+# ── Gestión de API Keys internas ───────────────────────────────────────────────
+@router.post("/apikeys/set-unlimited", summary="Activar/desactivar unlimited en una API key")
+async def set_api_key_unlimited(
+    data: dict = Body(...),
+    auth: dict = Depends(verify_n8n_service),
+    db: AsyncSession = Depends(get_db),
+):
+    api_key_id = data.get("api_key_id")
+    unlimited  = data.get("unlimited", False)
+    tipo       = data.get("tipo", "internal")
+
+    if not api_key_id:
+        raise HTTPException(status_code=400, detail="api_key_id es obligatorio.")
+
+    res = await db.execute(text("""
+        UPDATE api_keys
+        SET unlimited = :unlimited, tipo = :tipo
+        WHERE id = :id
+        RETURNING id, nombre, emisor_id, unlimited, tipo
+    """), {"unlimited": unlimited, "tipo": tipo, "id": api_key_id})
+    row = res.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="API Key no encontrada.")
+
+    await db.commit()
+    return {
+        "ok":         True,
+        "api_key_id": row.id,
+        "nombre":     row.nombre,
+        "emisor_id":  row.emisor_id,
+        "unlimited":  row.unlimited,
+        "tipo":       row.tipo
+    }
+
+
+@router.get("/apikeys", summary="Listar todas las API keys")
+async def listar_api_keys(
+    emisor_id: int = Query(None, description="Filtrar por emisor"),
+    auth: dict = Depends(verify_n8n_service),
+    db: AsyncSession = Depends(get_db),
+):
+    query = """
+        SELECT ak.id, ak.nombre, ak.emisor_id, ak.tipo, ak.unlimited,
+               ak.revoked, ak.created_at, ak.last_used_at,
+               e.razon_social, e.ruc
+        FROM api_keys ak
+        JOIN emisores e ON ak.emisor_id = e.id
+        WHERE ak.revoked = false
+    """
+    params = {}
+    if emisor_id:
+        query += " AND ak.emisor_id = :eid"
+        params["eid"] = emisor_id
+
+    query += " ORDER BY ak.created_at DESC"
+    res  = await db.execute(text(query), params)
+    rows = res.fetchall()
+
+    return {
+        "ok":   True,
+        "data": [
+            {
+                "id":           r.id,
+                "nombre":       r.nombre,
+                "emisor_id":    r.emisor_id,
+                "razon_social": r.razon_social,
+                "ruc":          r.ruc,
+                "tipo":         r.tipo,
+                "unlimited":    r.unlimited,
+                "last_used_at": str(r.last_used_at) if r.last_used_at else None,
+                "created_at":   str(r.created_at)
+            }
+            for r in rows
+        ]
     }

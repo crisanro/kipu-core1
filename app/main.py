@@ -1,18 +1,18 @@
 # main.py
+import asyncio
+import time
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import time
 
 # Firebase
 import app.core.firebase
 
 # Workers
-from app.workers.sri_worker import job_enviar_facturas, job_autorizar_facturas
+from app.workers.sri_worker import iniciar_workers
 
 # Routers
 from app.api.v1.app import (
@@ -24,32 +24,41 @@ from app.api.v1.app import (
     dashboard as dashboard_app,
     apikeys as apikeys_app,
     catalogo as catalogo_app,
-    notificaciones as notificaciones_app
-
+    notificaciones as notificaciones_app,
+    productos as productos_app,
+    usuarios as usuarios_app
 )
+
 from app.api.v1.public import (
     clientes as clientes_public,
     integraciones as integraciones_public,
-    invoices as invoices_public
-)
-from app.api.v1.admin import (
-    integraciones as integraciones_n8n
+    invoices as invoices_public,
 )
 
-# ─── WORKERS ──────────────────────────────────────────────────────────────────
-scheduler = AsyncIOScheduler()
+from app.api.v1.admin import (
+    integraciones as integraciones_n8n,
+)
+
+# ─── LIFESPAN ─────────────────────────────────────────────────────────────────
+_worker_task: asyncio.Task | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.add_job(job_enviar_facturas,   'interval', seconds=20, max_instances=1)
-    scheduler.add_job(job_autorizar_facturas, 'interval', seconds=30, max_instances=1)
-    scheduler.start()
-    print("⏰ Workers del SRI iniciados correctamente.")
+    global _worker_task
+    # Arranca workers como background task — no bloquea el startup
+    _worker_task = asyncio.create_task(iniciar_workers())
+    print("🚀 Workers del SRI iniciados (event-driven).")
     yield
-    scheduler.shutdown()
+    # Shutdown limpio
+    if _worker_task and not _worker_task.done():
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
     print("💤 Workers del SRI detenidos.")
 
-# ─── APP ───────────────────────────────────────────────────────────────────────
+# ─── APP ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Kipu Core API",
     description="Microservicios Core para Facturación Electrónica SRI",
@@ -68,8 +77,6 @@ def custom_openapi():
         description="Microservicios Core para Facturación Electrónica SRI",
         routes=app.routes,
     )
-
-    # Esquema Bearer JWT Firebase
     schema["components"]["securitySchemes"] = {
         "BearerAuth": {
             "type": "http",
@@ -78,8 +85,6 @@ def custom_openapi():
             "description": "Token Firebase — cópialo desde la app web"
         }
     }
-
-    # Aplicar candado solo a rutas NO públicas y NO admin
     for path, path_item in schema["paths"].items():
         if "/public/" in path or "/admin/" in path or path == "/":
             continue
@@ -108,9 +113,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     errores = []
     for e in exc.errors():
         errores.append({
-            "campo":           " → ".join(str(x) for x in e["loc"]),
-            "mensaje":         e["msg"],
-            "valor_recibido":  str(e.get("input", ""))
+            "campo":          " → ".join(str(x) for x in e["loc"]),
+            "mensaje":        e["msg"],
+            "valor_recibido": str(e.get("input", ""))
         })
     return JSONResponse(status_code=422, content={"detail": errores})
 
@@ -132,7 +137,7 @@ async def log_request_data_and_time(request: Request, call_next):
         data_log = f"Query: {request.query_params}"
     elif body:
         try:
-            decoded = body.decode('utf-8').replace('\n', '').replace('\r', '').replace('  ', '')
+            decoded = body.decode("utf-8").replace("\n", "").replace("\r", "").replace("  ", "")
             if len(decoded) > 150:
                 decoded = decoded[:150] + "... [truncado]"
             data_log = f"Body: {decoded}"
@@ -147,28 +152,30 @@ async def log_request_data_and_time(request: Request, call_next):
 # ─── RUTAS ────────────────────────────────────────────────────────────────────
 
 # App Web & Mobile (Firebase Auth)
-app.include_router(auth_app.router,       prefix="/api/v1/app/auth",       tags=["📱 App - Auth & Nuke"])
-app.include_router(emisor_app.router,     prefix="/api/v1/app/emisor",     tags=["📱 App - Emisor & Config"])
-app.include_router(estructura_app.router, prefix="/api/v1/app/estructura", tags=["📱 App - Estructura"])
-app.include_router(clientes_app.router,   prefix="/api/v1/app/clientes",   tags=["📱 App - Clientes"])
-app.include_router(invoices_app.router,   prefix="/api/v1/app/invoices",   tags=["📱 App - Facturación"])
-app.include_router(dashboard_app.router,  prefix="/api/v1/app/dashboard",  tags=["📱 App - Dashboard"])
-app.include_router(apikeys_app.router,    prefix="/api/v1/app/apikeys",    tags=["📱 App - API Keys"])
-app.include_router(catalogo_app.router, prefix="/api/v1/app/catalogo", tags=["📱 App - Catálogo"])
-app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones", tags=["📱 App - Notificaciones"] )
+app.include_router(auth_app.router,           prefix="/api/v1/app/auth",           tags=["📱 App - Auth & Nuke"])
+app.include_router(emisor_app.router,         prefix="/api/v1/app/emisor",         tags=["📱 App - Emisor & Config"])
+app.include_router(estructura_app.router,     prefix="/api/v1/app/estructura",     tags=["📱 App - Estructura"])
+app.include_router(productos_app.router, prefix="/api/v1/app/productos", tags=["📱 App - Productos"])
+app.include_router(usuarios_app.router, prefix="/api/v1/app/usuarios", tags=["📱 App - Usuarios"])
+app.include_router(clientes_app.router,       prefix="/api/v1/app/clientes",       tags=["📱 App - Clientes"])
+app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",       tags=["📱 App - Facturación"])
+app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",      tags=["📱 App - Dashboard"])
+app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",        tags=["📱 App - API Keys"])
+app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",       tags=["📱 App - Catálogo"])
+app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones", tags=["📱 App - Notificaciones"])
 
 # API Pública (API Key Auth)
 app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones", tags=["🌍 API Facturación"])
 app.include_router(invoices_public.router,       prefix="/api/v1/public",               tags=["🌍 API Facturación"])
 app.include_router(clientes_public.router,       prefix="/api/v1/public/clientes",      tags=["🌍 API Facturación"])
 
-# Admin / n8n / WhatsApp (Headers Internos)
-app.include_router(integraciones_n8n.router, prefix="/api/v1/admin",              tags=["🤖 n8n Automations - Core"])
+# Admin / n8n (Headers Internos)
+app.include_router(integraciones_n8n.router, prefix="/api/v1/admin", tags=["🤖 n8n Automations - Core"])
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 async def root():
     return {
-        "status": "Kipu API is running! 🚀",
-        "docs": "Visita /docs para la documentación interactiva."
+        "status":  "Kipu API is running! 🚀",
+        "docs":    "Visita /docs para la documentación interactiva."
     }

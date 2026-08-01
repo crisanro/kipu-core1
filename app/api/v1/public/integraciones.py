@@ -1,4 +1,4 @@
-# app/api/v1/public/integraciones.py — CON IDEMPOTENCY KEY
+# app/api/v1/public/integraciones.py
 from typing import Optional
 from fastapi import APIRouter, Depends, Body, Header
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,8 +44,14 @@ async def api_invoice(
     if cached:
         return cached
 
-    # ── Procesar ──────────────────────────────────────────────────────────────
-    result = await emitir_factura_core(factura_data, emisor_id, db)
+    # ── Pasar api_key_id y unlimited al core ──────────────────────────────────
+    result = await emitir_factura_core(
+        factura_data, 
+        emisor_id, 
+        db,
+        api_key_id=auth.get("api_key_id"),
+        unlimited=auth.get("unlimited", False)
+    )
 
     # ── Guardar solo si fue exitoso ───────────────────────────────────────────
     if result.get("ok"):

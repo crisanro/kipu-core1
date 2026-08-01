@@ -14,6 +14,7 @@ from app.services.storage_service import upload_file, download_file, delete_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
 from app.core.config import settings
+from app.core.cache import get_redis
 
 import pytz
 
@@ -29,7 +30,13 @@ URLS_SRI = {
 }
 NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
-async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSession):
+async def emitir_factura_core(
+    factura_data: dict, 
+    emisor_id: int, 
+    db: AsyncSession,
+    api_key_id: int = None,
+    unlimited: bool = False
+):
     if not factura_data.get("establecimiento") or not factura_data.get("punto_emision"):
         raise HTTPException(status_code=400, detail="Los campos 'establecimiento' y 'punto_emision' son requeridos.")
 
@@ -117,7 +124,9 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
             WHERE e.id = :emisor_id FOR UPDATE
         """), {"emisor_id": emisor_id})
         emisor = res_emisor.fetchone()
-        if not emisor or emisor.balance_emision <= 0:
+        
+        # Validación de créditos con exención para keys ilimitadas
+        if not unlimited and (not emisor or emisor.balance_emision <= 0):
             raise HTTPException(status_code=402, detail="Créditos insuficientes.")
 
         res_pto = await db.execute(text("""
@@ -242,20 +251,24 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         xml_path_rel = f"{emisor.ruc}/facturas/{clave_acceso}.xml"
         upload_file(xml_path_rel, xml_firmado_str.encode('utf-8'), "text/xml")
 
-        await db.execute(
-            text("UPDATE user_credits SET balance_emision = balance_emision - 1 WHERE emisor_id = :eid"),
-            {"eid": emisor_id}
-        )
+        # Descuento condicional de créditos
+        if not unlimited:
+            await db.execute(
+                text("UPDATE user_credits SET balance_emision = balance_emision - 1 WHERE emisor_id = :eid"),
+                {"eid": emisor_id}
+            )
+
+        origen_val = "api" if api_key_id else factura_data.get("origen", "web")
 
         res_insert = await db.execute(text("""
             INSERT INTO invoices_emitidas (
-                emisor_id, punto_emision_id, cliente_emisor_id, secuencial, fecha_emision,
+                emisor_id, punto_emision_id, cliente_emisor_id, api_key_id, origen, secuencial, fecha_emision,
                 clave_acceso, numero_factura, estado,
                 identificacion_comprador, razon_social_comprador, email_comprador,
                 importe_total, subtotal_iva, subtotal_0, valor_iva,
                 xml_path, datos_factura
             ) VALUES (
-                :emisor_id, :pto_id, :cliente_emisor_id, :sec, :fecha,
+                :emisor_id, :pto_id, :cliente_emisor_id, :api_key_id, :origen, :sec, :fecha,
                 :clave, :num_fac, 'FIRMADO',
                 :id_comp, :razon_comp, :email_comp,
                 :total, :sub_iva, :sub_0, :val_iva,
@@ -265,6 +278,8 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
             "emisor_id":         emisor_id,
             "pto_id":            punto_emision.punto_id,
             "cliente_emisor_id": cliente_emisor_id,
+            "api_key_id":        api_key_id,
+            "origen":            origen_val,
             "sec":               secuencial,
             "fecha":             ahora_ecuador.date(),
             "clave":             clave_acceso,
@@ -299,7 +314,6 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         "razon_social_comprador": cliente_final["razon_social"],
         "secuencial":             secuencial,
         "importe_total":          calculos["totales"]["importeTotal"],
-        "xml_path":               xml_path_rel,
         "ambiente":               emisor.ambiente,
         "ruc":                    emisor.ruc,
         "emisor_db_id":           str(emisor_id),
@@ -399,10 +413,13 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
                     SET estado = 'DEVUELTA', mensajes_sri = CAST(:msg AS jsonb)
                     WHERE id = :fid
                 """), {"msg": json.dumps(lista_errores), "fid": factura_id})
-                await db.execute(
-                    text("UPDATE user_credits SET balance_emision = balance_emision + 1 WHERE emisor_id = :eid"),
-                    {"eid": emisor_id}
-                )
+                
+                # Reembolso condicional en caso de devolución
+                if not unlimited:
+                    await db.execute(
+                        text("UPDATE user_credits SET balance_emision = balance_emision + 1 WHERE emisor_id = :eid"),
+                        {"eid": emisor_id}
+                    )
                 await db.commit()
                 await notificar_cambio_estado(factura_notificar, "DEVUELTA")
 
@@ -413,6 +430,13 @@ async def emitir_factura_core(factura_data: dict, emisor_id: int, db: AsyncSessi
         text("SELECT estado FROM invoices_emitidas WHERE id = :fid"), {"fid": factura_id}
     )
     estado_final = final_state_res.scalar()
+
+    # Si no se autorizó en fast-track → encolar para worker asíncrono
+    if estado_final not in ("AUTORIZADO", "DEVUELTA", "RECHAZADO"):
+        redis = await get_redis()
+        await redis.lpush("kipu:queue:emision", str(factura_id))
+        print(f"[Fast-Track] 📥 {clave_acceso} → cola de emisión")
+
     return {
         "ok":          True,
         "id":          factura_id,

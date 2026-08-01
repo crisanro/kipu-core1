@@ -18,7 +18,11 @@ async def verify_api_key(
     key_hash = hashlib.sha256(x_api_key.encode('utf-8')).hexdigest()
     
     # Consultar DB
-    query = text("SELECT emisor_id, nombre FROM api_keys WHERE key_hash = :hash AND revoked = false")
+    query = text("""
+        SELECT id, emisor_id, nombre, unlimited 
+        FROM api_keys 
+        WHERE key_hash = :hash AND revoked = false
+    """)
     result = await db.execute(query, {"hash": key_hash})
     key_data = result.fetchone()
 
@@ -29,8 +33,14 @@ async def verify_api_key(
     await db.execute(text("UPDATE api_keys SET last_used_at = NOW() WHERE key_hash = :hash"), {"hash": key_hash})
     await db.commit()
 
-    # Retornamos el objeto "usuario" que estará disponible en tu endpoint
-    return {"emisor_id": key_data.emisor_id, "role": "external_app", "app_name": key_data.nombre}
+    # Retornamos el contexto completo necesario para los endpoints y workers
+    return {
+        "emisor_id":  key_data.emisor_id,
+        "api_key_id": key_data.id,
+        "unlimited":  key_data.unlimited,
+        "role":       "external_app",
+        "app_name":   key_data.nombre
+    }
 
 
 # ─── 2. FIREBASE AUTH (Para la App/Web) ────────────────────────────────────────
@@ -51,20 +61,32 @@ async def verify_firebase_token(
             raise HTTPException(status_code=401, detail="La sesión ha expirado")
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    # Consultar DB
-    query = text("SELECT id, emisor_id, email, role FROM profiles WHERE firebase_uid = :uid")
+    # Consultar DB con soporte para multi-empresa ordenado por fecha de vinculación
+    query = text("""
+        SELECT p.id, p.email, p.role,
+               eu.emisor_id, eu.rol as emisor_rol
+        FROM profiles p
+        LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+        WHERE p.firebase_uid = :uid
+        ORDER BY eu.created_at ASC
+        LIMIT 1
+    """)
     result = await db.execute(query, {"uid": decoded_token["uid"]})
     profile = result.fetchone()
 
     if not profile:
-        return {"uid": decoded_token["uid"], "email": decoded_token.get("email"), "pending_provision": True}
+        return {
+            "uid":               decoded_token["uid"],
+            "email":             decoded_token.get("email"),
+            "pending_provision": True
+        }
 
     return {
-        "uid": decoded_token["uid"],
+        "uid":        decoded_token["uid"],
         "profile_id": profile.id,
-        "emisor_id": profile.emisor_id,
-        "email": profile.email,
-        "role": profile.role
+        "emisor_id":  profile.emisor_id,
+        "email":      profile.email,
+        "role":       profile.emisor_rol or profile.role
     }
 
 
@@ -100,14 +122,20 @@ async def verify_whatsapp_service(
     if not x_whatsapp_number:
         raise HTTPException(status_code=400, detail="Falta el número de WhatsApp emisor")
 
-    query = text("SELECT emisor_id FROM profiles WHERE whatsapp_number = :phone")
+    query = text("""
+        SELECT eu.emisor_id 
+        FROM profiles p
+        JOIN emisor_usuarios eu ON eu.profile_id = p.id
+        WHERE p.whatsapp_number = :phone
+        LIMIT 1
+    """)
     result = await db.execute(query, {"phone": x_whatsapp_number})
-    profile = result.fetchone()
+    relacion = result.fetchone()
 
-    if not profile:
+    if not relacion:
         raise HTTPException(status_code=404, detail="Número de WhatsApp no vinculado a Kipu.")
 
-    return {"role": "internal_service", "source": "whatsapp", "emisor_id": profile.emisor_id}
+    return {"role": "internal_service", "source": "whatsapp", "emisor_id": relacion.emisor_id}
 
 
 async def validar_y_quemar_pin(db: AsyncSession, emisor_id: int, pin: str, tipo_accion: str):

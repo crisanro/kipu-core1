@@ -1,4 +1,4 @@
-#app/api/v1/app/apikeys.py
+# app/api/v1/app/apikeys.py
 import os
 import hashlib
 from typing import List
@@ -21,16 +21,18 @@ async def listar_apikeys(
 ):
     emisor_id = auth_data["emisor_id"]
 
-    # Seleccionamos solo las columnas necesarias según tu esquema
+    # Seleccionamos tipo y filtramos solo las externas para no exponer llaves de servicio interno
     query = text("""
         SELECT 
             id, 
             nombre, 
+            tipo, 
             revoked, 
             created_at, 
             last_used_at
         FROM api_keys 
         WHERE emisor_id = :eid 
+          AND tipo = 'external'
         ORDER BY created_at DESC
     """)
 
@@ -41,10 +43,11 @@ async def listar_apikeys(
         # Construimos la lista simplificada
         return [
             {
-                "id": k.id,
-                "nombre": k.nombre,
-                "estado": "activa" if not k.revoked else "revocada",
-                "created_at": k.created_at,
+                "id":           k.id,
+                "nombre":       k.nombre,
+                "tipo":         k.tipo,
+                "estado":       "activa" if not k.revoked else "revocada",
+                "created_at":   k.created_at,
                 "last_used_at": k.last_used_at
             }
             for k in keys
@@ -56,7 +59,8 @@ async def listar_apikeys(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="Error al obtener el listado de llaves."
         )
-    
+
+
 @router.post("/", summary="Generar una nueva API Key", status_code=201)
 async def crear_apikey(
     data: ApiKeyCreate, # Debe incluir 'pin' en el schema
@@ -105,6 +109,7 @@ async def crear_apikey(
         if "23505" in str(e):
             raise HTTPException(status_code=400, detail="Ya existe una llave con ese nombre.")
         raise HTTPException(status_code=500, detail="Error al procesar la solicitud.")
+
 
 @router.delete("/{key_id}", summary="Revocar una API Key")
 async def revocar_apikey(

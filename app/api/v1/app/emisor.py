@@ -3,6 +3,8 @@ import time
 import httpx
 import base64
 import os
+import re
+import unicodedata
 from datetime import datetime, date
 from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException
 from sqlalchemy import text
@@ -67,8 +69,16 @@ def validar_ruc_ecuador(ruc: str):
 
 
 def mayusculas(texto: str | None) -> str | None:
-    """Convierte a mayúsculas y limpia espacios. Retorna None si está vacío."""
-    return texto.strip().upper() if texto and texto.strip() else None
+    """Convierte a mayúsculas, elimina tildes y caracteres especiales."""
+    if not texto or not texto.strip():
+        return None
+    # Normalizar y eliminar diacríticos
+    texto = unicodedata.normalize("NFD", texto.strip().upper())
+    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    # Solo letras, números y símbolos básicos permitidos por SRI
+    texto = re.sub(r"[^A-Z0-9\s\.\,\-\/\#\&]", "", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto if texto else None
 
 # ── POST /onboarding ───────────────────────────────────────────────────────────
 
@@ -105,15 +115,35 @@ async def onboarding(
         })
         new_emisor_id = res_emisor.scalar()
 
-        full_name_up = (data.full_name or data.razon_social).upper()
-        await db.execute(text("""
-            INSERT INTO profiles (firebase_uid, emisor_id, email, full_name, role)
-            VALUES (:uid, :eid, :email, :fname, 'admin')
-        """), {
-            "uid": auth_data["uid"], "eid": new_emisor_id,
-            "email": auth_data["email"].lower(), "fname": full_name_up,
-        })
+        full_name_up = mayusculas(data.full_name or data.razon_social)
+        
+        # Verificar si ya tiene perfil (puede venir de una invitación)
+        res_profile = await db.execute(text("""
+            SELECT id FROM profiles WHERE firebase_uid = :uid
+        """), {"uid": auth_data["uid"]})
+        perfil = res_profile.fetchone()
 
+        if perfil:
+            profile_id = perfil.id
+        else:
+            res_new_profile = await db.execute(text("""
+                INSERT INTO profiles (firebase_uid, email, full_name, role)
+                VALUES (:uid, :email, :fname, 'admin')
+                RETURNING id
+            """), {
+                "uid":   auth_data["uid"],
+                "email": auth_data["email"].lower(),
+                "fname": full_name_up,
+            })
+            profile_id = res_new_profile.scalar()
+
+        # Vincular profile con empresa
+        await db.execute(text("""
+            INSERT INTO emisor_usuarios (emisor_id, profile_id, rol)
+            VALUES (:eid, :pid, 'admin')
+        """), {"eid": new_emisor_id, "pid": str(profile_id)})
+
+        # Asignar créditos iniciales y registrar transacción
         await db.execute(text("""
             INSERT INTO user_credits (emisor_id, balance_emision, balance_recepcion)
             VALUES (:eid, 10, 0)
@@ -131,11 +161,14 @@ async def onboarding(
     except Exception as e:
         await db.rollback()
         import traceback; traceback.print_exc()
-        if "23505" in str(e):
-            raise HTTPException(status_code=400, detail="EL RUC INGRESADO YA ESTÁ REGISTRADO.")
+        error_str = str(e).lower()
+        if "unique" in error_str or "duplicate" in error_str or "23505" in error_str:
+            if "emisores_ruc_key" in str(e):
+                raise HTTPException(status_code=400, detail="EL RUC INGRESADO YA ESTÁ REGISTRADO EN KIPU.")
+            if "profiles_firebase_uid" in str(e):
+                raise HTTPException(status_code=400, detail="ESTE USUARIO YA TIENE UNA CUENTA CONFIGURADA.")
+            raise HTTPException(status_code=400, detail="YA EXISTE UN REGISTRO CON ESOS DATOS.")
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL PROCESAR EL REGISTRO.")
-
-
 # ── POST /firma ────────────────────────────────────────────────────────────────
 
 @router.post("/firma", summary="Subir firma electrónica (P12)")
@@ -198,7 +231,6 @@ async def upload_p12(
             raise ValueError("No se encontró la fecha de expiración en la respuesta del validador.")
         fecha_objeto = datetime.strptime(str(raw_exp)[:10], '%Y-%m-%d').date()
 
-        # p12_pass — nombre original de la columna en tu DB
         await db.execute(text("""
             UPDATE emisores
             SET p12_path = :path, p12_pass = :pass, p12_expiration = :exp, updated_at = NOW()
@@ -277,7 +309,7 @@ async def get_config(
     if cached:
         return cached
 
-    # OPTIMIZACIÓN: JOIN con user_credits en una sola query
+    # JOIN con user_credits en una sola query
     res = await db.execute(text("""
         SELECT
             e.ruc, e.razon_social, e.nombre_comercial, e.direccion_matriz,
@@ -380,10 +412,9 @@ async def update_config(
 
 # ── POST /produccion ───────────────────────────────────────────────────────────
 
-
 @router.post("/produccion", summary="Activar ambiente de producción")
 async def activar_produccion(
-    pin: str,                                          # ← nuevo, obligatorio
+    pin: str,
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
 ):

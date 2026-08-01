@@ -15,23 +15,33 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from app.core.config import settings
 import time
+import os
+import urllib3
 
 # =============================================================================
 # CLIENTE R2
 # =============================================================================
+
+# Solo deshabilitar SSL en desarrollo local
+if os.getenv("ENVIRONMENT", "development") == "development":
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 r2_client = boto3.client(
     's3',
     endpoint_url=f"https://{settings.R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
     aws_access_key_id=settings.R2_ACCESS_KEY_ID,
     aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
-    config=Config(signature_version='s3v4'),
-    region_name='auto'
+    config=Config(
+        signature_version='s3v4',
+        connect_timeout=10,
+        read_timeout=30,
+    ),
+    region_name='auto',
+    verify=os.getenv("ENVIRONMENT", "development") == "production"
 )
 
 BUCKET = settings.R2_BUCKET_NAME
 
-print(f"[Storage] R2 inicializado — bucket: {BUCKET}")
 print(f"[Storage] R2 inicializado — bucket: {BUCKET}")
 print(f"[Storage] Account ID: {settings.R2_ACCOUNT_ID[:8]}...")  # solo primeros 8 chars por seguridad
 print(f"[Storage] Access Key: {settings.R2_ACCESS_KEY_ID[:8]}...")

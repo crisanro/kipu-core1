@@ -37,6 +37,7 @@ def _meses_en_rango(fecha_inicio: date, fecha_fin: date) -> list[tuple[int, int]
 async def obtener_dashboard_core(
     emisor_id: int | None,
     email_usuario: str,
+    email_verificado: bool,
     fecha_inicio: date,
     fecha_fin: date,
     db: AsyncSession
@@ -54,17 +55,19 @@ async def obtener_dashboard_core(
                 SELECT
                     e.ruc, e.p12_path, e.p12_expiration, e.ambiente,
                     c.balance_emision,
-                    c.balance_recepcion,                                          -- ← nuevo
+                    c.balance_recepcion,
                     p.whatsapp_number,
                     e.id AS emisor_db_id,
                     (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = e.id) AS total_estab,
                     (SELECT COUNT(*) FROM puntos_emision   WHERE emisor_id = e.id) AS total_puntos,
                     (SELECT COUNT(*) FROM api_keys         WHERE emisor_id = e.id AND revoked = false) AS total_keys,
-                    (SELECT EXISTS(SELECT 1 FROM notificaciones WHERE emisor_id = e.id AND leida = false)) AS tiene_notificaciones  -- ← nuevo
+                    (SELECT EXISTS(SELECT 1 FROM notificaciones WHERE emisor_id = e.id AND leida = false)) AS tiene_notificaciones
                 FROM profiles p
-                LEFT JOIN emisores e     ON p.emisor_id = e.id
-                LEFT JOIN user_credits c ON c.emisor_id = e.id
+                LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+                LEFT JOIN emisores e         ON e.id = eu.emisor_id
+                LEFT JOIN user_credits c     ON c.emisor_id = e.id
                 WHERE LOWER(p.email) = LOWER(:email)
+                LIMIT 1
             """)
             res_header = await db.execute(query_header, {"email": email_usuario})
             row_header = res_header.mappings().fetchone()
@@ -72,10 +75,10 @@ async def obtener_dashboard_core(
             if not row_header:
                 data_header = {
                     "ruc": None, "p12_expiration": None, "ambiente": None,
-                    "p12_path": None, "balance_emision": 0, "balance_recepcion": 0,  # ← actualizado
+                    "p12_path": None, "balance_emision": 0, "balance_recepcion": 0,
                     "whatsapp_number": None, "emisor_db_id": None,
                     "total_estab": 0, "total_puntos": 0, "total_keys": 0,
-                    "tiene_notificaciones": False  # ← nuevo
+                    "tiene_notificaciones": False
                 }
             else:
                 data_header = dict(row_header)
@@ -222,6 +225,7 @@ async def obtener_dashboard_core(
             "ok": True,
             "data": {
                 "health": {
+                    "email_verificado":              email_verificado,
                     "ruc":                           bool(data_header.get("ruc")),
                     "ambiente_produccion":           data_header.get("ambiente") == 2,
                     "firma_configurada":             bool(data_header.get("p12_path")),
@@ -229,13 +233,21 @@ async def obtener_dashboard_core(
                     "firma_alerta":                  firma_alerta,
                     "establecimientos_configurados": int(data_header.get("total_estab", 0)) > 0,
                     "puntos_emision_configurados":   int(data_header.get("total_puntos", 0)) > 0,
-                    "balance_emision":               data_header.get("balance_emision") or 0,   # ← actualizado
-                    "balance_recepcion":             data_header.get("balance_recepcion") or 0, # ← nuevo
+                    "balance_emision":               data_header.get("balance_emision") or 0,
+                    "balance_recepcion":             data_header.get("balance_recepcion") or 0,
                     "usuario_nuevo":                 not current_emisor_id,
                     "tiene_api_key":                 int(data_header.get("total_keys", 0)) > 0,
                     "whatsapp_vinculado":            bool(data_header.get("whatsapp_number")),
                     "whatsapp_numero":               data_header.get("whatsapp_number"),
-                    "tiene_notificaciones":          bool(data_header.get("tiene_notificaciones", False)),  # ← nuevo
+                    "tiene_notificaciones":          bool(data_header.get("tiene_notificaciones", False)),
+                    "listo_produccion": (
+                        email_verificado and
+                        bool(data_header.get("ruc")) and
+                        bool(data_header.get("p12_path")) and
+                        firma_vigente and
+                        int(data_header.get("total_estab", 0)) > 0 and
+                        int(data_header.get("total_puntos", 0)) > 0
+                    ),
                 },
                 "resumen":  resumen,
                 "facturas": todas_las_facturas,

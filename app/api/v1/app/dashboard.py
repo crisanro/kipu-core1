@@ -2,6 +2,8 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
+from firebase_admin import auth as fb_auth
+
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.services.dashboard_service import obtener_dashboard_core, consultar_detalle_factura_core
@@ -19,6 +21,14 @@ async def get_dashboard(
 ):
     emisor_id = auth_data.get("emisor_id")
 
+    # Verificación de email en Firebase Auth
+    email_verificado = False
+    try:
+        fb_user = fb_auth.get_user(auth_data["uid"])
+        email_verificado = fb_user.email_verified
+    except Exception:
+        pass
+
     # Cache por emisor + rango de fechas
     cache_key = CK.fmt(CK.DASHBOARD, eid=emisor_id, fi=fecha_inicio, ff=fecha_fin)
     cached = await cache_get(cache_key)
@@ -28,6 +38,7 @@ async def get_dashboard(
     result = await obtener_dashboard_core(
         emisor_id=emisor_id,
         email_usuario=auth_data.get("email"),
+        email_verificado=email_verificado,
         fecha_inicio=fecha_inicio,
         fecha_fin=fecha_fin,
         db=db,

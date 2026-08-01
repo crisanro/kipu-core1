@@ -57,27 +57,44 @@ class Emisor(Base):
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at              = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    profile                 = relationship("Profile", back_populates="emisor", uselist=False)
     credits                 = relationship("UserCredits", back_populates="emisor", uselist=False)
     api_keys                = relationship("ApiKey", back_populates="emisor")
     credit_transactions     = relationship("CreditTransaction", back_populates="emisor")
     establecimientos        = relationship("Establecimiento", back_populates="emisor")
+    usuarios                = relationship("EmisorUsuario", back_populates="emisor")
+    catalogo_items          = relationship("CatalogoItem", back_populates="emisor")
 
 
 class Profile(Base):
-    """Usuarios del sistema. Vinculan Firebase Auth con un emisor de Kipu."""
+    """Usuarios del sistema. Vinculan Firebase Auth con Kipu."""
     __tablename__ = "profiles"
 
     id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     firebase_uid    = Column(Text, unique=True, nullable=False)
-    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="SET NULL"), nullable=True)
     email           = Column(Text, unique=True, nullable=False)
     full_name       = Column(Text)
     role            = Column(String(20), default="admin")            # 'admin', 'contador', 'viewer'
     whatsapp_number = Column(String(20))
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
-    emisor          = relationship("Emisor", back_populates="profile")
+    emisores        = relationship("EmisorUsuario", back_populates="profile")
+
+
+class EmisorUsuario(Base):
+    """Relación muchos a muchos entre usuarios (profiles) y empresas (emisores)."""
+    __tablename__ = "emisor_usuarios"
+    __table_args__ = (
+        UniqueConstraint("emisor_id", "profile_id", name="uq_emisor_profile"),
+    )
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    emisor_id   = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    profile_id  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
+    rol         = Column(String(20), default="emisor")              # "admin" | "emisor"
+    created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+    emisor      = relationship("Emisor", back_populates="usuarios")
+    profile     = relationship("Profile", back_populates="emisores")
 
 
 class UserCredits(Base):
@@ -130,12 +147,33 @@ class ApiKey(Base):
     nombre          = Column(String(100), nullable=False)
     key_prefix      = Column(String(10), nullable=False)             # "kp_live_" — visible al usuario
     key_hash        = Column(String(64), unique=True, nullable=False)   # SHA256 del key completo
+    tipo            = Column(String(20), default="external")         # "internal" | "external"
+    unlimited       = Column(Boolean, default=False)
     revoked         = Column(Boolean, default=False)
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=True)
     last_used_at    = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     emisor          = relationship("Emisor", back_populates="api_keys")
+    webhooks        = relationship("Webhook", back_populates="api_key")
+    invoices        = relationship("InvoiceEmitida", back_populates="api_key")
+
+
+class Webhook(Base):
+    """Endpoints para notificar eventos a sistemas externos."""
+    __tablename__ = "webhooks"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    emisor_id   = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    api_key_id  = Column(Integer, ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True)
+    url         = Column(Text, nullable=False)
+    secret      = Column(Text)                                      # HMAC para verificar payload
+    eventos     = Column(JSONB, default=["factura.autorizada", "factura.rechazada"])
+    activo      = Column(Boolean, default=True)
+    created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+    emisor      = relationship("Emisor")
+    api_key     = relationship("ApiKey", back_populates="webhooks")
 
 
 class AuthChallenge(Base):
@@ -156,9 +194,11 @@ class AuthChallenge(Base):
 class EmailRateLimit(Base):
     """Control anti-spam para envío de correos de verificación."""
     __tablename__ = "email_rate_limits"
+
     id          = Column(Integer, primary_key=True, autoincrement=True)
     email       = Column(String(255), unique=True, nullable=False)
     last_sent   = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
 
 class LeadExUsuario(Base):
     """Ex-clientes para análisis de churn y campañas de reactivación."""
@@ -179,8 +219,26 @@ class LeadExUsuario(Base):
 
 
 # =============================================================================
-# TABLAS DE NEGOCIO (Antes tenant, ahora junto al resto)
+# TABLAS DE NEGOCIO
 # =============================================================================
+
+class CatalogoItem(Base):
+    """Productos y servicios del emisor para facturación rápida."""
+    __tablename__ = "catalogo_items"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    codigo          = Column(String(50))                    # código interno del producto
+    descripcion     = Column(Text, nullable=False)          # lo que aparece en la factura
+    precio          = Column(Numeric(12, 2), nullable=False)
+    tipo_iva        = Column(String(10), default="15")      # 0, 15, 5 — porcentaje IVA Ecuador
+    unidad          = Column(String(20), default="UNIDAD")  # UNIDAD, SERVICIO, KG, etc.
+    activo          = Column(Boolean, default=True)
+    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    emisor          = relationship("Emisor", back_populates="catalogo_items")
+
 
 class Establecimiento(Base):
     """Sucursales del emisor (establecimientos SRI: 001, 002...)."""
@@ -249,6 +307,8 @@ class InvoiceEmitida(Base):
     emisor_id                   = Column(Integer, ForeignKey("emisores.id"), nullable=False)
     punto_emision_id            = Column(Integer, ForeignKey("puntos_emision.id"), nullable=False)
     cliente_emisor_id           = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="SET NULL"), nullable=True)
+    api_key_id                  = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)
+    origen                      = Column(String(20), default="web")  # "web" | "komand" | "wappti" | "api"
     clave_acceso                = Column(String(49), unique=True)
     secuencial                  = Column(String(9), nullable=False)
     numero_factura              = Column(String(17))                # calculado: 001-001-000000001
@@ -273,6 +333,7 @@ class InvoiceEmitida(Base):
 
     punto_emision               = relationship("PuntoEmision", back_populates="invoices")
     cliente                     = relationship("ClienteEmisor", back_populates="invoices")
+    api_key                     = relationship("ApiKey", back_populates="invoices")
 
 
 class InvoiceRecibida(Base):
@@ -280,7 +341,7 @@ class InvoiceRecibida(Base):
     __tablename__ = "invoices_recibidas"
 
     id                      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    emisor_id               = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)  # CASCADE agregado
+    emisor_id               = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
     ruc_proveedor           = Column(String(13), nullable=False)
     razon_social_proveedor  = Column(Text, nullable=False)
     clave_acceso            = Column(String(49), unique=True)
@@ -298,5 +359,3 @@ class InvoiceRecibida(Base):
     fuente                  = Column(String(10), default="MANUAL")
     procesado               = Column(Boolean, default=False)
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
-
-
