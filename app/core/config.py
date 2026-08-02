@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     DATABASE_URL:           str = Field(validation_alias="DATABASE_URL_KIPU")
     REDIS_URL:              str
     NODE_SIGNER_URL:        str
+    IVA_RATE: float = 0.15
+    STRIPE_SECRET_KEY: str
     FIREBASE_PROJECT_ID:    str
     FIREBASE_CLIENT_EMAIL:  str
     FIREBASE_PRIVATE_KEY_ID: str

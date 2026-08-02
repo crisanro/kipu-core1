@@ -13,11 +13,10 @@ class VerifyPinRequest(BaseModel):
 
 
 class RequestPinSchema(BaseModel):
-    whatsapp_number: str
-    tipo_accion: str
-    email: Optional[str] = None # Más flexible para debug que EmailStr
-    metadata: Optional[dict] = None
-    
+    email:            str
+    tipo_accion:      str
+    whatsapp_number:  Optional[str] = None  # opcional — legacy
+    metadata:         Optional[dict] = None
     model_config = ConfigDict(from_attributes=True)
 
 class ApiKeyCreate(BaseModel):

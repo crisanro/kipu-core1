@@ -44,6 +44,7 @@ class Emisor(Base):
     __tablename__ = "emisores"
 
     id                      = Column(Integer, primary_key=True, autoincrement=True)
+    stripe_customer_id = Column(String(50), nullable=True)
     ruc                     = Column(String(13), unique=True, nullable=False)
     razon_social            = Column(Text, nullable=False)
     nombre_comercial        = Column(Text)
