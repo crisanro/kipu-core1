@@ -49,7 +49,13 @@ async def request_pin(
                              "ELIMINAR_TOKEN", "ACTIVAR_PRODUCCION", "EXPORTAR_DATOS", "NUKE"]:
         if not data.email:
             raise HTTPException(status_code=400, detail="El email es obligatorio.")
-        query = text("SELECT id, emisor_id, email FROM profiles WHERE LOWER(email) = LOWER(:val)")
+        query = text("""
+            SELECT p.id, eu.emisor_id, p.email
+            FROM profiles p
+            LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+            WHERE LOWER(p.email) = LOWER(:val)
+            LIMIT 1
+        """)
         param = {"val": data.email}
     else:
         raise HTTPException(status_code=400, detail=f"TIPO DE ACCIÓN NO RECONOCIDO: {data.tipo_accion}")
