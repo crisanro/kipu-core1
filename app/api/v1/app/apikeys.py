@@ -1,46 +1,36 @@
 # app/api/v1/app/apikeys.py
-import os
+import secrets
 import hashlib
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import verify_firebase_token
-from app.schemas.seguridad import ApiKeyCreate, RequestPinSchema
-from app.core.security import validar_y_quemar_pin
+from app.core.security import verify_firebase_token, validar_y_quemar_pin
+from app.schemas.seguridad import ApiKeyCreate
+from app.core.rate_limit import RateLimit, RateLimitScope
 
 router = APIRouter(tags=["Seguridad"])
 
+MAX_API_KEYS = 5  # Máximo de keys activas por emisor
+
 
 @router.get("", summary="Listar API Keys del emisor")
-async def listar_apikeys(
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+async def listar_api_keys(
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
-    emisor_id = auth_data["emisor_id"]
-
-    # Seleccionamos tipo y filtramos solo las externas para no exponer llaves de servicio interno
-    query = text("""
-        SELECT 
-            id, 
-            nombre, 
-            tipo, 
-            revoked, 
-            created_at, 
-            last_used_at
-        FROM api_keys 
-        WHERE emisor_id = :eid 
-          AND tipo = 'external'
-        ORDER BY created_at DESC
-    """)
-
+    emisor_id = auth_data.get("emisor_id")
     try:
-        res = await db.execute(query, {"eid": emisor_id})
+        res = await db.execute(text("""
+            SELECT id, nombre, tipo, revoked, created_at, last_used_at
+            FROM api_keys
+            WHERE emisor_id = :eid
+              AND tipo = 'external'
+            ORDER BY created_at DESC
+        """), {"eid": emisor_id})
         keys = res.fetchall()
-
-        # Construimos la lista simplificada
         return [
             {
                 "id":           k.id,
@@ -52,93 +42,76 @@ async def listar_apikeys(
             }
             for k in keys
         ]
-
     except Exception as e:
         print(f"❌ Error al listar API Keys: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail="Error al obtener el listado de llaves."
-        )
+        raise HTTPException(status_code=500, detail="Error al obtener las API Keys.")
 
 
 @router.post("", summary="Generar una nueva API Key", status_code=201)
-async def crear_apikey(
-    data: ApiKeyCreate, # Debe incluir 'pin' en el schema
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+async def crear_api_key(
+    data: ApiKeyCreate,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
-    emisor_id = auth_data["emisor_id"]
+    emisor_id = auth_data.get("emisor_id")
 
-    # 1. Validar el PIN enviado desde el bot de WhatsApp
+    # Verificar límite de keys activas
+    res_count = await db.execute(text("""
+        SELECT COUNT(*) FROM api_keys
+        WHERE emisor_id = :eid AND revoked = false AND tipo = 'external'
+    """), {"eid": emisor_id})
+    total = res_count.scalar()
+    if total >= MAX_API_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Has alcanzado el límite de {MAX_API_KEYS} API Keys activas. Revoca una antes de crear otra."
+        )
+
+    # Validar PIN
     await validar_y_quemar_pin(db, emisor_id, data.pin, "CREAR_TOKEN")
 
-    # 2. Lógica de generación de llave
-    nombre_limpio = data.nombre.strip()
-    prefix = 'kp_live'
-    secret = os.urandom(24).hex()
-    raw_key = f"{prefix}_{secret}"
-    key_hash = hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
+    # Generar key
+    raw_key  = f"kp_live_{secrets.token_urlsafe(32)}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
-    try:
-        # Nota: 'revoked' tiene default false y 'created_at' tiene default now()
-        query = text("""
-            INSERT INTO api_keys (emisor_id, key_hash, key_prefix, nombre) 
-            VALUES (:eid, :hash, :prefix, :nombre) 
-            RETURNING id, created_at
-        """)
-        
-        res = await db.execute(query, {
-            "eid": emisor_id, 
-            "hash": key_hash, 
-            "prefix": prefix, 
-            "nombre": nombre_limpio
-        })
-        nueva_key = res.fetchone()
-        await db.commit()
+    await db.execute(text("""
+        INSERT INTO api_keys (emisor_id, nombre, key_hash, tipo, unlimited, revoked)
+        VALUES (:eid, :nombre, :hash, 'external', false, false)
+    """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash})
+    await db.commit()
 
-        return {
-            "ok": True,
-            "mensaje": "¡Guarda tu API Key en un lugar seguro! No podrás verla de nuevo.",
-            "key_id": nueva_key.id,
-            "api_key": raw_key,
-            "created_at": nueva_key.created_at
-        }
-    except Exception as e:
-        await db.rollback()
-        # Error de nombre duplicado (Unique constraint)
-        if "23505" in str(e):
-            raise HTTPException(status_code=400, detail="Ya existe una llave con ese nombre.")
-        raise HTTPException(status_code=500, detail="Error al procesar la solicitud.")
+    return {
+        "ok":      True,
+        "api_key": raw_key,
+        "mensaje": "Guarda esta key en un lugar seguro. No podrás verla de nuevo."
+    }
 
 
 @router.delete("/{key_id}", summary="Revocar una API Key")
-async def revocar_apikey(
-    key_id: int, 
-    pin: str, # Se puede pasar por query param (?pin=123456)
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+async def revocar_api_key(
+    key_id: int,
+    pin: str,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
-    emisor_id = auth_data["emisor_id"]
-    
-    # 1. Validar PIN de confirmación para eliminación
+    emisor_id = auth_data.get("emisor_id")
+
+    # Verificar que la key pertenece al emisor
+    res = await db.execute(text("""
+        SELECT id FROM api_keys
+        WHERE id = :kid AND emisor_id = :eid AND revoked = false AND tipo = 'external'
+    """), {"kid": key_id, "eid": emisor_id})
+    if not res.fetchone():
+        raise HTTPException(status_code=404, detail="API Key no encontrada o ya revocada.")
+
+    # Validar PIN
     await validar_y_quemar_pin(db, emisor_id, pin, "ELIMINAR_TOKEN")
 
-    # 2. Ejecutar la revocación
-    query = text("""
-        UPDATE api_keys 
-        SET revoked = true, expires_at = NOW() 
-        WHERE id = :id AND emisor_id = :eid AND revoked = false
-        RETURNING id
-    """)
-    
-    res = await db.execute(query, {"id": key_id, "eid": emisor_id})
-    
-    if not res.fetchone():
-        await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="Llave no encontrada, ya revocada o no autorizada."
-        )
-        
+    await db.execute(text("""
+        UPDATE api_keys SET revoked = true WHERE id = :kid AND emisor_id = :eid
+    """), {"kid": key_id, "eid": emisor_id})
     await db.commit()
+
     return {"ok": True, "mensaje": "API Key revocada exitosamente."}
