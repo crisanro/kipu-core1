@@ -64,7 +64,8 @@ app = FastAPI(
     title="Kipu Core API",
     description="Microservicios Core para Facturación Electrónica SRI",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    redirect_slashes=False  # AGREGAR
 )
 
 # ─── OPENAPI PERSONALIZADO ────────────────────────────────────────────────────
