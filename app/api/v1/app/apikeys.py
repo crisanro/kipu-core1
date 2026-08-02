@@ -75,7 +75,7 @@ async def crear_api_key(
     # Generar key
     raw_key    = f"kp_live_{secrets.token_urlsafe(32)}"
     key_hash   = hashlib.sha256(raw_key.encode()).hexdigest()
-    key_prefix = raw_key[:12]  # AGREGAR — primeros 12 chars para mostrar al usuario
+    key_prefix = raw_key[:8]  # AGREGAR — primeros 12 chars para mostrar al usuario
 
     await db.execute(text("""
         INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, tipo, unlimited, revoked)
