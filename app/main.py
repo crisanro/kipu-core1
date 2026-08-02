@@ -100,8 +100,8 @@ app.openapi = custom_openapi
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción: ["https://kipu.ec"]
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,  # CAMBIAR a False
     allow_methods=["*"],
     allow_headers=["*"],
 )
