@@ -49,8 +49,8 @@ async def get_redis() -> aioredis.Redis:
             settings.REDIS_URL,
             encoding="utf-8",
             decode_responses=True,
-            socket_connect_timeout=5,   # antes 2
-            socket_timeout=5,           # antes 2
+            socket_connect_timeout=5,
+            socket_timeout=None,  # ← Sin timeout para soportar BRPOP blocking
         )
     return _redis_client
 
