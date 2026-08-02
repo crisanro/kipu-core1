@@ -61,7 +61,7 @@ async def listar_apikeys(
         )
 
 
-@router.post("/", summary="Generar una nueva API Key", status_code=201)
+@router.post("", summary="Generar una nueva API Key", status_code=201)
 async def crear_apikey(
     data: ApiKeyCreate, # Debe incluir 'pin' en el schema
     auth_data: dict = Depends(verify_firebase_token), 
