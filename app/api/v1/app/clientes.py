@@ -17,7 +17,7 @@ from app.services.cliente_service import (
 
 router = APIRouter()
 
-@router.post("/")
+@router.post("")
 async def crear_cliente(
     cliente_data: ClienteCreate, 
     auth_data: dict = Depends(verify_firebase_token), 

@@ -193,7 +193,7 @@ async def obtener_producto(
 
 
 # ── POST / — Crear producto ────────────────────────────────────────────────────
-@router.post("/", summary="Crear producto en el catálogo", status_code=201)
+@router.post("", summary="Crear producto en el catálogo", status_code=201)
 async def crear_producto(
     data: ProductoCreate,
     auth_data: dict = Depends(verify_firebase_token),

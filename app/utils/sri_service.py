@@ -30,6 +30,30 @@ URLS_SRI = {
 }
 NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
+def _construir_campos_adicionales(factura_data: dict, emisor) -> list:
+    """
+    Construye los campos adicionales del XML.
+    El RUC del proveedor SIEMPRE va al final — Art. 5 NAC-DGERCGC26-00000027
+    """
+    campos = []
+
+    # Campos adicionales del usuario si los envía
+    for campo in factura_data.get("campos_adicionales", []):
+        if campo.get("nombre") and campo.get("valor"):
+            campos.append({
+                "@nombre": str(campo["nombre"])[:300],
+                "#text":   str(campo["valor"])[:300]
+            })
+
+    # RUC del proveedor — SIEMPRE AL FINAL según resolución SRI
+    campos.append({
+        "@nombre": "PROVEEDOR_SISTEMA_INFORMATICO",
+        "#text":   emisor.ruc
+    })
+
+    return campos
+
+
 async def emitir_factura_core(
     factura_data: dict, 
     emisor_id: int, 
@@ -202,7 +226,10 @@ async def emitir_factura_core(
                         } for p in factura_data.get("pagos", [])]
                     }
                 },
-                "detalles": {"detalle": calculos["detallesXml"]}
+                "detalles": {"detalle": calculos["detallesXml"]},
+                "infoAdicional": {
+                    "campoAdicional": _construir_campos_adicionales(factura_data, emisor)
+                }
             }
         }
         await db.commit()
