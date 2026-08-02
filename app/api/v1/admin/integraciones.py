@@ -136,28 +136,30 @@ async def request_pin(
     if res_rate.fetchone():
         raise HTTPException(status_code=429, detail="Ya enviamos un PIN. Espera 1 minuto antes de solicitar otro.")
 
-    # Verificar PIN activo
+
     res_check = await db.execute(text("""
-        SELECT expires_at FROM auth_challenges
+        SELECT pin FROM auth_challenges
         WHERE emisor_id = :eid AND tipo_accion = :tipo AND expires_at > NOW()
         LIMIT 1
     """), {"eid": user.emisor_id, "tipo": data.tipo_accion})
-    if res_check.fetchone():
-        raise HTTPException(status_code=429, detail="YA TIENES UN PIN ACTIVO. ESPERA A QUE EXPIRE.")
+    challenge = res_check.fetchone()
 
-    # Generar PIN
-    pin = f"{random.randint(100000, 999999)}"
-
-    await db.execute(text("""
-        INSERT INTO auth_challenges (email, pin, tipo_accion, extra_data, emisor_id, expires_at)
-        VALUES (:email, :pin, :tipo, CAST(:meta AS jsonb), :eid, NOW() + INTERVAL '10 minutes')
-    """), {
-        "email": user.email,
-        "pin":   pin,
-        "tipo":  data.tipo_accion,
-        "meta":  json.dumps(data.metadata) if hasattr(data, 'metadata') and data.metadata else "{}",
-        "eid":   user.emisor_id
-    })
+    if challenge:
+        pin = challenge.pin  # Reutilizar el PIN existente
+    else:
+        pin = f"{random.randint(100000, 999999)}"
+        await db.execute(text("""
+            INSERT INTO auth_challenges (email, pin, tipo_accion, extra_data, emisor_id, expires_at)
+            VALUES (:email, :pin, :tipo, CAST(:meta AS jsonb), :eid, NOW() + INTERVAL '10 minutes')
+        """), {
+            "email": user.email,
+            "pin":   pin,
+            "tipo":  data.tipo_accion,
+            "meta":  json.dumps(data.metadata) if hasattr(data, 'metadata') and data.metadata else "{}",
+            "eid":   user.emisor_id
+        })
+        await db.commit()   
+ 
 
     # Rate limit DB
     await db.execute(text("""
