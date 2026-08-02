@@ -72,14 +72,15 @@ async def crear_api_key(
     await validar_y_quemar_pin(db, emisor_id, data.pin, "CREAR_TOKEN")
 
     # Generar key
-    raw_key  = f"kp_live_{secrets.token_urlsafe(32)}"
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    # Generar key
+    raw_key    = f"kp_live_{secrets.token_urlsafe(32)}"
+    key_hash   = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:12]  # AGREGAR — primeros 12 chars para mostrar al usuario
 
     await db.execute(text("""
-        INSERT INTO api_keys (emisor_id, nombre, key_hash, tipo, unlimited, revoked)
-        VALUES (:eid, :nombre, :hash, 'external', false, false)
-    """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash})
-    await db.commit()
+        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, tipo, unlimited, revoked)
+        VALUES (:eid, :nombre, :hash, :prefix, 'external', false, false)
+    """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash, "prefix": key_prefix})
 
     return {
         "ok":      True,
