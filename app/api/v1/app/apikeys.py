@@ -82,6 +82,8 @@ async def crear_api_key(
         VALUES (:eid, :nombre, :hash, :prefix, 'external', false, false)
     """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash, "prefix": key_prefix})
 
+    await db.commit()  # AGREGAR ESTO
+
     return {
         "ok":      True,
         "api_key": raw_key,
