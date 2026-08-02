@@ -14,7 +14,7 @@ from app.core.security import validar_y_quemar_pin
 router = APIRouter(tags=["Seguridad"])
 
 
-@router.get("/", summary="Listar API Keys del emisor")
+@router.get("", summary="Listar API Keys del emisor")
 async def listar_apikeys(
     auth_data: dict = Depends(verify_firebase_token), 
     db: AsyncSession = Depends(get_db)

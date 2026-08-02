@@ -28,7 +28,7 @@ async def crear_cliente(
 
 
 # 2. Agrega este endpoint (ponlo justo debajo del POST de crear_cliente, por ejemplo):
-@router.get("/")
+@router.get("")
 async def listar_todos_los_clientes(
     auth_data: dict = Depends(verify_firebase_token), 
     db: AsyncSession = Depends(get_db)

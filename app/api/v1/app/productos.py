@@ -55,7 +55,7 @@ class ProductoUpdate(BaseModel):
 
 
 # ── GET /  — Listar todos los productos activos ────────────────────────────────
-@router.get("/", summary="Listar productos del catálogo")
+@router.get("", summary="Listar productos del catálogo")
 async def listar_productos(
     response: Response,
     auth_data: dict = Depends(verify_firebase_token),

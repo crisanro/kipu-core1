@@ -8,7 +8,7 @@ from app.core.security import verify_firebase_token
 router = APIRouter()
 
 
-@router.get("/", summary="Listar notificaciones del emisor")
+@router.get("", summary="Listar notificaciones del emisor")
 async def listar_notificaciones(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),

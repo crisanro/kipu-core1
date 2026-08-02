@@ -14,7 +14,7 @@ from app.core.cache import cache_get, cache_set, cache_delete, CK, TTL
 router = APIRouter()
 
 # ── GET Estructura — CON CACHE ─────────────────────────────────────────────────
-@router.get("/", summary="Listar establecimientos y puntos de emisión")
+@router.get("", summary="Listar establecimientos y puntos de emisión")
 async def listar_estructura(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),

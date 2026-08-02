@@ -12,7 +12,7 @@ from app.core.cache import cache_get, cache_set, CK, TTL
 router = APIRouter()
 
 
-@router.get("/", summary="Obtener datos globales del Dashboard")
+@router.get("", summary="Obtener datos globales del Dashboard")
 async def get_dashboard(
     fecha_inicio: date = Query(..., description="Fecha inicial (YYYY-MM-DD)"),
     fecha_fin:    date = Query(..., description="Fecha final (YYYY-MM-DD)"),
