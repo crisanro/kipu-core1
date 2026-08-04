@@ -69,6 +69,7 @@ async def listar_productos(
     db: AsyncSession = Depends(get_db),
     incluir_inactivos: bool = Query(False)
 ):
+    response.headers["Cache-Control"] = "no-cache"
     emisor_id = auth_data["emisor_id"]
     cache_key = ck_lista(emisor_id)
 
@@ -76,8 +77,6 @@ async def listar_productos(
     if not incluir_inactivos:
         cached = await cache_get(cache_key)
         if cached:
-            # Cache del cliente — 2 minutos
-            response.headers["Cache-Control"] = "no-cache"
             return {"ok": True, "data": cached, "source": "cache"}
 
     filtro = "" if incluir_inactivos else "AND activo = true"
@@ -106,7 +105,6 @@ async def listar_productos(
     if not incluir_inactivos:
         await cache_set(cache_key, data, TTL_LISTA)
 
-    response.headers["Cache-Control"] = "private, max-age=120"
     return {"ok": True, "data": data, "source": "db"}
 
 
@@ -118,12 +116,12 @@ async def buscar_productos(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
 ):
+    response.headers["Cache-Control"] = "no-cache"
     emisor_id = auth_data["emisor_id"]
     cache_key = ck_busqueda(emisor_id, q)
 
     cached = await cache_get(cache_key)
     if cached:
-        response.headers["Cache-Control"] = "private, max-age=60"
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
@@ -154,7 +152,6 @@ async def buscar_productos(
     ]
 
     await cache_set(cache_key, data, TTL_BUSQUEDA)
-    response.headers["Cache-Control"] = "private, max-age=60"
     return {"ok": True, "data": data, "source": "db"}
 
 
@@ -166,12 +163,12 @@ async def obtener_producto(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
 ):
+    response.headers["Cache-Control"] = "no-cache"
     emisor_id = auth_data["emisor_id"]
     cache_key = ck_detalle(emisor_id, producto_id)
 
     cached = await cache_get(cache_key)
     if cached:
-        response.headers["Cache-Control"] = "private, max-age=300"
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
@@ -198,7 +195,6 @@ async def obtener_producto(
     }
 
     await cache_set(cache_key, data, TTL_DETALLE)
-    response.headers["Cache-Control"] = "private, max-age=300"
     return {"ok": True, "data": data, "source": "db"}
 
 
