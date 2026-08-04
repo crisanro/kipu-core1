@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     REDIS_URL:              str
     NODE_SIGNER_URL:        str
     IVA_RATE: float = 0.15
+    BACKEND_URL: str = "https://core.kipu.ec"
     STRIPE_SECRET_KEY: str
     FIREBASE_PROJECT_ID:    str
     FIREBASE_CLIENT_EMAIL:  str

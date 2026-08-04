@@ -112,6 +112,7 @@ app.add_middleware(
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     print("❌ ERROR DE VALIDACIÓN 422 ❌")
     print("Ruta:", request.url.path)
+    print("Errores:", exc.errors())  # AGREGAR ESTA LÍNEA
     errores = []
     for e in exc.errors():
         errores.append({

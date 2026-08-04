@@ -1,4 +1,3 @@
-# app/workers/sri_worker.py
 import base64
 import asyncio
 import httpx
@@ -13,6 +12,7 @@ from app.services.storage_service import download_file, upload_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
 from app.core.config import settings
+from app.api.v1.app.productos import invalidar_cache_productos
 
 QUEUE_EMISION       = "kipu:queue:emision"
 QUEUE_AUTORIZACION  = "kipu:queue:autorizacion"
@@ -32,7 +32,6 @@ URLS_SRI = {
 
 NODE_PDF_URL    = f"{settings.NODE_SIGNER_URL}/api/pdf"
 MAX_CONCURRENT  = 3
-MAX_RETRIES     = 5
 BRPOP_TIMEOUT   = 5
 
 _sri_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -45,9 +44,9 @@ async def recovery_al_arrancar():
     async with AsyncSessionLocal() as db:
         result_emision = await db.execute(text("""
             SELECT id FROM invoices_emitidas
-            WHERE estado = 'FIRMADO' AND retry_count < :max_retries
+            WHERE estado = 'FIRMADO'
             ORDER BY created_at ASC
-        """), {"max_retries": MAX_RETRIES})
+        """))
         ids_emision = result_emision.fetchall()
 
         result_auth = await db.execute(text("""
@@ -123,8 +122,16 @@ async def procesar_emision(factura_id: str):
                 )
                 res = await httpx_with_retry(urls["recepcion"], soap_body, {"Content-Type": "text/xml"})
 
-                json_res       = xmltodict.parse(res.text)
-                body           = json_res.get("soap:Envelope", {}).get("soap:Body", {})
+                json_res = xmltodict.parse(res.text)
+                body     = json_res.get("soap:Envelope", {}).get("soap:Body", {})
+
+                # Si hay fault del SRI — reintentar con espera larga inicial (30s)
+                if body.get("soap:Fault"):
+                    fault_msg = body['soap:Fault'].get('faultstring', 'Error desconocido')
+                    print(f"[Emisión] ⚠️ SRI Fault — esperando 30s antes de reintentar: {fault_msg}")
+                    await asyncio.sleep(30)
+                    raise Exception(f"SRI Fault: {fault_msg}")
+
                 resp_recepcion = body.get("ns2:validarComprobanteResponse", {}).get("RespuestaRecepcionComprobante")
                 fac_dict       = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in factura._mapping.items()}
 
@@ -151,24 +158,40 @@ async def procesar_emision(factura_id: str):
                         )
                     await db.commit()
                     print(f"[Emisión] ⚠️ DEVUELTA: {factura.clave_acceso}")
+                    try:
+                        from app.core.cache import cache_clear_prefix
+                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
+                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
+                    except Exception as e_cache:
+                        print(f"[Emisión] ⚠️ Cache no invalidado: {e_cache}")
                     await notificar_cambio_estado(fac_dict, "DEVUELTA", resp_recepcion)
 
             except Exception as err:
                 await db.rollback()
                 async with AsyncSessionLocal() as db2:
                     result2 = await db2.execute(
-                        text("UPDATE invoices_emitidas SET retry_count = COALESCE(retry_count,0) + 1, last_retry = NOW() WHERE id = :id RETURNING retry_count"),
+                        text("""
+                            UPDATE invoices_emitidas 
+                            SET retry_count = CASE 
+                                WHEN last_retry < NOW() - INTERVAL '1 hour' THEN 1
+                                ELSE COALESCE(retry_count, 0) + 1
+                            END,
+                            last_retry = NOW() 
+                            WHERE id = :id 
+                            RETURNING retry_count
+                        """),
                         {"id": factura_id}
                     )
                     nuevo_retry = result2.scalar()
                     await db2.commit()
                 print(f"[Emisión] ❌ Error ({factura_id}): {str(err)} — retry #{nuevo_retry}")
-                if nuevo_retry < MAX_RETRIES:
-                    await asyncio.sleep(min(2 ** nuevo_retry, 30))
-                    redis = await get_redis()
-                    await redis.lpush(QUEUE_EMISION, factura_id)
-                else:
-                    print(f"[Emisión] 🚫 {factura_id} superó {MAX_RETRIES} reintentos. Abandonado.")
+                
+                # Reintentos continuos con backoff exponencial (máximo 5 minutos)
+                espera = min(2 ** nuevo_retry * 10, 300)
+                print(f"[Emisión] ⏳ Esperando {espera}s antes del reintento #{nuevo_retry + 1}")
+                await asyncio.sleep(espera)
+                redis = await get_redis()
+                await redis.lpush(QUEUE_EMISION, factura_id)
 
 
 async def procesar_autorizacion(factura_id: str):
@@ -206,8 +229,9 @@ async def procesar_autorizacion(factura_id: str):
                 resp_auth = body.get("ns2:autorizacionComprobanteResponse", {}).get("RespuestaAutorizacionComprobante")
                 fac_dict  = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in factura._mapping.items()}
 
+                # Si aún no hay comprobantes disponibles en el SRI — reintentar en 10s
                 if not resp_auth or int(resp_auth.get("numeroComprobantes", 0)) == 0:
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(10)
                     redis = await get_redis()
                     await redis.lpush(QUEUE_AUTORIZACION, factura_id)
                     return
@@ -243,7 +267,47 @@ async def procesar_autorizacion(factura_id: str):
                         {"fecha": fecha_auth_obj, "id": factura.id}
                     )
                     await db.commit()
+
+                    # Descontar stock de productos facturados
+                    try:
+                        datos = await db.execute(text("""
+                            SELECT datos_factura FROM invoices_emitidas WHERE id = :id
+                        """), {"id": factura.id})
+                        fac_data = datos.scalar()
+                        if fac_data:
+                            detalles = fac_data.get("detalles", {}).get("detalle", [])
+                            if not isinstance(detalles, list):
+                                detalles = [detalles]
+                            for detalle in detalles:
+                                codigo = detalle.get("codigoPrincipal") or detalle.get("codigoAuxiliar")
+                                if not codigo or codigo == "S/C":
+                                    continue
+                                cantidad = float(detalle.get("cantidad", 0))
+                                await db.execute(text("""
+                                    UPDATE catalogo_items
+                                    SET stock = GREATEST(0, stock - :qty),
+                                        updated_at = NOW()
+                                    WHERE emisor_id = :eid
+                                      AND stock > 0
+                                      AND codigo = :cod
+                                """), {"qty": int(cantidad), "eid": factura.emisor_db_id, "cod": codigo})
+                            await db.commit()
+                            try:
+                                await invalidar_cache_productos(factura.emisor_db_id)
+                            except Exception as e_cache_prod:
+                                print(f"[Stock] ⚠️ Cache productos no invalidado: {e_cache_prod}")
+
+                    except Exception as e_stock:
+                        print(f"[Stock] ⚠️ Error descontando stock: {e_stock}")
+
                     print(f"[Auth] ✅ AUTORIZADO: {factura.clave_acceso}")
+                    try:
+                        from app.core.cache import cache_delete, cache_clear_prefix, CK
+                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
+                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
+                    except Exception as e_cache:
+                        print(f"[Auth] ⚠️ Cache no invalidado: {e_cache}")
+
                     await notificar_cambio_estado(fac_dict, "AUTORIZADO")
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.autorizada", fac_dict)
 
@@ -271,13 +335,19 @@ async def procesar_autorizacion(factura_id: str):
                         )
                     await db.commit()
                     print(f"[Auth] ⚠️ RECHAZADO: {factura.clave_acceso}")
+                    try:
+                        from app.core.cache import cache_clear_prefix
+                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
+                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
+                    except Exception as e_cache:
+                        print(f"[Auth] ⚠️ Cache no invalidado: {e_cache}")
                     await notificar_cambio_estado(fac_dict, "RECHAZADO", autorizacion.get("mensajes"))
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.rechazada", fac_dict)
 
             except Exception as err:
                 await db.rollback()
                 print(f"[Auth] ❌ Error ({factura_id}): {str(err)}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(30)
                 redis = await get_redis()
                 await redis.lpush(QUEUE_AUTORIZACION, factura_id)
 
@@ -327,7 +397,6 @@ async def loop_emision():
         except Exception as e:
             print(f"[Worker Emisión] ❌ Error en loop: {e}")
             await asyncio.sleep(3)
-            # Reconectar Redis por si acaso
             try:
                 redis = await get_redis()
             except Exception:
@@ -339,8 +408,6 @@ async def _procesar_y_limpiar_emision(factura_id: str, redis):
         await procesar_emision(factura_id)
     finally:
         await redis.lrem(QUEUE_PROC_EMISION, 1, factura_id)
-
-
 
 
 async def loop_autorizacion():

@@ -12,7 +12,8 @@ from app.services.cliente_service import (
     verificar_existencia_cliente_core,
     consultar_todos_clientes_core,
     consultar_detalle_cliente_core,
-    actualizar_cliente_core
+    actualizar_cliente_core,
+    buscar_clientes_core
 )
 
 router = APIRouter()
@@ -28,15 +29,16 @@ async def crear_cliente(
 
 
 # 2. Agrega este endpoint (ponlo justo debajo del POST de crear_cliente, por ejemplo):
+from fastapi import APIRouter, Depends, HTTPException, Query as QueryParam
+
 @router.get("")
 async def listar_todos_los_clientes(
-    auth_data: dict = Depends(verify_firebase_token), 
-    db: AsyncSession = Depends(get_db)
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+    q: str = QueryParam(None, description="Búsqueda por nombre o identificación")
 ):
-    """
-    Devuelve la lista completa de clientes asociados a este emisor.
-    Ideal para llenar la tabla principal de clientes en el Dashboard.
-    """
+    if q:
+        return await buscar_clientes_core(auth_data["emisor_id"], q, db)
     return await consultar_todos_clientes_core(auth_data["emisor_id"], db)
 
 

@@ -15,6 +15,7 @@ from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.cache import get_redis, cache_get, cache_set, cache_delete, cache_clear_prefix
 
+
 router = APIRouter()
 
 # ── TTLs ──────────────────────────────────────────────────────────────────────
@@ -41,9 +42,10 @@ async def invalidar_cache_productos(emisor_id: int):
 class ProductoCreate(BaseModel):
     codigo:      Optional[str]  = None
     descripcion: str            = Field(..., min_length=2, max_length=300)
-    precio:      Decimal        = Field(..., gt=0)
-    tipo_iva:    str            = Field(default="15")   # "0", "5", "15"
+    precio:      Decimal        = Field(..., ge=0)
+    tipo_iva:    str            = Field(default="15")
     unidad:      str            = Field(default="UNIDAD")
+    stock:       int            = Field(default=-1)  # -1 = sin control
 
 class ProductoUpdate(BaseModel):
     codigo:      Optional[str]     = None
@@ -52,9 +54,14 @@ class ProductoUpdate(BaseModel):
     tipo_iva:    Optional[str]     = None
     unidad:      Optional[str]     = None
     activo:      Optional[bool]    = None
+    stock:       Optional[int]     = None
 
+class StockAjuste(BaseModel):
+    cantidad:  int = Field(..., description="Positivo=entrada, Negativo=salida")
+    motivo:    str = Field(default="Ajuste manual")
 
-# ── GET /  — Listar todos los productos activos ────────────────────────────────
+    
+# ── GET / — Listar todos los productos activos ────────────────────────────────
 @router.get("", summary="Listar productos del catálogo")
 async def listar_productos(
     response: Response,
@@ -70,12 +77,12 @@ async def listar_productos(
         cached = await cache_get(cache_key)
         if cached:
             # Cache del cliente — 2 minutos
-            response.headers["Cache-Control"] = "private, max-age=120"
+            response.headers["Cache-Control"] = "no-cache"
             return {"ok": True, "data": cached, "source": "cache"}
 
     filtro = "" if incluir_inactivos else "AND activo = true"
     res = await db.execute(text(f"""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, activo, created_at
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, activo, created_at
         FROM catalogo_items
         WHERE emisor_id = :eid {filtro}
         ORDER BY descripcion ASC
@@ -90,6 +97,7 @@ async def listar_productos(
             "precio":      float(r.precio),
             "tipo_iva":    r.tipo_iva,
             "unidad":      r.unidad,
+            "stock":       r.stock,
             "activo":      r.activo,
         }
         for r in rows
@@ -119,7 +127,7 @@ async def buscar_productos(
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock
         FROM catalogo_items
         WHERE emisor_id = :eid
           AND activo = true
@@ -140,6 +148,7 @@ async def buscar_productos(
             "precio":      float(r.precio),
             "tipo_iva":    r.tipo_iva,
             "unidad":      r.unidad,
+            "stock":       r.stock,
         }
         for r in rows
     ]
@@ -166,7 +175,7 @@ async def obtener_producto(
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, activo, created_at, updated_at
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, activo, created_at, updated_at
         FROM catalogo_items
         WHERE id = :id AND emisor_id = :eid
     """), {"id": producto_id, "eid": emisor_id})
@@ -182,6 +191,7 @@ async def obtener_producto(
         "precio":      float(row.precio),
         "tipo_iva":    row.tipo_iva,
         "unidad":      row.unidad,
+        "stock":       row.stock,
         "activo":      row.activo,
         "created_at":  str(row.created_at),
         "updated_at":  str(row.updated_at),
@@ -206,9 +216,9 @@ async def crear_producto(
 
     try:
         res = await db.execute(text("""
-            INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad)
-            VALUES (:eid, :codigo, :desc, :precio, :iva, :unidad)
-            RETURNING id, descripcion, precio, tipo_iva, unidad, created_at
+            INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad, stock)
+            VALUES (:eid, :codigo, :desc, :precio, :iva, :unidad, :stock)
+            RETURNING id, descripcion, precio, tipo_iva, unidad, stock, created_at
         """), {
             "eid":    emisor_id,
             "codigo": data.codigo,
@@ -216,6 +226,7 @@ async def crear_producto(
             "precio": data.precio,
             "iva":    data.tipo_iva,
             "unidad": data.unidad,
+            "stock":  data.stock,
         })
         row = res.fetchone()
         await db.commit()
@@ -237,6 +248,7 @@ async def crear_producto(
             "precio":      float(row.precio),
             "tipo_iva":    row.tipo_iva,
             "unidad":      row.unidad,
+            "stock":       row.stock,
             "created_at":  str(row.created_at),
         }
     }
@@ -272,6 +284,7 @@ async def actualizar_producto(
     if data.tipo_iva    is not None: campos.append("tipo_iva = :iva");       params["iva"]         = data.tipo_iva
     if data.unidad      is not None: campos.append("unidad = :unidad");      params["unidad"]      = data.unidad
     if data.activo      is not None: campos.append("activo = :activo");      params["activo"]      = data.activo
+    if data.stock       is not None: campos.append("stock = :stock");        params["stock"]       = data.stock
 
     if not campos:
         raise HTTPException(status_code=400, detail="No hay campos para actualizar.")
@@ -292,6 +305,30 @@ async def actualizar_producto(
     await invalidar_cache_productos(emisor_id)
 
     return {"ok": True, "mensaje": "Producto actualizado exitosamente."}
+
+
+# ── PATCH /{id}/stock — Ajuste manual de stock ────────────────────────────────
+@router.patch("/{producto_id}/stock", summary="Ajustar stock manualmente")
+async def ajustar_stock(
+    producto_id: str,
+    data: StockAjuste,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data["emisor_id"]
+    res = await db.execute(text("""
+        UPDATE catalogo_items
+        SET stock = GREATEST(0, stock + :cantidad),
+            updated_at = NOW()
+        WHERE id = :id AND emisor_id = :eid AND stock != -1
+        RETURNING id, stock
+    """), {"id": producto_id, "eid": emisor_id, "cantidad": data.cantidad})
+    row = res.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Producto no encontrado o no maneja stock.")
+    await db.commit()
+    await invalidar_cache_productos(emisor_id)
+    return {"ok": True, "stock_actual": row.stock}
 
 
 # ── DELETE /{id} — Desactivar producto (soft delete) ──────────────────────────

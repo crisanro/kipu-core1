@@ -22,6 +22,8 @@ class TTL:
     ESTRUCTURA        = 600   # 10 min — establecimientos y puntos (cambian poco)
     API_KEYS          = 300   # 5 min  — lista de API Keys del emisor
     STATUS_INTEGRACION= 180   # 3 min  — estado del emisor vía API externa
+    FACTURA_DETALLE   = 300
+    HISTORIAL         = 360
 
 # ── Prefijos de clave ──────────────────────────────────────────────────────────
 class CK:
@@ -33,6 +35,8 @@ class CK:
     ESTRUCTURA      = "estructura:{eid}"
     API_KEYS        = "apikeys:{eid}"
     STATUS          = "status:{eid}"
+    FACTURA         = "factura:{eid}:{fid}"
+    HISTORIAL       = "historial:{eid}:{fi}:{ff}"
 
     @staticmethod
     def fmt(template: str, **kwargs) -> str:
@@ -124,3 +128,5 @@ async def invalidate_emisor(emisor_id: int):
     await cache_clear_prefix(f"estructura:{emisor_id}")
     await cache_clear_prefix(f"apikeys:{emisor_id}")
     await cache_clear_prefix(f"status:{emisor_id}")
+    await cache_clear_prefix(f"factura:{emisor_id}")
+    await cache_clear_prefix(f"historial:{emisor_id}")

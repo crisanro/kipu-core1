@@ -1,11 +1,13 @@
 # app/services/dashboard_service.py — OPTIMIZADO con cache en 2 capas
+import json
+import calendar
+from datetime import date, datetime
+import pytz
+import traceback
+
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import date, datetime
-import calendar
-import pytz
-import traceback
 
 from app.core.cache import cache_get, cache_set
 
@@ -120,15 +122,18 @@ async def obtener_dashboard_core(
                             f.identificacion_comprador, f.razon_social_comprador,
                             f.subtotal_iva, f.subtotal_0, f.valor_iva, f.importe_total,
                             f.fecha_emision,
+                            f.created_at,
+                            f.numero_factura,
                             est.codigo AS estab,
-                            p.codigo   AS punto
+                            p.codigo   AS punto,
+                            f.datos_factura->'detalles'->'detalle' AS detalles_items
                         FROM invoices_emitidas f
-                        JOIN puntos_emision   p   ON f.punto_emision_id   = p.id
-                        JOIN establecimientos est  ON p.establecimiento_id = est.id
-                        WHERE f.emisor_id     = :eid
-                          AND f.fecha_emision BETWEEN :fini AND :ffin
+                        LEFT JOIN puntos_emision p ON f.punto_emision_id = p.id
+                        LEFT JOIN establecimientos est ON p.establecimiento_id = est.id
+                        WHERE f.emisor_id = :eid
+                          AND f.fecha_emision >= :fini
+                          AND f.fecha_emision <= :ffin
                         ORDER BY f.fecha_emision DESC, f.created_at DESC
-                        LIMIT 500
                     """)
                     res_facturas = await db.execute(query_facturas, {
                         "eid":  current_emisor_id,
@@ -138,19 +143,46 @@ async def obtener_dashboard_core(
 
                     facturas_mes = []
                     for f in res_facturas.mappings():
+                        raw = f.get("detalles_items")
+                        if isinstance(raw, str):
+                            try:
+                                raw = json.loads(raw)
+                            except Exception:
+                                raw = []
+                        detalles = raw if isinstance(raw, list) else ([raw] if raw else [])
+
+                        # Acumular subtotales por tarifa desde los detalles
+                        impuestos_por_tarifa = {}
+                        for detalle in detalles:
+                            if not isinstance(detalle, dict):
+                                continue
+                            imp = detalle.get("impuestos", {}).get("impuesto", {})
+                            imp_list = imp if isinstance(imp, list) else ([imp] if imp else [])
+                            for i in imp_list:
+                                if not isinstance(i, dict):
+                                    continue
+                                tarifa = str(i.get("tarifa") if i.get("tarifa") is not None else "0")
+                                if tarifa not in impuestos_por_tarifa:
+                                    impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
+                                impuestos_por_tarifa[tarifa]["base"] += float(i.get("baseImponible") or 0)
+                                impuestos_por_tarifa[tarifa]["iva"]  += float(i.get("valor") or 0)
+
                         facturas_mes.append({
-                            "id":             str(f["id"]),
-                            "clave_acceso":   f["clave_acceso"],
-                            "numero":         f"{f['estab']}-{f['punto']}-{f['secuencial']}",
-                            "cliente_nombre": f["razon_social_comprador"],
-                            "cliente_id":     f["identificacion_comprador"],
-                            "subtotal_15":    float(f["subtotal_iva"]),
-                            "subtotal_0":     float(f["subtotal_0"]),
-                            "iva":            float(f["valor_iva"]),
-                            "total":          float(f["importe_total"]),
-                            "estado":         f["estado"],
+                            "id":                str(f["id"]),
+                            "clave_acceso":      f["clave_acceso"],
+                            "numero":            f"{f['estab']}-{f['punto']}-{f['secuencial']}",
+                            "numero_factura":    f["numero_factura"],
+                            "cliente_nombre":    f["razon_social_comprador"],
+                            "cliente_id":        f["identificacion_comprador"],
+                            "subtotal_15":       float(f["subtotal_iva"] or 0),
+                            "subtotal_0":        float(f["subtotal_0"] or 0),
+                            "iva":               float(f["valor_iva"] or 0),
+                            "total":             float(f["importe_total"] or 0),
+                            "estado":            f["estado"],
+                            "impuestos_totales": impuestos_por_tarifa,
                             # Guardamos como string ISO para serialización Redis
-                            "fecha":          f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"])
+                            "fecha":             f["fecha_emision"].isoformat() if isinstance(f["fecha_emision"], (date, datetime)) else str(f["fecha_emision"]),
+                            "created_at":        f["created_at"].isoformat() if isinstance(f["created_at"], (date, datetime)) else str(f["created_at"]) if f.get("created_at") else ""
                         })
 
                     # Meses pasados duran 1 hora, mes actual solo 2 min
@@ -171,8 +203,11 @@ async def obtener_dashboard_core(
                 if fecha_inicio <= _parse_fecha(f) <= fecha_fin
             ]
 
-            # Ordenar por fecha desc y limitar
-            todas_las_facturas.sort(key=_parse_fecha, reverse=True)
+            # Ordenar por fecha desc y created_at desc, luego limitar
+            todas_las_facturas.sort(
+                key=lambda f: (f["fecha"], f.get("created_at", "")),
+                reverse=True
+            )
             todas_las_facturas = todas_las_facturas[:100]
 
         # ── Calcular resumen en Python sobre las facturas filtradas ───────
@@ -237,7 +272,7 @@ async def obtener_dashboard_core(
                     "balance_recepcion":             data_header.get("balance_recepcion") or 0,
                     "usuario_nuevo":                 not current_emisor_id,
                     "tiene_api_key":                 int(data_header.get("total_keys", 0)) > 0,
-                    "whatsapp_vinculado":            bool(data_header.get("whatsapp_number")),
+                    "whatsapp_vinculado":             bool(data_header.get("whatsapp_number")),
                     "whatsapp_numero":               data_header.get("whatsapp_number"),
                     "tiene_notificaciones":          bool(data_header.get("tiene_notificaciones", False)),
                     "listo_produccion": (
@@ -321,7 +356,7 @@ async def consultar_detalle_factura_core(emisor_id: int, factura_id: str, db: As
         return {
             "ok": True,
             "factura": {
-                "id":             str(row_dict["factura_id"]),
+                "id":              str(row_dict["factura_id"]),
                 "numero_completo": f"{row_dict['estab_codigo'] or '000'}-{row_dict['pto_emi_codigo'] or '000'}-{row_dict['secuencial']}",
                 "secuencial":     row_dict["secuencial"],
                 "clave_acceso":   row_dict["clave_acceso"],

@@ -1,13 +1,15 @@
-# app/api/v1/app/dashboard.py — OPTIMIZADO con cache
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import date
 from firebase_admin import auth as fb_auth
 
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
-from app.services.dashboard_service import obtener_dashboard_core, consultar_detalle_factura_core
+from app.services.dashboard_service import obtener_dashboard_core
 from app.core.cache import cache_get, cache_set, CK, TTL
+from app.core.config import settings
+
 
 router = APIRouter()
 
@@ -29,7 +31,7 @@ async def get_dashboard(
     except Exception:
         pass
 
-    # Cache por emisor + rango de fechas
+    # 1. Cache corregido por emisor + rango de fechas usando CK.fmt
     cache_key = CK.fmt(CK.DASHBOARD, eid=emisor_id, fi=fecha_inicio, ff=fecha_fin)
     cached = await cache_get(cache_key)
     if cached:
@@ -44,32 +46,60 @@ async def get_dashboard(
         db=db,
     )
 
-    # TTL corto (2 min) — el dashboard muestra datos recientes
+    # Cache con TTL estándar de Dashboard (2 min)
     await cache_set(cache_key, result, TTL.DASHBOARD)
     return result
 
 
-@router.get("/factura/{factura_id}", summary="Obtener detalles de una factura específica")
-async def get_detalle_factura(
+@router.get("/factura/{factura_id}", summary="Detalle de una factura")
+async def detalle_factura(
     factura_id: str,
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
 ):
-    # El detalle de una factura es inmutable una vez AUTORIZADA — TTL largo
-    cache_key = f"factura_detalle:{auth_data['emisor_id']}:{factura_id}"
+    emisor_id = auth_data.get("emisor_id")
+    
+    # 3. Formateo de cache_key unificado con CK.fmt
+    cache_key = CK.fmt(CK.FACTURA, eid=emisor_id, fid=factura_id)
     cached = await cache_get(cache_key)
     if cached:
         return cached
-
-    result = await consultar_detalle_factura_core(
-        emisor_id=auth_data["emisor_id"],
-        factura_id=factura_id,
-        db=db,
-    )
-
-    # Solo cachear si la factura está autorizada (estado final)
-    estado = result.get("factura", {}).get("estado", "")
-    if estado == "AUTORIZADO":
-        await cache_set(cache_key, result, 3600)  # 1 hora — estado inmutable
-
-    return result
+    
+    res = await db.execute(text("""
+        SELECT 
+            id, clave_acceso, numero_factura, secuencial, fecha_emision,
+            estado, mensajes_sri, fecha_autorizacion, datos_factura,
+            xml_path, origen, created_at
+        FROM invoices_emitidas
+        WHERE id = :fid AND emisor_id = :eid
+    """), {"fid": factura_id, "eid": emisor_id})
+    
+    factura = res.fetchone()
+    if not factura:
+        raise HTTPException(status_code=404, detail="Factura no encontrada.")
+    
+    f = factura._mapping
+    resultado = {
+        "ok": True,
+        "factura": {
+            "id":                 str(f["id"]),
+            "clave_acceso":       f["clave_acceso"],
+            "numero_factura":     f["numero_factura"],
+            "fecha_emision":      str(f["fecha_emision"]),
+            "fecha_autorizacion": str(f["fecha_autorizacion"]) if f["fecha_autorizacion"] else None,
+            "estado":             f["estado"],
+            "mensajes_sri":       f["mensajes_sri"],
+            "origen":             f["origen"],
+            "datos":              f["datos_factura"],
+            "links": {
+                "pdf": f"{settings.BACKEND_URL}/api/v1/public/pdf/{f['clave_acceso']}",
+                "xml": f"{settings.BACKEND_URL}/api/v1/public/xml/{f['clave_acceso']}",
+            } if f["estado"] == "AUTORIZADO" else None
+        }
+    }
+    
+    # 2. TTL.FACTURA_DETALLE aplicado correctamente (5 min si autorizada, 30s si pendiente/otro)
+    ttl = TTL.FACTURA_DETALLE if f["estado"] == "AUTORIZADO" else 30
+    await cache_set(cache_key, resultado, ttl)
+    
+    return resultado

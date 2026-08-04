@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
+
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.schemas.factura import FacturaCreate
@@ -43,6 +44,10 @@ async def emitir_factura_app(
 async def historial_facturas(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
+    fecha_inicio: Optional[str] = None,
+    fecha_fin: Optional[str] = None,
     _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
-    return await obtener_historial_core(auth_data["emisor_id"], db)
+    return await obtener_historial_core(
+        auth_data["emisor_id"], db, fecha_inicio, fecha_fin
+    )

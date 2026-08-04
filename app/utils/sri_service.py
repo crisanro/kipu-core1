@@ -1,7 +1,6 @@
 import json
 import base64
 import httpx
-import asyncio
 from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,35 +9,24 @@ from app.schemas.cliente import ClienteCreate
 from app.services.cliente_service import crear_cliente_core
 from app.utils.calculadora import calcular_totales_e_impuestos
 from app.utils.crypto import generar_clave_acceso, decrypt_password
-from app.services.storage_service import upload_file, download_file, delete_file
-from app.services.mail_service import mail_service
-from app.services.notifier_service import notificar_cambio_estado
+from app.services.storage_service import upload_file, download_file
 from app.core.config import settings
 from app.core.cache import get_redis
 
 import pytz
 
-URLS_SRI = {
-    "1": {
-        "recepcion":    "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
-        "autorizacion": "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
-    },
-    "2": {
-        "recepcion":    "https://cel.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
-        "autorizacion": "https://cel.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
-    }
-}
 NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
-def _construir_campos_adicionales(factura_data: dict, emisor) -> list:
-    """
-    Construye los campos adicionales del XML.
-    El RUC del proveedor SIEMPRE va al final — Art. 5 NAC-DGERCGC26-00000027
-    """
+def _construir_campos_adicionales(factura_data, emisor) -> list:
     campos = []
 
-    # Campos adicionales del usuario si los envía
-    for campo in factura_data.get("campos_adicionales", []):
+    # Soporta tanto dict como objeto Pydantic
+    if isinstance(factura_data, dict):
+        campos_adicionales = factura_data.get("campos_adicionales") or []
+    else:
+        campos_adicionales = getattr(factura_data, "campos_adicionales", None) or []
+
+    for campo in campos_adicionales:
         if campo.get("nombre") and campo.get("valor"):
             campos.append({
                 "@nombre": str(campo["nombre"])[:300],
@@ -47,12 +35,11 @@ def _construir_campos_adicionales(factura_data: dict, emisor) -> list:
 
     # RUC del proveedor — SIEMPRE AL FINAL según resolución SRI
     campos.append({
-        "@nombre": "PROVEEDOR_SISTEMA_INFORMATICO",
-        "#text":   emisor.ruc
+        "@nombre": "Proveedor",
+        "#text":   "1312838392001 (kipu.ec)"
     })
 
     return campos
-
 
 async def emitir_factura_core(
     factura_data: dict, 
@@ -312,17 +299,30 @@ async def emitir_factura_core(
             "clave":             clave_acceso,
             "num_fac":           f"{punto_emision.estab_codigo}-{punto_emision.punto_codigo}-{secuencial}",
             "id_comp":           cliente_final["identificacion"],
-            "razon_comp":        cliente_final["razon_social"],
-            "email_comp":        cliente_final["email"],
+            "razon_comp":         cliente_final["razon_social"],
+            "email_comp":         cliente_final["email"],
             "total":             calculos["totales"]["importeTotal"],
             "sub_iva":           calculos["totales"]["subtotal_iva"],
             "sub_0":             calculos["totales"]["subtotal_0"],
             "val_iva":           calculos["totales"]["totalIva"],
             "xml_path":          xml_path_rel,
-            "datos_fac":         json.dumps(xml_obj["factura"])
+            "datos_fac": json.dumps({
+                **xml_obj["factura"],
+                "resumenImpuestos": calculos["resumenImpuestos"]
+            })
         })
         factura_id = res_insert.scalar()
         await db.commit()
+
+        # Invalidar cache del dashboard e historial
+        try:
+            redis = await get_redis()
+            pattern = f"kipu:cache:*:{emisor_id}:*"
+            keys = await redis.keys(pattern)
+            if keys:
+                await redis.delete(*keys)
+        except Exception as e_cache:
+            print(f"⚠️ Cache no invalidado: {e_cache}")
 
     except Exception as e:
         await db.rollback()
@@ -330,144 +330,16 @@ async def emitir_factura_core(
         raise HTTPException(status_code=500, detail=str(e))
 
     # ─────────────────────────────────────────────────────────────
-    # BLOQUE 4: Fast-Track al SRI
+    # BLOQUE 4: Encolar para worker asíncrono
     # ─────────────────────────────────────────────────────────────
-    urls       = URLS_SRI[str(emisor.ambiente)]
-    xml_base64 = base64.b64encode(xml_firmado_str.encode('utf-8')).decode('utf-8')
-    factura_notificar = {
-        "id":                     str(factura_id),
-        "clave_acceso":           clave_acceso,
-        "email_comprador":        cliente_final["email"],
-        "razon_social_comprador": cliente_final["razon_social"],
-        "secuencial":             secuencial,
-        "importe_total":          calculos["totales"]["importeTotal"],
-        "ambiente":               emisor.ambiente,
-        "ruc":                    emisor.ruc,
-        "emisor_db_id":           str(emisor_id),
-        "razon_social":           emisor.razon_social
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client_sri:
-            soap_rec = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.recepcion"><soapenv:Body><ec:validarComprobante><xml>{xml_base64}</xml></ec:validarComprobante></soapenv:Body></soapenv:Envelope>"""
-            res_rec  = await client_sri.post(urls["recepcion"], content=soap_rec, headers={"Content-Type": "text/xml"})
-
-            if "RECIBIDA" in res_rec.text:
-                await db.execute(
-                    text("UPDATE invoices_emitidas SET estado = 'RECIBIDA', fecha_envio_sri = NOW() WHERE id = :fid"),
-                    {"fid": factura_id}
-                )
-                await db.commit()
-                await notificar_cambio_estado(factura_notificar, "RECIBIDA")
-
-                soap_auth = f"""<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ec="http://ec.gob.sri.ws.autorizacion"><soapenv:Body><ec:autorizacionComprobante><claveAccesoComprobante>{clave_acceso}</claveAccesoComprobante></ec:autorizacionComprobante></soapenv:Body></soapenv:Envelope>"""
-
-                for pausa in [1.2, 1.8, 2.5]:
-                    await asyncio.sleep(pausa)
-                    try:
-                        res_auth = await client_sri.post(urls["autorizacion"], content=soap_auth, headers={"Content-Type": "text/xml"})
-                        if "AUTORIZADO" in res_auth.text and "NO AUTORIZADO" not in res_auth.text:
-                            import xml.etree.ElementTree as ET
-                            root_auth      = ET.fromstring(res_auth.text)
-                            auth_node      = root_auth.find(".//autorizacion")
-                            fecha_auth     = None
-                            xml_autorizado = xml_firmado_str  # fallback
-
-                            if auth_node is not None:
-                                fecha_auth     = auth_node.findtext("fechaAutorizacion")
-                                xml_autorizado = auth_node.findtext("comprobante") or xml_firmado_str
-
-                            # Sobreescribir XML firmado con XML autorizado en R2
-                            upload_file(xml_path_rel, xml_autorizado.encode('utf-8'), "text/xml")
-
-                            # Generar PDF on-demand para el email — no se guarda en R2
-                            pdf_para_email = None
-                            try:
-                                res_pdf = await client_sri.post(
-                                    NODE_SIGNER_URL.replace("/firmar", "/pdf"),
-                                    json={
-                                        "xmlAutorizado":    xml_autorizado,
-                                        "emisor":           {"contribuyente_especial": getattr(emisor, 'contribuyente_especial', '')},
-                                        "fechaAutorizacion": fecha_auth
-                                    },
-                                    timeout=15.0
-                                )
-                                if res_pdf.status_code == 200 and res_pdf.json().get("ok"):
-                                    pdf_para_email = base64.b64decode(res_pdf.json()["pdfBase64"])
-                            except Exception as e_pdf:
-                                print(f"[FAST-TRACK] ⚠️ Error generando PDF para email: {e_pdf}")
-
-                            await db.execute(
-                                text("UPDATE invoices_emitidas SET estado = 'AUTORIZADO', fecha_autorizacion = NOW() WHERE id = :fid"),
-                                {"fid": factura_id}
-                            )
-                            await db.commit()
-                            await notificar_cambio_estado(factura_notificar, "AUTORIZADO")
-
-                            # Email con XML autorizado + PDF generado on-demand
-                            if factura_notificar["email_comprador"]:
-                                attachments = [
-                                    {"filename": f"{clave_acceso}.xml", "content": xml_autorizado.encode('utf-8'), "maintype": "text", "subtype": "xml"}
-                                ]
-                                if pdf_para_email:
-                                    attachments.append(
-                                        {"filename": f"{clave_acceso}.pdf", "content": pdf_para_email, "maintype": "application", "subtype": "pdf"}
-                                    )
-                                await mail_service.send_mail(
-                                    to=factura_notificar["email_comprador"],
-                                    subject=f"Factura Electrónica - {emisor.razon_social} - {secuencial}",
-                                    html_content=f"Su factura {secuencial} ha sido autorizada por el SRI.",
-                                    attachments=attachments
-                                )
-                            print(f"[FAST-TRACK] ⭐ ÉXITO: {clave_acceso}")
-                            break
-                    except Exception:
-                        continue
-
-            elif "DEVUELTA" in res_rec.text:
-                import xml.etree.ElementTree as ET
-                root_res      = ET.fromstring(res_rec.text)
-                lista_errores = []
-                for msg in root_res.findall(".//mensaje"):
-                    lista_errores.append({
-                        "identificador":        msg.findtext("identificador"),
-                        "mensaje":              msg.findtext("mensaje"),
-                        "informacionAdicional": msg.findtext("informacionAdicional"),
-                        "tipo":                 msg.findtext("tipo")
-                    })
-                await db.execute(text("""
-                    UPDATE invoices_emitidas 
-                    SET estado = 'DEVUELTA', mensajes_sri = CAST(:msg AS jsonb)
-                    WHERE id = :fid
-                """), {"msg": json.dumps(lista_errores), "fid": factura_id})
-                
-                # Reembolso condicional en caso de devolución
-                if not unlimited:
-                    await db.execute(
-                        text("UPDATE user_credits SET balance_emision = balance_emision + 1 WHERE emisor_id = :eid"),
-                        {"eid": emisor_id}
-                    )
-                await db.commit()
-                await notificar_cambio_estado(factura_notificar, "DEVUELTA")
-
-    except Exception as e:
-        print(f"[FAST-TRACK] ℹ️ SRI asíncrono o timeout para {clave_acceso}: {str(e)}")
-
-    final_state_res = await db.execute(
-        text("SELECT estado FROM invoices_emitidas WHERE id = :fid"), {"fid": factura_id}
-    )
-    estado_final = final_state_res.scalar()
-
-    # Si no se autorizó en fast-track → encolar para worker asíncrono
-    if estado_final not in ("AUTORIZADO", "DEVUELTA", "RECHAZADO"):
-        redis = await get_redis()
-        await redis.lpush("kipu:queue:emision", str(factura_id))
-        print(f"[Fast-Track] 📥 {clave_acceso} → cola de emisión")
+    redis = await get_redis()
+    await redis.lpush("kipu:queue:emision", str(factura_id))
+    print(f"[Emisión] 📥 {clave_acceso} → cola de emisión")
 
     return {
         "ok":          True,
         "id":          factura_id,
         "claveAcceso": clave_acceso,
-        "estado":      estado_final,
-        "mensaje":     "Factura autorizada exitosamente." if estado_final == 'AUTORIZADO' else "Comprobante en proceso."
+        "estado":      "FIRMADO",
+        "mensaje":     "Factura en proceso de autorización."
     }

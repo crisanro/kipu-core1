@@ -198,6 +198,31 @@ async def actualizar_cliente_core(emisor_id: int, cliente_id: str, datos: Client
 
 # ── 2. CONSULTAS ───────────────────────────────────────────────────────────────
 
+async def buscar_clientes_core(emisor_id: int, q: str, db: AsyncSession):
+    q_clean = q.strip()
+    query = text("""
+        SELECT id, tipo_identificacion_sri, identificacion,
+               razon_social, email, telefono, direccion
+        FROM clientes_emisor
+        WHERE emisor_id = :eid
+          AND (
+            razon_social ILIKE :q
+            OR identificacion ILIKE :q
+            OR email ILIKE :q
+          )
+        ORDER BY razon_social ASC
+        LIMIT 10
+    """)
+    res  = await db.execute(query, {"eid": emisor_id, "q": f"%{q_clean}%"})
+    rows = res.mappings().fetchall()
+    data = []
+    for r in rows:
+        d = dict(r)
+        d["id"] = str(d["id"])
+        data.append(d)
+    return {"ok": True, "data": data}
+
+
 async def consultar_cliente_por_identificacion_core(emisor_id: int, identificacion: str, db: AsyncSession):
     """Busca 1 cliente. Primero en la DB local, luego en sujetos_global."""
     # OPTIMIZACIÓN: una sola query con LEFT JOIN en lugar de 2 queries secuenciales
