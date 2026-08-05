@@ -224,22 +224,21 @@ class LeadExUsuario(Base):
 # =============================================================================
 
 class CatalogoItem(Base):
-    """Productos y servicios del emisor para facturación rápida."""
     __tablename__ = "catalogo_items"
 
-    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
-    codigo          = Column(String(50))                    # código interno del producto
-    descripcion     = Column(Text, nullable=False)          # lo que aparece en la factura
-    precio          = Column(Numeric(12, 2), nullable=False)
-    tipo_iva        = Column(String(10), default="15")      # 0, 15, 5 — porcentaje IVA Ecuador
-    unidad          = Column(String(20), default="UNIDAD")  # UNIDAD, SERVICIO, KG, etc.
-    activo          = Column(Boolean, default=True)
-    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id   = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    codigo      = Column(String(50))
+    descripcion = Column(Text, nullable=False)
+    precio      = Column(Numeric(12, 2), nullable=False)
+    tipo_iva    = Column(String(10), default="15")
+    unidad      = Column(String(20), default="UNIDAD")
+    stock       = Column(Integer, default=-1)   # -1=sin control, 0=sin stock, >0=con stock
+    activo      = Column(Boolean, default=True)
+    created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at  = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    emisor          = relationship("Emisor", back_populates="catalogo_items")
-
+    emisor      = relationship("Emisor", back_populates="catalogo_items")
 
 class Establecimiento(Base):
     """Sucursales del emisor (establecimientos SRI: 001, 002...)."""
@@ -338,25 +337,47 @@ class InvoiceEmitida(Base):
 
 
 class InvoiceRecibida(Base):
-    """Facturas electrónicas RECIBIDAS por el emisor."""
     __tablename__ = "invoices_recibidas"
 
     id                      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     emisor_id               = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    
+    # ── Proveedor ──────────────────────────────────────────────
     ruc_proveedor           = Column(String(13), nullable=False)
     razon_social_proveedor  = Column(Text, nullable=False)
+    contribuyente_especial  = Column(String(13))                    # si aplica
+    
+    # ── Identificación del comprobante ─────────────────────────
     clave_acceso            = Column(String(49), unique=True)
-    numero_factura          = Column(String(17))
+    numero_autorizacion     = Column(String(49))                    # mismo valor generalmente
+    numero_factura          = Column(String(17))                    # 001-286-000015036
     fecha_emision           = Column(Date, nullable=False)
-    subtotal_0              = Column(Numeric(12, 2), default=0)
-    subtotal_iva            = Column(Numeric(12, 2), default=0)
-    valor_iva               = Column(Numeric(12, 2), default=0)
+    fecha_autorizacion      = Column(TIMESTAMP(timezone=True))
+    
+    # ── Totales resumen (para queries rápidas sin tocar JSONB) ──
+    total_sin_impuestos     = Column(Numeric(12, 2), default=0)     # totalSinImpuestos del XML
+    total_descuento         = Column(Numeric(12, 2), default=0)     # totalDescuento del XML
+    subtotal_0              = Column(Numeric(12, 2), default=0)     # base IVA 0%
+    subtotal_iva            = Column(Numeric(12, 2), default=0)     # base IVA 15% (o mayor tarifa)
+    valor_iva               = Column(Numeric(12, 2), default=0)     # IVA total pagado
     importe_total           = Column(Numeric(12, 2), nullable=False)
-    categoria_gasto         = Column(String(50))
+    
+    # ── Desglose completo de impuestos (todos los códigos) ──────
+    impuestos_detalle       = Column(JSONB)
+    # [{"codigoPorcentaje":"4","tarifa":"15","baseImponible":80.59,"valor":12.09,"aplicaCredito":true}, ...]
+    
+    # ── Decisiones fiscales del cliente ────────────────────────
     deducible_renta         = Column(Boolean, default=True)
+    credito_tributario_iva  = Column(Boolean, default=False)        # decisión global
     notas_cliente           = Column(Text)
-    xml_path                = Column(Text)
-    xml_raw                 = Column(JSONB)
-    fuente                  = Column(String(10), default="MANUAL")
+    
+    # ── Almacenamiento ──────────────────────────────────────────
+    xml_path                = Column(Text)                          # XML en R2
+    datos_factura           = Column(JSONB)                         # comprobante parseado sin firma
+    
+    # ── Control ─────────────────────────────────────────────────
+    fuente                  = Column(String(10), default="MANUAL")  # MANUAL / CLAVE
     procesado               = Column(Boolean, default=False)
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+

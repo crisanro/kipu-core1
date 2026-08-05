@@ -1,3 +1,4 @@
+# app/services/sri_service.py
 import json
 import base64
 import httpx
@@ -12,6 +13,7 @@ from app.utils.crypto import generar_clave_acceso, decrypt_password
 from app.services.storage_service import upload_file, download_file
 from app.core.config import settings
 from app.core.cache import get_redis
+from app.api.v1.app.productos import invalidar_cache_productos
 
 import pytz
 
@@ -19,8 +21,6 @@ NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
 def _construir_campos_adicionales(factura_data, emisor) -> list:
     campos = []
-
-    # Soporta tanto dict como objeto Pydantic
     if isinstance(factura_data, dict):
         campos_adicionales = factura_data.get("campos_adicionales") or []
     else:
@@ -33,17 +33,85 @@ def _construir_campos_adicionales(factura_data, emisor) -> list:
                 "#text":   str(campo["valor"])[:300]
             })
 
-    # RUC del proveedor — SIEMPRE AL FINAL según resolución SRI
     campos.append({
         "@nombre": "Proveedor",
         "#text":   "1312838392001 (kipu.ec)"
     })
-
     return campos
 
+
+async def _descontar_stock(factura_data: dict, emisor_id: int, db: AsyncSession):
+    """
+    Descuenta stock de los productos facturados usando codigoPrincipal.
+    Solo afecta productos con stock > 0 y que tengan código.
+    """
+    try:
+        detalles = factura_data.get("detalles", {}).get("detalle", [])
+        if not isinstance(detalles, list):
+            detalles = [detalles]
+
+        for detalle in detalles:
+            codigo = detalle.get("codigoPrincipal") or detalle.get("codigoAuxiliar")
+            if not codigo or codigo == "S/C":
+                continue
+            cantidad = float(detalle.get("cantidad", 0))
+            await db.execute(text("""
+                UPDATE catalogo_items
+                SET stock = GREATEST(0, stock - :qty),
+                    updated_at = NOW()
+                WHERE emisor_id = :eid
+                  AND stock > 0
+                  AND codigo = :cod
+            """), {"qty": int(cantidad), "eid": emisor_id, "cod": codigo})
+
+        await db.commit()
+        await invalidar_cache_productos(emisor_id)
+        print(f"[Stock] ✅ Stock descontado para emisor {emisor_id}")
+    except Exception as e:
+        print(f"[Stock] ⚠️ Error descontando stock: {e}")
+
+
+async def _devolver_stock(factura_id: str, emisor_id: int, db: AsyncSession):
+    """
+    Devuelve el stock si el SRI rechaza la factura.
+    Lee los detalles desde datos_factura JSONB.
+    """
+    try:
+        res = await db.execute(text("""
+            SELECT datos_factura FROM invoices_emitidas WHERE id = :id
+        """), {"id": factura_id})
+        datos = res.scalar()
+        if not datos:
+            return
+
+        detalles = datos.get("detalles", {}).get("detalle", [])
+        if not isinstance(detalles, list):
+            detalles = [detalles]
+
+        for detalle in detalles:
+            codigo = detalle.get("codigoPrincipal") or detalle.get("codigoAuxiliar")
+            if not codigo or codigo == "S/C":
+                continue
+            cantidad = float(detalle.get("cantidad", 0))
+            await db.execute(text("""
+                UPDATE catalogo_items
+                SET stock = stock + :qty,
+                    updated_at = NOW()
+                WHERE emisor_id = :eid
+                  AND stock != -1
+                  AND codigo = :cod
+            """), {"qty": int(cantidad), "eid": emisor_id, "cod": codigo})
+
+        await db.commit()
+        await invalidar_cache_productos(emisor_id)
+        print(f"[Stock] ↩️ Stock devuelto para factura {factura_id}")
+    except Exception as e:
+        print(f"[Stock] ⚠️ Error devolviendo stock: {e}")
+
+
 async def emitir_factura_core(
-    factura_data: dict, 
-    emisor_id: int, 
+    factura_data: dict,
+    emisor_id: int,
     db: AsyncSession,
     api_key_id: int = None,
     unlimited: bool = False
@@ -71,7 +139,7 @@ async def emitir_factura_core(
 
     elif cliente_id and str(cliente_id).strip() != "":
         res_cli = await db.execute(text("""
-            SELECT id, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono 
+            SELECT id, tipo_identificacion_sri, identificacion, razon_social, direccion, email, telefono
             FROM clientes_emisor WHERE id = :cid AND emisor_id = :eid
         """), {"cid": cliente_id, "eid": emisor_id})
         row_cli = res_cli.fetchone()
@@ -130,13 +198,12 @@ async def emitir_factura_core(
     # ─────────────────────────────────────────────────────────────
     try:
         res_emisor = await db.execute(text("""
-            SELECT e.*, c.balance_emision 
-            FROM emisores e JOIN user_credits c ON e.id = c.emisor_id 
+            SELECT e.*, c.balance_emision
+            FROM emisores e JOIN user_credits c ON e.id = c.emisor_id
             WHERE e.id = :emisor_id FOR UPDATE
         """), {"emisor_id": emisor_id})
         emisor = res_emisor.fetchone()
-        
-        # Validación de créditos con exención para keys ilimitadas
+
         if not unlimited and (not emisor or emisor.balance_emision <= 0):
             raise HTTPException(status_code=402, detail="Créditos insuficientes.")
 
@@ -261,11 +328,9 @@ async def emitir_factura_core(
     # BLOQUE 3: Guardar XML firmado en R2 e Insertar Factura
     # ─────────────────────────────────────────────────────────────
     try:
-        # Solo XML — sin PDF
         xml_path_rel = f"{emisor.ruc}/facturas/{clave_acceso}.xml"
         upload_file(xml_path_rel, xml_firmado_str.encode('utf-8'), "text/xml")
 
-        # Descuento condicional de créditos
         if not unlimited:
             await db.execute(
                 text("UPDATE user_credits SET balance_emision = balance_emision - 1 WHERE emisor_id = :eid"),
@@ -273,6 +338,11 @@ async def emitir_factura_core(
             )
 
         origen_val = "api" if api_key_id else factura_data.get("origen", "web")
+
+        datos_fac_json = {
+            **xml_obj["factura"],
+            "resumenImpuestos": calculos["resumenImpuestos"]
+        }
 
         res_insert = await db.execute(text("""
             INSERT INTO invoices_emitidas (
@@ -299,22 +369,22 @@ async def emitir_factura_core(
             "clave":             clave_acceso,
             "num_fac":           f"{punto_emision.estab_codigo}-{punto_emision.punto_codigo}-{secuencial}",
             "id_comp":           cliente_final["identificacion"],
-            "razon_comp":         cliente_final["razon_social"],
-            "email_comp":         cliente_final["email"],
+            "razon_comp":        cliente_final["razon_social"],
+            "email_comp":        cliente_final["email"],
             "total":             calculos["totales"]["importeTotal"],
             "sub_iva":           calculos["totales"]["subtotal_iva"],
             "sub_0":             calculos["totales"]["subtotal_0"],
             "val_iva":           calculos["totales"]["totalIva"],
             "xml_path":          xml_path_rel,
-            "datos_fac": json.dumps({
-                **xml_obj["factura"],
-                "resumenImpuestos": calculos["resumenImpuestos"]
-            })
+            "datos_fac":         json.dumps(datos_fac_json)
         })
         factura_id = res_insert.scalar()
         await db.commit()
 
-        # Invalidar cache del dashboard e historial
+        # ── Descontar stock al firmar ──────────────────────────
+        await _descontar_stock(datos_fac_json, emisor_id, db)
+
+        # Invalidar cache dashboard e historial
         try:
             redis = await get_redis()
             pattern = f"kipu:cache:*:{emisor_id}:*"

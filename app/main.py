@@ -24,6 +24,7 @@ from app.api.v1.app import (
     dashboard as dashboard_app,
     apikeys as apikeys_app,
     catalogo as catalogo_app,
+    recibidas as recibidas_app,
     notificaciones as notificaciones_app,
     productos as productos_app,
     usuarios as usuarios_app,
@@ -165,6 +166,7 @@ app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",    
 app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",      tags=["📱 App - Dashboard"])
 app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",        tags=["📱 App - API Keys"])
 app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",       tags=["📱 App - Catálogo"])
+app.include_router(recibidas_app.router, prefix="/api/v1/app/invoices/received", tags=["📱 App - Facturas Recibidas"])
 app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones", tags=["📱 App - Notificaciones"])
 app.include_router(creditos_app.router, prefix="/api/v1/app/creditos", tags=["📱 App - Créditos"])
 
