@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.core.security import verify_api_key
 from app.schemas.integracion import ValidatePuntoRequest
 from app.services.integracion_service import validar_estructura_core, obtener_status_core
-from app.utils.sri_service import emitir_factura_core
+from app.utils.factura_service import emitir_factura_core
 from app.core.idempotency import verificar_idempotency, guardar_idempotency
 
 router = APIRouter()

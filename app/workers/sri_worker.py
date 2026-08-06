@@ -13,12 +13,12 @@ from app.services.storage_service import download_file, upload_file
 from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
 from app.core.config import settings
-from app.utils.sri_service import _devolver_stock
+from app.utils.sri_core import devolver_stock, descontar_stock
 
-QUEUE_EMISION       = "kipu:queue:emision"
-QUEUE_AUTORIZACION  = "kipu:queue:autorizacion"
-QUEUE_PROC_EMISION  = "kipu:queue:proc:emision"
-QUEUE_PROC_AUTH     = "kipu:queue:proc:auth"
+QUEUE_EMISION      = "kipu:queue:emision"
+QUEUE_AUTORIZACION = "kipu:queue:autorizacion"
+QUEUE_PROC_EMISION = "kipu:queue:proc:emision"
+QUEUE_PROC_AUTH    = "kipu:queue:proc:auth"
 
 URLS_SRI = {
     "1": {
@@ -31,12 +31,14 @@ URLS_SRI = {
     }
 }
 
-NODE_PDF_URL    = f"{settings.NODE_SIGNER_URL}/api/pdf"
-MAX_CONCURRENT  = 3
-BRPOP_TIMEOUT   = 5
+NODE_PDF_URL   = f"{settings.NODE_SIGNER_URL}/api/pdf"
+MAX_CONCURRENT = 3
+BRPOP_TIMEOUT  = 5
 
 _sri_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
+
+# ── Recovery ───────────────────────────────────────────────────────────────────
 
 async def recovery_al_arrancar():
     print("[Recovery] 🔍 Buscando facturas pendientes en DB...")
@@ -74,6 +76,8 @@ async def recovery_al_arrancar():
         print("[Recovery] ✅ Sin pendientes. Todo al día.")
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 async def httpx_with_retry(url: str, content: str, headers: dict, max_retries: int = 3):
     async with httpx.AsyncClient(timeout=15.0) as client:
         for intento in range(1, max_retries + 1):
@@ -91,6 +95,17 @@ async def httpx_with_retry(url: str, content: str, headers: dict, max_retries: i
 def es_unlimited(unlimited) -> bool:
     return bool(unlimited)
 
+
+async def _invalidar_cache(emisor_id: int):
+    try:
+        from app.core.cache import cache_clear_prefix
+        await cache_clear_prefix(f"dashboard:{emisor_id}")
+        await cache_clear_prefix(f"factura:{emisor_id}")
+    except Exception as e:
+        print(f"⚠️ Cache no invalidado: {e}")
+
+
+# ── Procesador de emisión ──────────────────────────────────────────────────────
 
 async def procesar_emision(factura_id: str):
     async with _sri_semaphore:
@@ -112,7 +127,7 @@ async def procesar_emision(factura_id: str):
 
                 print(f"[Emisión] 📤 Enviando: {factura.clave_acceso}")
                 xml_bytes  = download_file(factura.xml_path)
-                xml_base64 = base64.b64encode(xml_bytes).decode('utf-8')
+                xml_base64 = base64.b64encode(xml_bytes).decode("utf-8")
                 urls       = URLS_SRI[str(factura.ambiente)]
 
                 soap_body = (
@@ -127,8 +142,8 @@ async def procesar_emision(factura_id: str):
                 body     = json_res.get("soap:Envelope", {}).get("soap:Body", {})
 
                 if body.get("soap:Fault"):
-                    fault_msg = body['soap:Fault'].get('faultstring', 'Error desconocido')
-                    print(f"[Emisión] ⚠️ SRI Fault — esperando 30s antes de reintentar: {fault_msg}")
+                    fault_msg = body["soap:Fault"].get("faultstring", "Error desconocido")
+                    print(f"[Emisión] ⚠️ SRI Fault — esperando 30s: {fault_msg}")
                     await asyncio.sleep(30)
                     raise Exception(f"SRI Fault: {fault_msg}")
 
@@ -147,12 +162,13 @@ async def procesar_emision(factura_id: str):
                     await redis.lpush(QUEUE_AUTORIZACION, str(factura.id))
 
                 else:
-                    # DEVUELTA por SRI — devolver stock
+                    # DEVUELTA — revertir crédito y stock
                     await db.execute(text("""
                         UPDATE invoices_emitidas
                         SET estado = 'DEVUELTA', mensajes_sri = CAST(:msg AS jsonb)
                         WHERE id = :id
                     """), {"msg": json.dumps(resp_recepcion), "id": factura.id})
+
                     if not es_unlimited(factura.unlimited):
                         await db.execute(
                             text("UPDATE user_credits SET balance_emision = balance_emision + 1 WHERE emisor_id = :eid"),
@@ -161,35 +177,26 @@ async def procesar_emision(factura_id: str):
                     await db.commit()
                     print(f"[Emisión] ⚠️ DEVUELTA: {factura.clave_acceso}")
 
-                    # ── Devolver stock ──────────────────────────
-                    await _devolver_stock(str(factura.id), factura.emisor_db_id, db)
-
-                    try:
-                        from app.core.cache import cache_clear_prefix
-                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
-                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
-                    except Exception as e_cache:
-                        print(f"[Emisión] ⚠️ Cache no invalidado: {e_cache}")
+                    await devolver_stock(str(factura.id), factura.emisor_db_id, db)
+                    await _invalidar_cache(factura.emisor_db_id)
                     await notificar_cambio_estado(fac_dict, "DEVUELTA", resp_recepcion)
 
             except Exception as err:
                 await db.rollback()
                 async with AsyncSessionLocal() as db2:
-                    result2 = await db2.execute(
-                        text("""
-                            UPDATE invoices_emitidas
-                            SET retry_count = CASE
-                                WHEN last_retry < NOW() - INTERVAL '1 hour' THEN 1
-                                ELSE COALESCE(retry_count, 0) + 1
-                            END,
-                            last_retry = NOW()
-                            WHERE id = :id
-                            RETURNING retry_count
-                        """),
-                        {"id": factura_id}
-                    )
+                    result2 = await db2.execute(text("""
+                        UPDATE invoices_emitidas
+                        SET retry_count = CASE
+                            WHEN last_retry < NOW() - INTERVAL '1 hour' THEN 1
+                            ELSE COALESCE(retry_count, 0) + 1
+                        END,
+                        last_retry = NOW()
+                        WHERE id = :id
+                        RETURNING retry_count
+                    """), {"id": factura_id})
                     nuevo_retry = result2.scalar()
                     await db2.commit()
+
                 print(f"[Emisión] ❌ Error ({factura_id}): {str(err)} — retry #{nuevo_retry}")
                 espera = min(2 ** nuevo_retry * 10, 300)
                 print(f"[Emisión] ⏳ Esperando {espera}s antes del reintento #{nuevo_retry + 1}")
@@ -197,6 +204,8 @@ async def procesar_emision(factura_id: str):
                 redis = await get_redis()
                 await redis.lpush(QUEUE_EMISION, factura_id)
 
+
+# ── Procesador de autorización ─────────────────────────────────────────────────
 
 async def procesar_autorizacion(factura_id: str):
     async with _sri_semaphore:
@@ -249,6 +258,7 @@ async def procesar_autorizacion(factura_id: str):
 
                     upload_file(factura.xml_path, xml_autorizado.encode("utf-8"), "text/xml")
 
+                    # Generar PDF para email
                     pdf_para_email = None
                     try:
                         async with httpx.AsyncClient(timeout=20.0) as client_node:
@@ -257,7 +267,7 @@ async def procesar_autorizacion(factura_id: str):
                                 json={
                                     "xmlAutorizado":     xml_autorizado,
                                     "emisor":            {"contribuyente_especial": factura.contribuyente_especial},
-                                    "fechaAutorizacion": fecha_auth_str
+                                    "fechaAutorizacion": fecha_auth_str,
                                 }
                             )
                             if res_node.status_code == 200 and res_node.json().get("ok"):
@@ -270,28 +280,32 @@ async def procesar_autorizacion(factura_id: str):
                         {"fecha": fecha_auth_obj, "id": factura.id}
                     )
                     await db.commit()
-                    # Stock ya fue descontado al firmar — no hacer nada aquí
+                    # Stock ya descontado al firmar — no tocar aquí
                     print(f"[Auth] ✅ AUTORIZADO: {factura.clave_acceso}")
 
-                    try:
-                        from app.core.cache import cache_clear_prefix
-                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
-                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
-                    except Exception as e_cache:
-                        print(f"[Auth] ⚠️ Cache no invalidado: {e_cache}")
-
+                    await _invalidar_cache(factura.emisor_db_id)
                     await notificar_cambio_estado(fac_dict, "AUTORIZADO")
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.autorizada", fac_dict)
 
                     if factura.email_comprador:
-                        attachments = [{"filename": f"{factura.clave_acceso}.xml", "content": xml_autorizado.encode("utf-8"), "maintype": "text", "subtype": "xml"}]
+                        attachments = [{
+                            "filename": f"{factura.clave_acceso}.xml",
+                            "content":  xml_autorizado.encode("utf-8"),
+                            "maintype": "text",
+                            "subtype":  "xml",
+                        }]
                         if pdf_para_email:
-                            attachments.append({"filename": f"{factura.clave_acceso}.pdf", "content": pdf_para_email, "maintype": "application", "subtype": "pdf"})
+                            attachments.append({
+                                "filename": f"{factura.clave_acceso}.pdf",
+                                "content":  pdf_para_email,
+                                "maintype": "application",
+                                "subtype":  "pdf",
+                            })
                         await mail_service.send_mail(
                             to=factura.email_comprador,
                             subject=f"Factura Electrónica - {factura.razon_social} - {factura.secuencial}",
                             html_content=f"Adjuntamos su comprobante {factura.secuencial} autorizado por el SRI.",
-                            attachments=attachments
+                            attachments=attachments,
                         )
 
                 elif autorizacion.get("estado") in ["RECHAZADO", "NO AUTORIZADO"]:
@@ -300,6 +314,7 @@ async def procesar_autorizacion(factura_id: str):
                         SET estado = 'RECHAZADO', mensajes_sri = CAST(:msg AS jsonb)
                         WHERE id = :id
                     """), {"msg": json.dumps(autorizacion.get("mensajes")), "id": factura.id})
+
                     if not es_unlimited(factura.unlimited):
                         await db.execute(
                             text("UPDATE user_credits SET balance_emision = balance_emision + 1 WHERE emisor_id = :eid"),
@@ -308,16 +323,8 @@ async def procesar_autorizacion(factura_id: str):
                     await db.commit()
                     print(f"[Auth] ⚠️ RECHAZADO: {factura.clave_acceso}")
 
-                    # ── Devolver stock si SRI rechaza ───────────
-                    await _devolver_stock(str(factura.id), factura.emisor_db_id, db)
-
-                    try:
-                        from app.core.cache import cache_clear_prefix
-                        await cache_clear_prefix(f"dashboard:{factura.emisor_db_id}")
-                        await cache_clear_prefix(f"factura:{factura.emisor_db_id}")
-                    except Exception as e_cache:
-                        print(f"[Auth] ⚠️ Cache no invalidado: {e_cache}")
-
+                    await devolver_stock(str(factura.id), factura.emisor_db_id, db)
+                    await _invalidar_cache(factura.emisor_db_id)
                     await notificar_cambio_estado(fac_dict, "RECHAZADO", autorizacion.get("mensajes"))
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.rechazada", fac_dict)
 
@@ -328,6 +335,8 @@ async def procesar_autorizacion(factura_id: str):
                 redis = await get_redis()
                 await redis.lpush(QUEUE_AUTORIZACION, factura_id)
 
+
+# ── Webhooks ───────────────────────────────────────────────────────────────────
 
 async def disparar_webhooks(factura_id, emisor_id: int, evento: str, payload: dict):
     async with AsyncSessionLocal() as db:
@@ -342,7 +351,12 @@ async def disparar_webhooks(factura_id, emisor_id: int, evento: str, payload: di
                 return
 
             import hmac, hashlib
-            body = json.dumps({"evento": evento, "factura_id": str(factura_id), "timestamp": datetime.utcnow().isoformat(), "data": payload}, default=str)
+            body = json.dumps({
+                "evento":      evento,
+                "factura_id":  str(factura_id),
+                "timestamp":   datetime.utcnow().isoformat(),
+                "data":        payload,
+            }, default=str)
 
             async with httpx.AsyncClient(timeout=10.0) as client:
                 for wh in webhooks:
@@ -358,6 +372,8 @@ async def disparar_webhooks(factura_id, emisor_id: int, evento: str, payload: di
         except Exception as e:
             print(f"[Webhook] ❌ Error crítico: {e}")
 
+
+# ── Loops ──────────────────────────────────────────────────────────────────────
 
 async def loop_emision():
     print("[Worker] 🚀 Loop de emisión iniciado.")
@@ -419,5 +435,5 @@ async def iniciar_workers():
     await recovery_al_arrancar()
     await asyncio.gather(
         loop_emision(),
-        loop_autorizacion()
+        loop_autorizacion(),
     )

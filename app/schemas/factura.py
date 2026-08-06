@@ -11,18 +11,19 @@ class ClienteFactura(BaseModel):
 
 
 class ItemFactura(BaseModel):
-    codigo:          Optional[str] = None        # ← agregar
-    descripcion:     str           = Field(..., min_length=2)
-    cantidad:        float         = Field(..., gt=0)
-    precio_unitario: float         = Field(..., ge=0)
-    descuento:       float         = Field(0.0, ge=0)
-    tipo_iva:        Optional[str] = Field("15")
-    unidad_medida:   Optional[str] = Field("UNIDAD")
+    codigo:          Optional[str]   = None
+    descripcion:     Optional[str]   = None  # opcional si hay código
+    cantidad:        float           = Field(..., gt=0)
+    precio_unitario: Optional[float] = None  # opcional si hay código en catálogo
+    descuento:       float           = Field(0.0, ge=0)
+    tipo_iva:        Optional[str]   = Field("15")
+    unidad_medida:   Optional[str]   = Field("UNIDAD")
+
 
 class PagoFactura(BaseModel):
-    forma_pago: str = Field("01", description="01=Efectivo, 20=Transferencia")
-    total: float = Field(..., gt=0)
-    plazo: Optional[str] = "0"
+    forma_pago: str   = Field("01")
+    total:      Optional[float] = None  # None = saldo restante
+    plazo:      Optional[str]   = "0"
     unidad_tiempo: Optional[str] = "dias"
 
 class FacturaCreate(BaseModel):

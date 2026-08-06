@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.schemas.factura import FacturaCreate
-from app.utils.sri_service import emitir_factura_core
+from app.utils.factura_service import emitir_factura_core
 from app.services.invoice_service import obtener_historial_core
 from app.core.rate_limit import RateLimit, RateLimitScope
 from app.core.idempotency import verificar_idempotency, guardar_idempotency
