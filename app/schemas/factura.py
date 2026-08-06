@@ -9,7 +9,9 @@ class ClienteFactura(BaseModel):
     identificacion: str = Field(..., min_length=3)
     email: Optional[str] = None
 
+
 class ItemFactura(BaseModel):
+    codigo:          Optional[str] = None        # ← agregar
     descripcion:     str           = Field(..., min_length=2)
     cantidad:        float         = Field(..., gt=0)
     precio_unitario: float         = Field(..., ge=0)
