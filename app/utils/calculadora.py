@@ -21,6 +21,7 @@ def calcular_totales_e_impuestos(items: list) -> dict:
     detalles_xml          = []
 
     for item in items:
+        print(f"[Calculadora] item recibido: {item}")
         cantidad        = r2(item.get("cantidad", 0))
         precio_unitario = r2(item.get("precio_unitario", item.get("precioUnitario", item.get("precio", 0))))
         descuento       = r2(item.get("descuento", 0))  # siempre en dólares
