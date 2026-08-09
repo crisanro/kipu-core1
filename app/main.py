@@ -67,7 +67,7 @@ app = FastAPI(
     description="Microservicios Core para Facturación Electrónica SRI",
     version="2.0.0",
     lifespan=lifespan,
-    redirect_slashes=False  # AGREGAR
+    redirect_slashes=False
 )
 
 # ─── OPENAPI PERSONALIZADO ────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ app.openapi = custom_openapi
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # CAMBIAR a False
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -114,7 +114,7 @@ app.add_middleware(
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     print("❌ ERROR DE VALIDACIÓN 422 ❌")
     print("Ruta:", request.url.path)
-    print("Errores:", exc.errors())  # AGREGAR ESTA LÍNEA
+    print("Errores:", exc.errors())
     errores = []
     for e in exc.errors():
         errores.append({
@@ -160,21 +160,21 @@ async def log_request_data_and_time(request: Request, call_next):
 app.include_router(auth_app.router,           prefix="/api/v1/app/auth",           tags=["📱 App - Auth & Nuke"])
 app.include_router(emisor_app.router,         prefix="/api/v1/app/emisor",         tags=["📱 App - Emisor & Config"])
 app.include_router(estructura_app.router,     prefix="/api/v1/app/estructura",     tags=["📱 App - Estructura"])
-app.include_router(productos_app.router, prefix="/api/v1/app/productos", tags=["📱 App - Productos"])
-app.include_router(usuarios_app.router, prefix="/api/v1/app/usuarios", tags=["📱 App - Usuarios"])
+app.include_router(productos_app.router,      prefix="/api/v1/app/productos",      tags=["📱 App - Productos"])
+app.include_router(usuarios_app.router,       prefix="/api/v1/app/usuarios",       tags=["📱 App - Usuarios"])
 app.include_router(clientes_app.router,       prefix="/api/v1/app/clientes",       tags=["📱 App - Clientes"])
 app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",       tags=["📱 App - Facturación"])
 app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",      tags=["📱 App - Dashboard"])
 app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",        tags=["📱 App - API Keys"])
 app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",       tags=["📱 App - Catálogo"])
-app.include_router(recibidas_app.router, prefix="/api/v1/app/invoices/received", tags=["📱 App - Facturas Recibidas"])
+app.include_router(recibidas_app.router,      prefix="/api/v1/app/invoices/received", tags=["📱 App - Facturas Recibidas"])
 app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones", tags=["📱 App - Notificaciones"])
-app.include_router(creditos_app.router, prefix="/api/v1/app/creditos", tags=["📱 App - Créditos"])
-app.include_router( notas_credito_app.router, prefix="/api/v1/app/notas-credito", tags=["📱 App - Notas de Crédito"] )
+app.include_router(creditos_app.router,       prefix="/api/v1/app/creditos",       tags=["📱 App - Créditos"])
+app.include_router(notas_credito_app.router,  prefix="/api/v1/app/notas-credito",  tags=["📱 App - Notas de Crédito"])
 
 # API Pública (API Key Auth)
 app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones", tags=["🌍 API Facturación"])
-app.include_router(invoices_public.router,       prefix="/api/v1/public",               tags=["🌍 API Facturación"])
+app.include_router(invoices_public.router,       prefix="/api/v1/public",              tags=["🌍 API Facturación"])
 app.include_router(clientes_public.router,       prefix="/api/v1/public/clientes",      tags=["🌍 API Facturación"])
 
 # Admin / n8n (Headers Internos)
@@ -187,3 +187,92 @@ async def root():
         "status":  "Kipu API is running! 🚀",
         "docs":    "Visita /docs para la documentación interactiva."
     }
+
+# ─── OPENAPI PÚBLICO PARA CLIENTES ────────────────────────────────────────────
+@app.get("/api-docs", include_in_schema=False, tags=["Health"])
+async def openapi_publico():
+    """OpenAPI limpio — solo endpoints para clientes externos (API Key)"""
+    from fastapi.openapi.utils import get_openapi
+    from fastapi.responses import JSONResponse
+
+    schema = get_openapi(
+        title="Kipu — API de Facturación Electrónica",
+        version="2.0.0",
+        description="""
+# Kipu API — Facturación Electrónica Ecuador
+
+Integra facturación electrónica SRI en tu sistema en minutos.
+
+## Autenticación
+Todos los endpoints requieren tu API Key en el header:
+X-Api-Key: tu_api_key_aqui
+Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https://app.kipu.ec).
+
+## Flujo básico
+1. **Verificar** → `POST /api/v1/public/integraciones/validate`
+2. **Emitir factura** → `POST /api/v1/public/integraciones/invoice`
+3. **Descargar PDF** → `GET /api/v1/public/pdf/{clave_acceso}`
+4. **Descargar XML** → `GET /api/v1/public/xml/{clave_acceso}`
+
+## Ambientes
+- **Pruebas**: Las facturas van al SRI en ambiente de pruebas — no tienen validez fiscal.
+- **Producción**: Facturas reales autorizadas por el SRI.
+""",
+        routes=app.routes,
+    )
+
+    # ── Solo rutas públicas para clientes ─────────────────────────────────────
+    rutas_publicas = {
+        "/api/v1/public/integraciones/validate",
+        "/api/v1/public/integraciones/status",
+        "/api/v1/public/integraciones/invoice",
+        "/api/v1/public/pdf/{clave_acceso}",
+        "/api/v1/public/xml/{clave_acceso}",
+        "/api/v1/public/clientes/",
+        "/api/v1/public/clientes/buscar",
+        "/api/v1/public/clientes/{identificacion}",
+    }
+    schema["paths"] = {
+        k: v for k, v in schema["paths"].items()
+        if k in rutas_publicas
+    }
+
+    # ── Solo ApiKeyAuth ────────────────────────────────────────────────────────
+    schema["components"]["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type":        "apiKey",
+            "in":          "header",
+            "name":        "X-Api-Key",
+            "description": "API Key obtenida desde Configuración → API Keys en app.kipu.ec"
+        }
+    }
+
+    # ── Aplicar seguridad y limpiar tags ──────────────────────────────────────
+    for path, path_item in schema["paths"].items():
+        for method_data in path_item.values():
+            method_data["security"] = [{"ApiKeyAuth": []}]
+            # Tags legibles
+            if "integraciones" in path:
+                method_data["tags"] = ["🧾 Facturación"]
+            elif "clientes" in path:
+                method_data["tags"] = ["👥 Clientes"]
+            elif "pdf" in path or "xml" in path:
+                method_data["tags"] = ["📄 Documentos"]
+
+    # ── Solo schemas necesarios ────────────────────────────────────────────────
+    schemas_necesarios = {
+        "ValidatePuntoRequest",
+        "ClienteCreate",
+        "ClienteBusquedaMasiva",
+        "ClienteFactura",
+        "ItemFactura",
+        "PagoFactura",
+        "HTTPValidationError",
+        "ValidationError",
+    }
+    schema["components"]["schemas"] = {
+        k: v for k, v in schema["components"]["schemas"].items()
+        if k in schemas_necesarios
+    }
+
+    return JSONResponse(content=schema)
