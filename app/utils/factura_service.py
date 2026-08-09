@@ -30,16 +30,16 @@ async def emitir_factura_core(
     if not factura_data.get("establecimiento") or not factura_data.get("punto_emision"):
         raise HTTPException(status_code=400, detail="Los campos 'establecimiento' y 'punto_emision' son requeridos.")
 
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 0: Cliente
-    # ─────────────────────────────────────────────────────────────
-    cliente_final, cliente_emisor_id = await resolver_cliente(factura_data, emisor_id, db)
-
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 1: Datos base
-    # ─────────────────────────────────────────────────────────────
     try:
-        # Emisor + créditos
+        # ─────────────────────────────────────────────────────────────
+        # BLOQUE 0: Cliente
+        # ─────────────────────────────────────────────────────────────
+        cliente_final, cliente_emisor_id = await resolver_cliente(factura_data, emisor_id, db)
+
+        # ─────────────────────────────────────────────────────────────
+        # BLOQUE 1: Datos base y Reserva de Secuencial (Transaccional)
+        # ─────────────────────────────────────────────────────────────
+        # Emisor + créditos (FOR UPDATE bloquea la fila para evitar race conditions)
         res_emisor = await db.execute(text("""
             SELECT e.*, c.balance_emision
             FROM emisores e JOIN user_credits c ON e.id = c.emisor_id
@@ -68,7 +68,7 @@ async def emitir_factura_core(
         if not punto_emision:
             raise HTTPException(status_code=404, detail="Establecimiento y Punto no existen o no te pertenecen.")
 
-        # Secuencial
+        # Incrementar secuencial (mantiene el bloqueo dentro de la misma transacción)
         res_sec = await db.execute(text("""
             UPDATE puntos_emision SET secuencial_actual = secuencial_actual + 1
             WHERE id = :pto_id RETURNING secuencial_actual
@@ -82,7 +82,7 @@ async def emitir_factura_core(
         fecha_sri     = ahora_ecuador.strftime("%d/%m/%Y")
 
         # Completar items desde catálogo
-        items_raw      = factura_data.get("items", [])
+        items_raw       = factura_data.get("items", [])
         items_completos = await completar_items_catalogo(items_raw, emisor_id, db)
 
         # Calcular totales
@@ -111,7 +111,6 @@ async def emitir_factura_core(
         importe_total = Decimal(str(calculos["totales"]["importeTotal"]))
         pagos_xml     = resolver_pagos(factura_data.get("pagos", []), importe_total)
         propina_valor = Decimal(str(factura_data.get("propina", 0) or 0)).quantize(Decimal("0.01"))
-
 
         # Datos del establecimiento
         nombre_comercial = punto_emision.nombre_establecimiento or emisor.nombre_comercial or emisor.razon_social
@@ -142,13 +141,13 @@ async def emitir_factura_core(
                     "tipoIdentificacionComprador": cliente_final["tipo_id"],
                     "razonSocialComprador":        cliente_final["razon_social"],
                     "identificacionComprador":     cliente_final["identificacion"],
-                    "totalSinImpuestos":           calculos["totales"]["totalSinImpuestos"],
+                    "totalSinImpuestos":          calculos["totales"]["totalSinImpuestos"],
                     "totalDescuento":              calculos["totales"]["totalDescuento"],
-                    "totalConImpuestos":           {"totalImpuesto": calculos["totalConImpuestosXml"]},
-                    "propina":                     f"{propina_valor:.2f}",
+                    "totalConImpuestos":          {"totalImpuesto": calculos["totalConImpuestosXml"]},
+                    "propina":                    f"{propina_valor:.2f}",
                     "importeTotal":                f"{(importe_total + propina_valor):.2f}",
                     "moneda":                      "DOLAR",
-                    "pagos":                       {"pago": pagos_xml},
+                    "pagos":                      {"pago": pagos_xml},
                 },
                 "detalles": {"detalle": calculos["detallesXml"]},
                 "infoAdicional": {
@@ -157,7 +156,53 @@ async def emitir_factura_core(
             }
         }
 
+        # ─────────────────────────────────────────────────────────────
+        # BLOQUE 2: Firma Electrónica
+        # ─────────────────────────────────────────────────────────────
+        # Se ejecuta dentro del try. Si falla la firma, salta directamente
+        # al except/rollback restaurando el secuencial automáticamente.
+        xml_firmado_str = await firmar_xml(xml_obj, emisor)
+
+        # ─────────────────────────────────────────────────────────────
+        # BLOQUE 3: Persistencia, R2 y Encolado
+        # ─────────────────────────────────────────────────────────────
+        xml_path_rel = f"{emisor.ruc}/facturas/{clave_acceso}.xml"
+        origen       = "api" if api_key_id else factura_data.get("origen", "web")
+
+        datos_fac_json = {
+            **xml_obj["factura"],
+            "resumenImpuestos": calculos["resumenImpuestos"],
+        }
+
+        factura_id = await guardar_y_encolar(
+            xml_firmado_str   = xml_firmado_str,
+            xml_path_rel      = xml_path_rel,
+            datos_fac_json    = datos_fac_json,
+            calculos          = calculos,
+            emisor_id         = emisor_id,
+            punto_emision     = punto_emision,
+            cliente_final     = cliente_final,
+            cliente_emisor_id = cliente_emisor_id,
+            secuencial        = secuencial,
+            clave_acceso      = clave_acceso,
+            ahora_ecuador     = ahora_ecuador,
+            api_key_id        = api_key_id,
+            unlimited         = unlimited,
+            origen            = origen,
+            db                = db,
+        )
+
+        # COMMIT ÚNICO: Garantiza que el secuencial, la factura y el descuento
+        # de créditos se confirmen únicamente tras el éxito total del proceso.
         await db.commit()
+
+        return {
+            "ok":          True,
+            "id":          factura_id,
+            "claveAcceso": clave_acceso,
+            "estado":      "FIRMADO",
+            "mensaje":     "Factura en proceso de autorización.",
+        }
 
     except HTTPException:
         await db.rollback()
@@ -166,45 +211,3 @@ async def emitir_factura_core(
         await db.rollback()
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error generando factura: {str(e)}")
-
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 2: Firma
-    # ─────────────────────────────────────────────────────────────
-    xml_firmado_str = await firmar_xml(xml_obj, emisor)
-
-    # ─────────────────────────────────────────────────────────────
-    # BLOQUE 3: Guardar y encolar
-    # ─────────────────────────────────────────────────────────────
-    xml_path_rel = f"{emisor.ruc}/facturas/{clave_acceso}.xml"
-    origen       = "api" if api_key_id else factura_data.get("origen", "web")
-
-    datos_fac_json = {
-        **xml_obj["factura"],
-        "resumenImpuestos": calculos["resumenImpuestos"],
-    }
-
-    factura_id = await guardar_y_encolar(
-        xml_firmado_str   = xml_firmado_str,
-        xml_path_rel      = xml_path_rel,
-        datos_fac_json    = datos_fac_json,
-        calculos          = calculos,
-        emisor_id         = emisor_id,
-        punto_emision     = punto_emision,
-        cliente_final     = cliente_final,
-        cliente_emisor_id = cliente_emisor_id,
-        secuencial        = secuencial,
-        clave_acceso      = clave_acceso,
-        ahora_ecuador     = ahora_ecuador,
-        api_key_id        = api_key_id,
-        unlimited         = unlimited,
-        origen            = origen,
-        db                = db,
-    )
-
-    return {
-        "ok":          True,
-        "id":          factura_id,
-        "claveAcceso": clave_acceso,
-        "estado":      "FIRMADO",
-        "mensaje":     "Factura en proceso de autorización.",
-    }

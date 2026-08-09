@@ -230,7 +230,7 @@ def resolver_pagos(pagos_raw: list, importe_total: Decimal) -> list:
                 status_code=400,
                 detail=f"Los pagos especificados (${total_cubierto:.2f}) superan el importe total (${importe_total:.2f})."
             )
-        pagos_xml.append({**ultimo_sin_total, "total": f"{saldo:.2f}"})
+        pagos_xml.append({ "formaPago": ultimo_sin_total["formaPago"], "total": f"{saldo:.2f}", "plazo": ultimo_sin_total["plazo"], "unidadTiempo": ultimo_sin_total["unidadTiempo"], })
     else:
         # Todos los pagos tienen total — validar que sumen
         if total_cubierto != importe_total:
@@ -323,6 +323,8 @@ async def guardar_y_encolar(
     unlimited:       bool,
     origen:          str,
     db:              AsyncSession,
+    cod_doc:           str  = "01",   # ← agregar
+    doc_referencia_id: str  = None,   # ← agregar
 ) -> str:
     """
     Guarda el XML en R2, inserta la factura en DB, descuenta crédito y encola.
@@ -343,13 +345,15 @@ async def guardar_y_encolar(
                 secuencial, fecha_emision, clave_acceso, numero_factura, estado,
                 identificacion_comprador, razon_social_comprador, email_comprador,
                 importe_total, subtotal_iva, subtotal_0, valor_iva,
-                xml_path, datos_factura
+                xml_path, datos_factura,
+                cod_doc, doc_referencia_id
             ) VALUES (
                 :emisor_id, :pto_id, :cliente_emisor_id, :api_key_id, :origen,
                 :sec, :fecha, :clave, :num_fac, 'FIRMADO',
                 :id_comp, :razon_comp, :email_comp,
                 :total, :sub_iva, :sub_0, :val_iva,
-                :xml_path, CAST(:datos_fac AS jsonb)
+                :xml_path, CAST(:datos_fac AS jsonb),
+                :cod_doc, :doc_ref_id
             ) RETURNING id
         """), {
             "emisor_id":         emisor_id,
@@ -370,6 +374,8 @@ async def guardar_y_encolar(
             "val_iva":           calculos["totales"]["totalIva"],
             "xml_path":          xml_path_rel,
             "datos_fac":         json.dumps(datos_fac_json),
+            "cod_doc":           cod_doc,            # ← agregar
+            "doc_ref_id":        doc_referencia_id,  # ← agregar
         })
         factura_id = res_insert.scalar()
         await db.commit()

@@ -40,6 +40,7 @@ async def obtener_historial_core(
     query = text(f"""
         SELECT
             id, clave_acceso, numero_factura, estado,
+            cod_doc,                                        -- ← agregar
             importe_total, subtotal_iva, subtotal_0, valor_iva,
             fecha_emision, created_at,
             razon_social_comprador, identificacion_comprador,
@@ -66,6 +67,7 @@ async def obtener_historial_core(
         d["subtotal_0"]    = float(d["subtotal_0"] or 0)
         d["valor_iva"]     = float(d["valor_iva"] or 0)
         d["fecha_emision"] = str(d["fecha_emision"])
+        d["cod_doc"]       = str(d.get("cod_doc") or "01")
         d["created_at"]    = str(d["created_at"])
 
         # Deserialización y estructuración de impuestos

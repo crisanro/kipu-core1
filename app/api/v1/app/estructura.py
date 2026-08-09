@@ -316,3 +316,34 @@ async def editar_punto_emision(
     await db.commit()
     await _invalidar_estructura(emisor_id)
     return {"ok": True, "mensaje": "Punto de emisión actualizado.", "data": dict(updated._mapping)}
+
+
+# ── PATCH Secuencial ───────────────────────────────────────────────────────────
+@router.patch("/puntos-emision/{punto_id}/secuencial", summary="Corregir secuencial de un punto")
+async def editar_secuencial(
+    punto_id: int,
+    data: dict,
+    auth_data: dict = Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+):
+    emisor_id    = auth_data["emisor_id"]
+    nuevo_sec    = data.get("secuencial_actual")
+
+    if nuevo_sec is None or int(nuevo_sec) < 1:
+        raise HTTPException(status_code=400, detail="El secuencial debe ser mayor a 0.")
+
+    res = await db.execute(text("""
+        UPDATE puntos_emision pe
+        SET secuencial_actual = :sec
+        FROM establecimientos e
+        WHERE pe.establecimiento_id = e.id
+          AND pe.id = :pid
+          AND e.emisor_id = :eid
+        RETURNING pe.id, pe.codigo, pe.secuencial_actual
+    """), {"sec": int(nuevo_sec), "pid": punto_id, "eid": emisor_id})
+    updated = res.fetchone()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Punto no encontrado.")
+    await db.commit()
+    await _invalidar_estructura(emisor_id)
+    return {"ok": True, "mensaje": "Secuencial actualizado.", "data": dict(updated._mapping)}

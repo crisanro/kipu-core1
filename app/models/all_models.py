@@ -322,6 +322,8 @@ class InvoiceEmitida(Base):
     subtotal_0                  = Column(Numeric(12, 2), default=0)
     valor_iva                   = Column(Numeric(12, 2), default=0)
     datos_factura               = Column(JSONB, nullable=False)
+    cod_doc           = Column(String(2), default="01")
+    doc_referencia_id = Column(UUID(as_uuid=True), ForeignKey("invoices_emitidas.id", ondelete="SET NULL"), nullable=True)
     xml_path                    = Column(Text)
     pdf_path                    = Column(Text)
     mensajes_sri                = Column(JSONB)
