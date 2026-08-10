@@ -14,6 +14,8 @@ from app.services.mail_service import mail_service
 from app.services.notifier_service import notificar_cambio_estado
 from app.core.config import settings
 from app.utils.sri_core import devolver_stock, descontar_stock
+from app.services.notification_service import crear_notificacion
+
 
 QUEUE_EMISION      = "kipu:queue:emision"
 QUEUE_AUTORIZACION = "kipu:queue:autorizacion"
@@ -177,6 +179,14 @@ async def procesar_emision(factura_id: str):
                     await devolver_stock(str(factura.id), factura.emisor_db_id, db)
                     await _invalidar_cache(factura.emisor_db_id)
                     await notificar_cambio_estado(fac_dict, "DEVUELTA", resp_recepcion)
+                    await crear_notificacion(
+                        db        = db,
+                        emisor_id = factura.emisor_db_id,
+                        tipo      = "FACTURA",
+                        titulo    = "⚠️ Comprobante devuelto por el SRI",
+                        mensaje   = f"El comprobante {factura.clave_acceso[-10:]} fue devuelto. Revisa los errores en el detalle.",
+                        referencia = f"/facturas/{factura.id}",
+                    )
 
             except Exception as err:
                 await db.rollback()
@@ -319,6 +329,14 @@ async def procesar_autorizacion(factura_id: str):
                     await devolver_stock(str(factura.id), factura.emisor_db_id, db)
                     await _invalidar_cache(factura.emisor_db_id)
                     await notificar_cambio_estado(fac_dict, "RECHAZADO", autorizacion.get("mensajes"))
+                    await crear_notificacion(
+                        db        = db,
+                        emisor_id = factura.emisor_db_id,
+                        tipo      = "FACTURA",
+                        titulo    = "❌ Comprobante rechazado por el SRI",
+                        mensaje   = f"El comprobante {factura.clave_acceso[-10:]} fue rechazado. Revisa los errores en el detalle.",
+                        referencia = f"/facturas/{factura.id}",
+                    )
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.rechazada", fac_dict)
 
             except Exception as err:
