@@ -28,46 +28,53 @@ class ConsultarFacturaRequest(BaseModel):
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str,
+    formato:      str = "a4",  # ← agregar parámetro de formato
     db: AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
-
     try:
         res = await db.execute(text("""
-            SELECT i.estado, i.xml_path, e.contribuyente_especial
+            SELECT
+                i.estado, i.xml_path,
+                i.fecha_autorizacion,        -- ← agregar
+                e.contribuyente_especial
             FROM invoices_emitidas i
             JOIN emisores e ON i.emisor_id = e.id
             WHERE i.clave_acceso = :clave
         """), {"clave": clave_acceso})
         factura = res.fetchone()
-
         if not factura:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
-
         if factura.estado != 'AUTORIZADO' or not factura.xml_path:
             return JSONResponse(status_code=404, content={"error": "Factura no autorizada o sin XML"})
 
-        # Descargar XML desde R2
         xml_bytes = download_file(factura.xml_path)
         xml_str   = xml_bytes.decode('utf-8')
 
-        # Generar PDF en Node.js bajo demanda
+        # Formatear fecha de autorización
+        fecha_auth = None
+        if factura.fecha_autorizacion:
+            fecha_auth = factura.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S")
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             res_pdf = await client.post(
                 NODE_PDF_URL,
                 json={
                     "xmlAutorizado":     xml_str,
                     "emisor":            {"contribuyente_especial": factura.contribuyente_especial or ""},
-                    "fechaAutorizacion": None
+                    "fechaAutorizacion": fecha_auth,  # ← pasar fecha real
+                    "formato":           formato,      # ← pasar formato
                 }
             )
-
         if res_pdf.status_code != 200 or not res_pdf.json().get("ok"):
             return JSONResponse(status_code=500, content={"error": "Error generando PDF"})
 
         pdf_bytes = base64.b64decode(res_pdf.json()["pdfBase64"])
-        headers   = {"Content-Disposition": f'inline; filename="{clave_acceso}.pdf"'}
+        headers   = {
+            "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
+            "Cache-Control":       "public, max-age=3600",  # cachear 1 hora
+        }
         return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
     except Exception as e:
