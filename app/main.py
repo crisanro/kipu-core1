@@ -40,6 +40,7 @@ from app.api.v1.public import (
 )
 from app.api.v1.admin import (
     integraciones as integraciones_n8n,
+    panel as panel_admin,
 )
 
 # ─── LIFESPAN ─────────────────────────────────────────────────────────────────
@@ -175,6 +176,7 @@ app.include_router(invoices_public.router,       prefix="/api/v1/public",       
 app.include_router(clientes_public.router,       prefix="/api/v1/public/clientes",      tags=["🌍 API Facturación"])
 
 app.include_router(integraciones_n8n.router, prefix="/api/v1/admin", tags=["🤖 n8n Automations - Core"])
+app.include_router( panel_admin.router, prefix="/api/v1/admin/panel", tags=["🔧 Admin - Panel"] )
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
