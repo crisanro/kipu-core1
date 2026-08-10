@@ -7,9 +7,16 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
+from starlette.responses import Response as StarResponse
 
 # Firebase
 import app.core.firebase
+
+# Cache / Redis
+from app.core.cache import get_redis
+
+# Services / Config
+from app.core.config import settings
 
 # Workers
 from app.workers.sri_worker import iniciar_workers
@@ -125,6 +132,21 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         })
     return JSONResponse(status_code=422, content={"detail": errores})
 
+# ─── HELPER RATE LIMIT DE ALERTAS ─────────────────────────────────────────────
+async def _puede_alertar(path: str, status: int) -> bool:
+    """Evita saturación: máximo 1 email por combinación (status + ruta) cada 5 minutos."""
+    try:
+        redis     = await get_redis()
+        cache_key = f"kipu:alert:{status}:{path.replace('/', '_')}"
+        existe    = await redis.get(cache_key)
+        if existe:
+            return False
+        await redis.setex(cache_key, 300, "1")  # TTL de 5 minutos (300 segundos)
+        return True
+    except Exception as e:
+        print(f"[Alert] ⚠️ Error consultando Redis para rate limit: {e}")
+        return True  # Fallback seguro: enviar la alerta si Redis falla
+
 # ─── MIDDLEWARE DE LOGS ────────────────────────────────────────────────────────
 async def set_body(request: Request, body: bytes):
     async def receive():
@@ -155,6 +177,66 @@ async def log_request_data_and_time(request: Request, call_next):
     response.headers["X-Process-Time-Ms"] = str(round(process_time_ms, 2))
     return response
 
+# ─── MIDDLEWARE DE ALERTAS DE ERROR ─────────────────────────────────────────────
+@app.middleware("http")
+async def alert_on_error(request: Request, call_next):
+    response = await call_next(request)
+    
+    # Verificar si el servicio de alertas por email está habilitado
+    if not getattr(settings, "ALERT_EMAIL_ERRORS", False):
+        return response
+    
+    status = response.status_code
+    path   = request.url.path
+
+    # Ignorar rutas de verificación de salud y documentación
+    if path in ("/", "/docs", "/openapi.json", "/api-docs"):
+        return response
+
+    if status >= 400:
+        if not await _puede_alertar(path, status):
+            return response
+
+        try:
+            # Leer el body de la respuesta sin romper la comunicación con el cliente
+            body_bytes = b""
+            async for chunk in response.body_iterator:
+                body_bytes += chunk
+
+            # Reconstruir la respuesta Starlette para retornarla adecuadamente al cliente
+            response = StarResponse(
+                content     = body_bytes,
+                status_code = status,
+                headers     = dict(response.headers),
+                media_type  = response.media_type,
+            )
+
+            nivel = "🔴 ERROR 5xx" if status >= 500 else "🟡 ERROR 4xx"
+
+            from app.services.mail_service import mail_service
+            
+            # Enviar el correo en segundo plano
+            asyncio.create_task(mail_service.send_mail(
+                to           = getattr(settings, "ALERT_EMAIL_TO", "admin@kipu.ec"),
+                subject      = f"[Kipu] {nivel} — {status} en {path}",
+                html_content = f"""
+                <h2>{nivel}</h2>
+                <table border="1" cellpadding="6" style="border-collapse:collapse;font-family:monospace">
+                    <tr><td><b>Status</b></td><td>{status}</td></tr>
+                    <tr><td><b>Método</b></td><td>{request.method}</td></tr>
+                    <tr><td><b>Ruta</b></td><td>{path}</td></tr>
+                    <tr><td><b>Query</b></td><td>{str(request.query_params) or '-'}</td></tr>
+                    <tr><td><b>IP</b></td><td>{request.client.host if request.client else '-'}</td></tr>
+                    <tr><td><b>User-Agent</b></td><td>{request.headers.get('user-agent', '-')}</td></tr>
+                    <tr><td><b>Respuesta</b></td><td><pre>{body_bytes.decode('utf-8', errors='replace')[:2000]}</pre></td></tr>
+                </table>
+                """
+            ))
+        except Exception as e:
+            print(f"[Alert] ⚠️ Error capturando o enviando alerta por correo: {e}")
+
+    return response
+
 # ─── RUTAS ────────────────────────────────────────────────────────────────────
 app.include_router(auth_app.router,           prefix="/api/v1/app/auth",             tags=["📱 App - Auth & Nuke"])
 app.include_router(emisor_app.router,         prefix="/api/v1/app/emisor",           tags=["📱 App - Emisor & Config"])
@@ -164,7 +246,7 @@ app.include_router(usuarios_app.router,       prefix="/api/v1/app/usuarios",    
 app.include_router(clientes_app.router,       prefix="/api/v1/app/clientes",         tags=["📱 App - Clientes"])
 app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",         tags=["📱 App - Facturación"])
 app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",        tags=["📱 App - Dashboard"])
-app.include_router( declaraciones_app.router, prefix="/api/v1/app/declaraciones", tags=["📱 App - Declaraciones"] )
+app.include_router(declaraciones_app.router,  prefix="/api/v1/app/declaraciones",    tags=["📱 App - Declaraciones"])
 app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",          tags=["📱 App - API Keys"])
 app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",         tags=["📱 App - Catálogo"])
 app.include_router(recibidas_app.router,      prefix="/api/v1/app/invoices/received", tags=["📱 App - Facturas Recibidas"])
@@ -177,8 +259,8 @@ app.include_router(invoices_public.router,       prefix="/api/v1/public",       
 app.include_router(clientes_public.router,       prefix="/api/v1/public/clientes",      tags=["🌍 API Facturación"])
 
 app.include_router(integraciones_n8n.router, prefix="/api/v1/admin", tags=["🤖 n8n Automations - Core"])
-app.include_router( panel_admin.router, prefix="/api/v1/admin/panel", tags=["🔧 Admin - Panel"] )
-app.include_router( stripe_webhook.router, prefix="/api/v1/admin/stripe", tags=["💳 Stripe Webhook"] )
+app.include_router(panel_admin.router,        prefix="/api/v1/admin/panel", tags=["🔧 Admin - Panel"])
+app.include_router(stripe_webhook.router,     prefix="/api/v1/admin/stripe", tags=["💳 Stripe Webhook"])
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])

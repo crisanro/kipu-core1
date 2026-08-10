@@ -396,7 +396,6 @@ async def guardar_y_encolar(
         # Encolar
         redis = await get_redis()
         await redis.lpush("kipu:queue:emision", str(factura_id))
-        print(f"[Emisión] 📥 {clave_acceso} → cola de emisión")
 
         return str(factura_id)
 
@@ -430,7 +429,6 @@ async def descontar_stock(factura_data: dict, emisor_id: int, db: AsyncSession):
 
         await db.commit()
         await invalidar_cache_productos(emisor_id)
-        print(f"[Stock] ✅ Stock descontado para emisor {emisor_id}")
 
     except Exception as e:
         print(f"[Stock] ⚠️ Error descontando stock: {e}")

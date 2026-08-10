@@ -13,6 +13,7 @@ from app.core.database import get_db
 from app.services.storage_service import download_file
 from app.core.config import settings
 from app.core.security import verify_public_origin
+from app.core.cache import get_redis
 
 router = APIRouter()
 
@@ -24,72 +25,106 @@ class ConsultarFacturaRequest(BaseModel):
     hpValue: Optional[str] = None
 
 
-# ── PDF — generado bajo demanda desde el XML autorizado ───────────────────────
+# ── PDF — con cache Redis ──────────────────────────────────────────────────────
 @router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF) público")
 async def get_pdf(
     clave_acceso: str,
-    formato:      str = "a4",  # ← agregar parámetro de formato
-    db: AsyncSession = Depends(get_db)
+    formato:      str = "a4",
+    db:           AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
+
+    cache_key = f"kipu:pdf:{clave_acceso}:{formato}"
+    try:
+        redis      = await get_redis()
+        cached_pdf = await redis.get(cache_key)
+        if cached_pdf:
+            return Response(
+                content      = cached_pdf,
+                media_type   = "application/pdf",
+                headers      = {
+                    "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
+                    "X-Cache": "HIT",
+                }
+            )
+    except Exception as e:
+        print(f"[PDF Cache] ⚠️ {e}")
+
     try:
         res = await db.execute(text("""
-            SELECT
-                i.estado, i.xml_path,
-                i.fecha_autorizacion,        -- ← agregar
-                e.contribuyente_especial
+            SELECT i.estado, i.xml_path, i.fecha_autorizacion, e.contribuyente_especial
             FROM invoices_emitidas i
             JOIN emisores e ON i.emisor_id = e.id
             WHERE i.clave_acceso = :clave
         """), {"clave": clave_acceso})
         factura = res.fetchone()
+
         if not factura:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
         if factura.estado != 'AUTORIZADO' or not factura.xml_path:
             return JSONResponse(status_code=404, content={"error": "Factura no autorizada o sin XML"})
 
-        xml_bytes = download_file(factura.xml_path)
-        xml_str   = xml_bytes.decode('utf-8')
-
-        # Formatear fecha de autorización
-        fecha_auth = None
-        if factura.fecha_autorizacion:
-            fecha_auth = factura.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S")
+        xml_bytes  = download_file(factura.xml_path)
+        xml_str    = xml_bytes.decode('utf-8')
+        fecha_auth = factura.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S") if factura.fecha_autorizacion else None
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            res_pdf = await client.post(
-                NODE_PDF_URL,
-                json={
-                    "xmlAutorizado":     xml_str,
-                    "emisor":            {"contribuyente_especial": factura.contribuyente_especial or ""},
-                    "fechaAutorizacion": fecha_auth,  # ← pasar fecha real
-                    "formato":           formato,      # ← pasar formato
-                }
-            )
+            res_pdf = await client.post(NODE_PDF_URL, json={
+                "xmlAutorizado":     xml_str,
+                "emisor":            {"contribuyente_especial": factura.contribuyente_especial or ""},
+                "fechaAutorizacion": fecha_auth,
+                "formato":           formato,
+            })
+
         if res_pdf.status_code != 200 or not res_pdf.json().get("ok"):
             return JSONResponse(status_code=500, content={"error": "Error generando PDF"})
 
         pdf_bytes = base64.b64decode(res_pdf.json()["pdfBase64"])
-        headers   = {
-            "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
-            "Cache-Control":       "public, max-age=3600",  # cachear 1 hora
-        }
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
+        try:
+            await redis.setex(cache_key, 7200, pdf_bytes)
+        except Exception as e:
+            print(f"[PDF Cache] ⚠️ Error guardando: {e}")
+
+        return Response(
+            content    = pdf_bytes,
+            media_type = "application/pdf",
+            headers    = {
+                "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
+                "Cache-Control":       "public, max-age=7200",
+                "X-Cache":             "MISS",
+            }
+        )
     except Exception as e:
-        print(f"Error Public PDF: {e}")
+        print(f"[PDF] ❌ Error: {e}")
         return JSONResponse(status_code=500, content={"error": "Error generando PDF"})
 
 
-# ── XML — descarga directa desde R2 ───────────────────────────────────────────
+# ── XML — con cache Redis ──────────────────────────────────────────────────────
 @router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
 async def get_xml(
     clave_acceso: str,
-    db: AsyncSession = Depends(get_db)
+    db:           AsyncSession = Depends(get_db)
 ):
     if not re.match(r"^\d{49}$", clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave inválida"})
+
+    cache_key = f"kipu:xml:{clave_acceso}"
+    try:
+        redis      = await get_redis()
+        cached_xml = await redis.get(cache_key)
+        if cached_xml:
+            return Response(
+                content    = cached_xml,
+                media_type = "application/xml",
+                headers    = {
+                    "Content-Disposition": f'attachment; filename="{clave_acceso}.xml"',
+                    "X-Cache": "HIT",
+                }
+            )
+    except Exception as e:
+        print(f"[XML Cache] ⚠️ {e}")
 
     try:
         res = await db.execute(text("""
@@ -100,16 +135,27 @@ async def get_xml(
 
         if not factura:
             return JSONResponse(status_code=404, content={"error": "Factura no encontrada"})
-
         if factura.estado != 'AUTORIZADO' or not factura.xml_path:
             return JSONResponse(status_code=404, content={"error": "Factura no autorizada o sin XML"})
 
         file_bytes = download_file(factura.xml_path)
-        headers    = {"Content-Disposition": f'attachment; filename="{clave_acceso}.xml"'}
-        return Response(content=file_bytes, media_type="application/xml", headers=headers)
 
+        try:
+            await redis.setex(cache_key, 7200, file_bytes)
+        except Exception as e:
+            print(f"[XML Cache] ⚠️ Error guardando: {e}")
+
+        return Response(
+            content    = file_bytes,
+            media_type = "application/xml",
+            headers    = {
+                "Content-Disposition": f'attachment; filename="{clave_acceso}.xml"',
+                "Cache-Control":       "public, max-age=7200",
+                "X-Cache":             "MISS",
+            }
+        )
     except Exception as e:
-        print(f"Error Public XML: {e}")
+        print(f"[XML] ❌ Error: {e}")
         return JSONResponse(status_code=500, content={"error": "Archivo no encontrado"})
 
 

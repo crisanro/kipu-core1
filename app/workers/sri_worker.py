@@ -125,7 +125,6 @@ async def procesar_emision(factura_id: str):
                     print(f"[Emisión] ℹ️ {factura_id} ya no está en FIRMADO, se omite.")
                     return
 
-                print(f"[Emisión] 📤 Enviando: {factura.clave_acceso}")
                 xml_bytes  = download_file(factura.xml_path)
                 xml_base64 = base64.b64encode(xml_bytes).decode("utf-8")
                 urls       = URLS_SRI[str(factura.ambiente)]
@@ -156,8 +155,6 @@ async def procesar_emision(factura_id: str):
                         {"id": factura.id}
                     )
                     await db.commit()
-                    print(f"[Emisión] ✅ RECIBIDA: {factura.clave_acceso}")
-                    await notificar_cambio_estado(fac_dict, "RECIBIDA")
                     redis = await get_redis()
                     await redis.lpush(QUEUE_AUTORIZACION, str(factura.id))
 
@@ -226,7 +223,6 @@ async def procesar_autorizacion(factura_id: str):
                     print(f"[Auth] ℹ️ {factura_id} ya no está en RECIBIDA, se omite.")
                     return
 
-                print(f"[Auth] 🔍 Consultando autorización: {factura.clave_acceso}")
                 urls      = URLS_SRI[str(factura.ambiente)]
                 soap_body = (
                     f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -280,11 +276,8 @@ async def procesar_autorizacion(factura_id: str):
                         {"fecha": fecha_auth_obj, "id": factura.id}
                     )
                     await db.commit()
-                    # Stock ya descontado al firmar — no tocar aquí
-                    print(f"[Auth] ✅ AUTORIZADO: {factura.clave_acceso}")
 
                     await _invalidar_cache(factura.emisor_db_id)
-                    await notificar_cambio_estado(fac_dict, "AUTORIZADO")
                     await disparar_webhooks(factura.id, factura.emisor_db_id, "factura.autorizada", fac_dict)
 
                     if factura.email_comprador:
@@ -366,7 +359,6 @@ async def disparar_webhooks(factura_id, emisor_id: int, evento: str, payload: di
                             firma = hmac.new(wh.secret.encode(), body.encode(), hashlib.sha256).hexdigest()
                             headers["X-Kipu-Signature"] = f"sha256={firma}"
                         await client.post(wh.url, content=body, headers=headers)
-                        print(f"[Webhook] ✅ {evento} → {wh.url}")
                     except Exception as e_wh:
                         print(f"[Webhook] ⚠️ Error enviando a {wh.url}: {e_wh}")
         except Exception as e:
