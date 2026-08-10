@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from contextlib import asynccontextmanager
 from starlette.responses import Response as StarResponse
+from app.core.cloudflare import es_ip_cloudflare
+
 
 # Firebase
 import app.core.firebase
@@ -379,6 +381,23 @@ async def log_request_data_and_time(request: Request, call_next):
                 ))
 
     return response
+
+# ─── MIDDLEWARE CLOUDFLARE ─────────────────────────────────────────────────────
+@app.middleware("http")
+async def validar_cloudflare(request: Request, call_next):
+    if not getattr(settings, "CLOUDFLARE_ONLY", False):
+        return await call_next(request)
+
+    ip_servidor = request.client.host if request.client else ""
+
+    if not es_ip_cloudflare(ip_servidor):
+        print(f"[CF] ⛔ Bloqueado — IP no Cloudflare: {ip_servidor}")
+        return JSONResponse(
+            status_code = 403,
+            content     = {"error": "Acceso no autorizado."}
+        )
+
+    return await call_next(request)
 
 # ─── RUTAS ────────────────────────────────────────────────────────────────────
 app.include_router(auth_app.router,           prefix="/api/v1/app/auth",              tags=["📱 App - Auth & Nuke"])
