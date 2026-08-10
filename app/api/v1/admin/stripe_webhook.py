@@ -19,7 +19,7 @@ router         = APIRouter()
 # ── POST /webhook ──────────────────────────────────────────────────────────────
 @router.post("/webhook", summary="Webhook de Stripe")
 async def stripe_webhook(request: Request):
-    payload   = await request.body()
+    payload    = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
     # ── Verificar firma ────────────────────────────────────────────────────────
@@ -27,6 +27,8 @@ async def stripe_webhook(request: Request):
         event = stripe.Webhook.construct_event(
             payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
         )
+        # Convertir evento a dict para un acceso seguro a claves mediante .get()
+        event = event.to_dict() if hasattr(event, "to_dict") else dict(event)
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida.")
     except Exception as e:
@@ -37,7 +39,7 @@ async def stripe_webhook(request: Request):
         return JSONResponse({"ok": True, "mensaje": "Evento ignorado."})
 
     session  = event["data"]["object"]
-    metadata = session.get("metadata", {})
+    metadata = session.get("metadata") or {}
 
     emisor_id = metadata.get("emisor_id")
     plan_id   = metadata.get("plan_id")
@@ -47,10 +49,10 @@ async def stripe_webhook(request: Request):
         print(f"[Stripe] ⚠️ Metadata incompleto: {metadata}")
         return JSONResponse({"ok": True, "mensaje": "Metadata incompleto."})
 
-    emisor_id = int(emisor_id)
-    cantidad  = int(cantidad)
-    monto     = float(session.get("amount_total", 0)) / 100  # centavos → USD
-    payment_id = session.get("payment_intent") or session.get("id")
+    emisor_id  = int(emisor_id)
+    cantidad   = int(cantidad)
+    monto      = float(session.get("amount_total") or 0) / 100  # centavos → USD
+    payment_id = session.get("payment_intent") or session.get("id") or ""
 
     print(f"[Stripe] 💳 Pago recibido — emisor {emisor_id}, {cantidad} créditos, ${monto}")
 
