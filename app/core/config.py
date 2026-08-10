@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     IVA_RATE: float = 0.15
     BACKEND_URL: str = "https://core.kipu.ec"
     STRIPE_SECRET_KEY: str
+    STRIPE_WEBHOOK_SECRET: str = ""
     FIREBASE_PROJECT_ID:    str
     FIREBASE_CLIENT_EMAIL:  str
     FIREBASE_PRIVATE_KEY_ID: str

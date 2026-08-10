@@ -1,14 +1,11 @@
 # app/services/notification_service.py
-#
-# Servicio para crear notificaciones en DB y enviarlas por FCM v1.
-# Usado por workers y endpoints del backend.
-
 import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 
 FCM_URL = f"https://fcm.googleapis.com/v1/projects/{settings.FIREBASE_PROJECT_ID}/messages:send"
+
 
 # ── Token de acceso Google ─────────────────────────────────────────────────────
 async def _get_access_token() -> str:
@@ -27,7 +24,6 @@ async def _get_access_token() -> str:
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         "client_x509_cert_url":        f"https://www.googleapis.com/robot/v1/metadata/x509/{settings.FIREBASE_CLIENT_EMAIL}",
     }
-
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/firebase.messaging"],
@@ -36,10 +32,31 @@ async def _get_access_token() -> str:
     credentials.refresh(request)
     return credentials.token
 
+
+# ── Borrar token inválido ──────────────────────────────────────────────────────
+async def _borrar_token(token: str, db: AsyncSession):
+    try:
+        await db.execute(
+            text("DELETE FROM fcm_tokens WHERE token = :token"),
+            {"token": token}
+        )
+        await db.commit()
+        print(f"[FCM] 🗑️ Token inválido eliminado")
+    except Exception as e:
+        print(f"[FCM] ⚠️ Error eliminando token: {e}")
+
+
 # ── Enviar push a lista de tokens ──────────────────────────────────────────────
-async def _enviar_push(tokens: list[str], titulo: str, cuerpo: str, url: str = None):
+async def _enviar_push(
+    tokens:   list[str],
+    titulo:   str,
+    cuerpo:   str,
+    url:      str          = None,
+    db:       AsyncSession = None,
+):
     if not tokens:
         return
+
     try:
         access_token = await _get_access_token()
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -58,8 +75,8 @@ async def _enviar_push(tokens: list[str], titulo: str, cuerpo: str, url: str = N
                             "notification": {
                                 "title": titulo,
                                 "body":  cuerpo,
-                                "icon":  "/icon-192.png",
-                                "badge": "/icon-192.png",
+                                "icon":  "/icons/icon-192.png",
+                                "badge": "/icons/icon-192.png",
                             },
                             "fcm_options": {
                                 "link": url or "/dashboard",
@@ -75,13 +92,31 @@ async def _enviar_push(tokens: list[str], titulo: str, cuerpo: str, url: str = N
                         "Content-Type":  "application/json",
                     },
                 )
+
                 if res.status_code == 200:
                     print(f"[FCM] ✅ Push enviado")
                 else:
-                    print(f"[FCM] ⚠️ Error: {res.text[:200]}")
+                    # Detectar tokens inválidos y limpiarlos
+                    try:
+                        error_body = res.json()
+                        error_code = (
+                            error_body
+                            .get("error", {})
+                            .get("details", [{}])[0]
+                            .get("errorCode", "")
+                        )
+                        if error_code in ("UNREGISTERED", "INVALID_ARGUMENT"):
+                            print(f"[FCM] 🗑️ Token inválido detectado — eliminando")
+                            if db:
+                                await _borrar_token(token, db)
+                        else:
+                            print(f"[FCM] ⚠️ Error FCM ({error_code}): {res.text[:200]}")
+                    except Exception:
+                        print(f"[FCM] ⚠️ Error inesperado: {res.text[:200]}")
 
     except Exception as e:
         print(f"[FCM] ❌ Error enviando push: {e}")
+
 
 # ── Función principal ──────────────────────────────────────────────────────────
 async def crear_notificacion(
@@ -93,16 +128,11 @@ async def crear_notificacion(
     referencia: str = None,
 ):
     """
-    Crea notificación en DB y la envía por FCM a todos los tokens del emisor.
-
-    Tipos sugeridos:
-      - DECLARACION   → recordatorio de declaración SRI
-      - FACTURA       → factura autorizada/rechazada
-      - CREDITOS      → créditos bajos o recargados
-      - SISTEMA       → mensajes generales del sistema
+    Crea notificación en DB y la envía por FCM.
+    Tipos: DECLARACION | FACTURA | CREDITOS | SISTEMA
     """
+    # 1. Guardar en DB
     try:
-        # 1. Guardar en DB
         await db.execute(text("""
             INSERT INTO notificaciones (emisor_id, tipo, titulo, mensaje, referencia, leida)
             VALUES (:eid, :tipo, :titulo, :mensaje, :ref, false)
@@ -115,13 +145,12 @@ async def crear_notificacion(
         })
         await db.commit()
         print(f"[Notif] 📥 {tipo} → emisor {emisor_id}: {titulo}")
-
     except Exception as e:
         print(f"[Notif] ❌ Error guardando en DB: {e}")
         await db.rollback()
         return
 
-    # 2. Buscar tokens FCM del emisor
+    # 2. Buscar tokens FCM
     try:
         res = await db.execute(text("""
             SELECT DISTINCT token FROM fcm_tokens
@@ -132,26 +161,22 @@ async def crear_notificacion(
         print(f"[Notif] ⚠️ Error buscando tokens: {e}")
         return
 
-    # 3. Enviar push
-    await _enviar_push(tokens, titulo, mensaje, referencia)
+    # 3. Enviar push — pasamos db para limpiar tokens inválidos
+    await _enviar_push(tokens, titulo, mensaje, referencia, db=db)
 
 
 # ── Notificar a todos los emisores ────────────────────────────────────────────
 async def notificar_todos_emisores(
-    db:         AsyncSession,
-    tipo:       str,
-    titulo:     str,
-    mensaje:    str,
-    referencia: str = None,
+    db:              AsyncSession,
+    tipo:            str,
+    titulo:          str,
+    mensaje:         str,
+    referencia:      str  = None,
     solo_produccion: bool = True,
 ):
-    """
-    Crea y envía notificación a todos los emisores activos.
-    Usado por workers (declaraciones, recordatorios, etc.)
-    """
     try:
         filtro = "AND e.ambiente = 2" if solo_produccion else ""
-        res = await db.execute(text(f"""
+        res    = await db.execute(text(f"""
             SELECT DISTINCT e.id
             FROM emisores e
             JOIN emisor_usuarios eu ON eu.emisor_id = e.id

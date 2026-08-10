@@ -86,7 +86,7 @@ async def verify_firebase_token(
         "profile_id": profile.id,
         "emisor_id":  profile.emisor_id,
         "email":      profile.email,
-        "role":       profile.emisor_rol or profile.role
+        "role":       profile.role or profile.emisor_rol
     }
 
 

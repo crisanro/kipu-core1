@@ -41,16 +41,19 @@ async def listar_empresas(
     cache_key = f"usuario:{profile_id}:empresas"
     cached    = await cache_get(cache_key)
     if cached:
-        return {"ok": True, "data": cached, "source": "cache"}
+        return cached  # ← cached ya incluye role
 
+    # ← Agregar p.role al SELECT
     res = await db.execute(text("""
         SELECT
             e.id, e.ruc, e.razon_social, e.nombre_comercial,
             e.ambiente, e.p12_path, e.p12_expiration,
             eu.rol,
-            c.balance_emision, c.balance_recepcion
+            c.balance_emision, c.balance_recepcion,
+            p.role as profile_role
         FROM emisor_usuarios eu
         JOIN emisores e      ON e.id = eu.emisor_id
+        JOIN profiles p      ON p.id = eu.profile_id
         LEFT JOIN user_credits c ON c.emisor_id = e.id
         WHERE eu.profile_id = :pid
         ORDER BY e.razon_social ASC
@@ -72,8 +75,17 @@ async def listar_empresas(
         for r in rows
     ]
 
-    await cache_set(cache_key, data, TTL_EMPRESAS)
-    return {"ok": True, "data": data, "source": "db"}
+    # ← role del perfil (superadmin, admin, etc.)
+    profile_role = rows[0].profile_role if rows else None
+
+    response = {
+        "ok":   True,
+        "data": data,
+        "role": profile_role,
+    }
+
+    await cache_set(cache_key, response, TTL_EMPRESAS)
+    return response
 
 
 # ── POST /empresas/cambiar — cambiar empresa activa en sesión ──────────────────
