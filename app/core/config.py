@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     SMTP_USER:              str
     SMTP_PASS:              str
     SMTP_FROM:              str
+    ALERT_EMAIL_ERRORS: bool = True
+    ALERT_EMAIL_TO:     str  = "cristhian@kipu.ec"
     PORT:                   int = 3000
     FRONTEND_URL:           str
     DEBUG_SIGNER:           bool = False
