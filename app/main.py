@@ -232,6 +232,8 @@ async def alert_on_error(request: Request, call_next):
                 </table>
                 """
             ))
+            print(f"[Alert] 📧 Enviando alerta {status} para {path}")
+
         except Exception as e:
             print(f"[Alert] ⚠️ Error capturando o enviando alerta por correo: {e}")
 
