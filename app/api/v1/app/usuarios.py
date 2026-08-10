@@ -233,6 +233,33 @@ async def invitar_usuario(
         """), {"eid": emisor_id, "pid": str(perfil_existente.id), "rol": data.rol})
         await db.commit()
 
+        # Heredar tokens FCM existentes del usuario a la nueva empresa
+        try:
+            res_tokens = await db.execute(text("""
+                SELECT DISTINCT token, device_id FROM fcm_tokens
+                WHERE profile_id = :pid
+            """), {"pid": str(perfil_existente.id)})
+            tokens = res_tokens.fetchall()
+
+            for t in tokens:
+                await db.execute(text("""
+                    INSERT INTO fcm_tokens (profile_id, emisor_id, token, device_id, updated_at)
+                    VALUES (:pid, :eid, :token, :did, NOW())
+                    ON CONFLICT (profile_id, emisor_id, device_id)
+                    DO UPDATE SET token = :token, updated_at = NOW()
+                """), {
+                    "pid":   str(perfil_existente.id),
+                    "eid":   emisor_id,
+                    "token": t.token,
+                    "did":   t.device_id or "default",
+                })
+
+            if tokens:
+                await db.commit()
+                print(f"[FCM] ✅ {len(tokens)} tokens heredados al nuevo miembro")
+        except Exception as e:
+            print(f"[FCM] ⚠️ Error heredando tokens en invitación: {e}")
+
         # Invalidar cache
         await cache_delete(f"empresa:{emisor_id}:usuarios")
         await cache_delete(f"usuario:{perfil_existente.id}:empresas")

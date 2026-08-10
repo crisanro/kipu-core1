@@ -154,9 +154,37 @@ async def onboarding(
         """), {"eid": new_emisor_id})
 
         await db.commit()
+
+        # Heredar tokens FCM existentes del usuario a la nueva empresa
+        try:
+            res_tokens = await db.execute(text("""
+                SELECT DISTINCT token, device_id FROM fcm_tokens
+                WHERE profile_id = :pid
+            """), {"pid": str(profile_id)})
+            tokens = res_tokens.fetchall()
+
+            for t in tokens:
+                await db.execute(text("""
+                    INSERT INTO fcm_tokens (profile_id, emisor_id, token, device_id, updated_at)
+                    VALUES (:pid, :eid, :token, :did, NOW())
+                    ON CONFLICT (profile_id, emisor_id, device_id)
+                    DO UPDATE SET token = :token, updated_at = NOW()
+                """), {
+                    "pid":   str(profile_id),
+                    "eid":   new_emisor_id,
+                    "token": t.token,
+                    "did":   t.device_id or "default",
+                })
+
+            if tokens:
+                await db.commit()
+                print(f"[FCM] ✅ {len(tokens)} tokens heredados a nueva empresa {new_emisor_id}")
+        except Exception as e:
+            print(f"[FCM] ⚠️ Error heredando tokens: {e}")
+
         return {
-            "ok":       True,
-            "mensaje":  "EMPRESA CONFIGURADA CORRECTAMENTE.",
+            "ok":        True,
+            "mensaje":   "EMPRESA CONFIGURADA CORRECTAMENTE.",
             "emisor_id": new_emisor_id
         }
 
@@ -401,7 +429,6 @@ async def update_config(
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL ACTUALIZAR.")
 
 
-# ── POST /produccion ───────────────────────────────────────────────────────────
 # ── POST /produccion ───────────────────────────────────────────────────────────
 @router.post("/produccion", summary="Activar ambiente de producción")
 async def activar_produccion(
