@@ -4,6 +4,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
+from pydantic import BaseModel
+
+
+class FCMTokenRequest(BaseModel):
+    token: str
+
 
 router = APIRouter()
 
@@ -86,3 +92,22 @@ async def marcar_todas_leidas(
 
     return {"ok": True, "mensaje": "TODAS LAS NOTIFICACIONES MARCADAS COMO LEÍDAS."}
 
+@router.post("/fcm-token", summary="Registrar token FCM")
+async def registrar_fcm_token(
+    data:      FCMTokenRequest,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    profile_id = auth_data.get("profile_id")
+    emisor_id  = auth_data.get("emisor_id")
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="Perfil no encontrado.")
+
+    await db.execute(text("""
+        INSERT INTO fcm_tokens (profile_id, emisor_id, token, updated_at)
+        VALUES (:pid, :eid, :token, NOW())
+        ON CONFLICT (profile_id, emisor_id)
+        DO UPDATE SET token = :token, updated_at = NOW()
+    """), {"pid": str(profile_id), "eid": emisor_id, "token": data.token})
+    await db.commit()
+    return {"ok": True}
