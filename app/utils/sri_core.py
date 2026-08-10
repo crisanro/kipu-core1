@@ -261,7 +261,7 @@ def construir_campos_adicionales(factura_data: dict) -> list:
 
     # Proveedor siempre al final
     campos.append({
-        "@nombre": "Proveedor",
+        "@nombre": "PROVEEDOR_SISTEMA_INFORMATICO",
         "#text":   "1312838392001 (kipu.ec)"
     })
 
