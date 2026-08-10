@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     DATABASE_URL:           str = Field(validation_alias="DATABASE_URL_KIPU")
     REDIS_URL:              str
     NODE_SIGNER_URL:        str
+    CLOUDFLARE_ONLY:      bool = False
     IVA_RATE: float = 0.15
     BACKEND_URL: str = "https://core.kipu.ec"
     STRIPE_SECRET_KEY: str
