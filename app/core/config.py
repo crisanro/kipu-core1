@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "https://core.kipu.ec"
     STRIPE_SECRET_KEY: str
     STRIPE_WEBHOOK_SECRET: str = ""
+    KIPU_EMISOR_ID:        int = 0
+    KIPU_ESTABLECIMIENTO:  str = "001"
+    KIPU_PUNTO_EMISION:    str = "001"
+    INTERNAL_API_KEY:      str = ""
     FIREBASE_PROJECT_ID:    str
     FIREBASE_CLIENT_EMAIL:  str
     FIREBASE_PRIVATE_KEY_ID: str

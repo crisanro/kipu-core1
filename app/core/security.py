@@ -154,3 +154,16 @@ async def validar_y_quemar_pin(db: AsyncSession, emisor_id: int, pin: str, tipo_
             status_code=status.HTTP_403_FORBIDDEN,
             detail="PIN incorrecto, expirado o ya utilizado. Solicite uno nuevo."
         )
+
+
+async def verify_internal_key(
+    x_internal_key: str = Header(None, alias="X-Internal-Key"),
+):
+    if not x_internal_key or x_internal_key != settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Clave interna inválida.")
+    return {
+        "emisor_id":  settings.KIPU_EMISOR_ID,
+        "unlimited":  True,
+        "role":       "internal_service",
+        "api_key_id": None,
+    }

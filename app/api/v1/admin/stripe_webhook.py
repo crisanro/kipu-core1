@@ -103,48 +103,46 @@ async def stripe_webhook(request: Request):
             """), {"eid": emisor_id})
             emisor = res_emisor.fetchone()
 
-            # ── 4. Emitir factura electrónica ──────────────────────────────────
-            if emisor and emisor.ws_establecimiento and emisor.ws_punto_emision:
+            # ── 4. Emitir factura desde Kipu hacia el cliente ─────────────────────────────
+            if emisor and settings.KIPU_EMISOR_ID and settings.KIPU_ESTABLECIMIENTO and settings.KIPU_PUNTO_EMISION:
                 try:
-                    # Precio sin IVA
                     subtotal = round(monto / (1 + settings.IVA_RATE), 2)
 
                     factura_data = {
-                        "establecimiento": emisor.ws_establecimiento,
-                        "punto_emision":   emisor.ws_punto_emision,
+                        "establecimiento": settings.KIPU_ESTABLECIMIENTO,
+                        "punto_emision":   settings.KIPU_PUNTO_EMISION,
                         "cliente": {
-                            "tipo_id":       "04",
-                            "nombre":        emisor.razon_social,
+                            "tipo_id":        "04",
+                            "nombre":         emisor.razon_social,
                             "identificacion": emisor.ruc,
-                            "email":         emisor.email,
+                            "email":          emisor.email,
                         },
                         "items": [{
-                            "descripcion":    f"Recarga de {cantidad} créditos de emisión — Kipu",
-                            "cantidad":       1,
+                            "descripcion":     f"Recarga de {cantidad} créditos de emisión — Kipu",
+                            "cantidad":        1,
                             "precio_unitario": subtotal,
-                            "tipo_iva":       "15",
+                            "tipo_iva":        "15",
                         }],
                         "pagos": [{
-                            "forma_pago": "16",  # 16 = tarjeta de crédito
+                            "forma_pago": "16",
                             "total":      monto,
                         }],
                         "campos_adicionales": [
-                            {"nombre": "Plan",      "valor": f"{cantidad} créditos"},
+                            {"nombre": "Plan",       "valor": f"{cantidad} créditos"},
                             {"nombre": "Referencia", "valor": payment_id[:20]},
                         ],
                     }
 
                     result = await emitir_factura_core(
                         factura_data = factura_data,
-                        emisor_id    = emisor_id,
+                        emisor_id    = settings.KIPU_EMISOR_ID,  # ← tu RUC
                         db           = db,
                         api_key_id   = None,
-                        unlimited    = True,  # ← no consumir créditos por esta factura
+                        unlimited    = True,                      # ← sin descuento
                     )
                     print(f"[Stripe] 🧾 Factura emitida: {result.get('secuencial', '?')}")
 
                 except Exception as e:
-                    # No crítico — los créditos ya fueron acreditados
                     print(f"[Stripe] ⚠️ Error emitiendo factura: {e}")
             else:
                 print(f"[Stripe] ⚠️ Emisor sin estructura configurada — factura omitida")
