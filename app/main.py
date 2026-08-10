@@ -13,6 +13,7 @@ import app.core.firebase
 
 # Workers
 from app.workers.sri_worker import iniciar_workers
+from app.workers.declaraciones_worker import iniciar_worker_declaraciones
 
 # Routers
 from app.api.v1.app import (
@@ -21,6 +22,7 @@ from app.api.v1.app import (
     estructura as estructura_app,
     clientes as clientes_app,
     invoices as invoices_app,
+    declaraciones as declaraciones_app,
     dashboard as dashboard_app,
     apikeys as apikeys_app,
     catalogo as catalogo_app,
@@ -28,38 +30,37 @@ from app.api.v1.app import (
     notificaciones as notificaciones_app,
     productos as productos_app,
     usuarios as usuarios_app,
-    notas_credito as notas_credito_app, 
+    notas_credito as notas_credito_app,
     creditos as creditos_app
 )
-
 from app.api.v1.public import (
     clientes as clientes_public,
     integraciones as integraciones_public,
     invoices as invoices_public,
 )
-
 from app.api.v1.admin import (
     integraciones as integraciones_n8n,
 )
 
 # ─── LIFESPAN ─────────────────────────────────────────────────────────────────
-_worker_task: asyncio.Task | None = None
+_worker_task:        asyncio.Task | None = None
+_declaraciones_task: asyncio.Task | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _worker_task
-    # Arranca workers como background task — no bloquea el startup
-    _worker_task = asyncio.create_task(iniciar_workers())
-    print("🚀 Workers del SRI iniciados (event-driven).")
+    global _worker_task, _declaraciones_task
+    _worker_task        = asyncio.create_task(iniciar_workers())
+    _declaraciones_task = asyncio.create_task(iniciar_worker_declaraciones())
+    print("🚀 Workers iniciados.")
     yield
-    # Shutdown limpio
-    if _worker_task and not _worker_task.done():
-        _worker_task.cancel()
-        try:
-            await _worker_task
-        except asyncio.CancelledError:
-            pass
-    print("💤 Workers del SRI detenidos.")
+    for task in [_worker_task, _declaraciones_task]:
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    print("💤 Workers detenidos.")
 
 # ─── APP ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -74,7 +75,6 @@ app = FastAPI(
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
-
     schema = get_openapi(
         title="Kipu Core API",
         version="2.0.0",
@@ -83,8 +83,8 @@ def custom_openapi():
     )
     schema["components"]["securitySchemes"] = {
         "BearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
+            "type":        "http",
+            "scheme":      "bearer",
             "bearerFormat": "JWT",
             "description": "Token Firebase — cópialo desde la app web"
         }
@@ -94,7 +94,6 @@ def custom_openapi():
             continue
         for method in path_item.values():
             method["security"] = [{"BearerAuth": []}]
-
     app.openapi_schema = schema
     return app.openapi_schema
 
@@ -133,9 +132,9 @@ async def set_body(request: Request, body: bytes):
 @app.middleware("http")
 async def log_request_data_and_time(request: Request, call_next):
     start_time = time.time()
-    body = await request.body()
+    body       = await request.body()
     await set_body(request, body)
-    response = await call_next(request)
+    response   = await call_next(request)
 
     data_log = "Ninguno"
     if request.query_params:
@@ -155,46 +154,40 @@ async def log_request_data_and_time(request: Request, call_next):
     return response
 
 # ─── RUTAS ────────────────────────────────────────────────────────────────────
-
-# App Web & Mobile (Firebase Auth)
-app.include_router(auth_app.router,           prefix="/api/v1/app/auth",           tags=["📱 App - Auth & Nuke"])
-app.include_router(emisor_app.router,         prefix="/api/v1/app/emisor",         tags=["📱 App - Emisor & Config"])
-app.include_router(estructura_app.router,     prefix="/api/v1/app/estructura",     tags=["📱 App - Estructura"])
-app.include_router(productos_app.router,      prefix="/api/v1/app/productos",      tags=["📱 App - Productos"])
-app.include_router(usuarios_app.router,       prefix="/api/v1/app/usuarios",       tags=["📱 App - Usuarios"])
-app.include_router(clientes_app.router,       prefix="/api/v1/app/clientes",       tags=["📱 App - Clientes"])
-app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",       tags=["📱 App - Facturación"])
-app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",      tags=["📱 App - Dashboard"])
-app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",        tags=["📱 App - API Keys"])
-app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",       tags=["📱 App - Catálogo"])
+app.include_router(auth_app.router,           prefix="/api/v1/app/auth",             tags=["📱 App - Auth & Nuke"])
+app.include_router(emisor_app.router,         prefix="/api/v1/app/emisor",           tags=["📱 App - Emisor & Config"])
+app.include_router(estructura_app.router,     prefix="/api/v1/app/estructura",       tags=["📱 App - Estructura"])
+app.include_router(productos_app.router,      prefix="/api/v1/app/productos",        tags=["📱 App - Productos"])
+app.include_router(usuarios_app.router,       prefix="/api/v1/app/usuarios",         tags=["📱 App - Usuarios"])
+app.include_router(clientes_app.router,       prefix="/api/v1/app/clientes",         tags=["📱 App - Clientes"])
+app.include_router(invoices_app.router,       prefix="/api/v1/app/invoices",         tags=["📱 App - Facturación"])
+app.include_router(dashboard_app.router,      prefix="/api/v1/app/dashboard",        tags=["📱 App - Dashboard"])
+app.include_router( declaraciones_app.router, prefix="/api/v1/app/declaraciones", tags=["📱 App - Declaraciones"] )
+app.include_router(apikeys_app.router,        prefix="/api/v1/app/apikeys",          tags=["📱 App - API Keys"])
+app.include_router(catalogo_app.router,       prefix="/api/v1/app/catalogo",         tags=["📱 App - Catálogo"])
 app.include_router(recibidas_app.router,      prefix="/api/v1/app/invoices/received", tags=["📱 App - Facturas Recibidas"])
-app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones", tags=["📱 App - Notificaciones"])
-app.include_router(creditos_app.router,       prefix="/api/v1/app/creditos",       tags=["📱 App - Créditos"])
-app.include_router(notas_credito_app.router,  prefix="/api/v1/app/notas-credito",  tags=["📱 App - Notas de Crédito"])
+app.include_router(notificaciones_app.router, prefix="/api/v1/app/notificaciones",    tags=["📱 App - Notificaciones"])
+app.include_router(creditos_app.router,       prefix="/api/v1/app/creditos",         tags=["📱 App - Créditos"])
+app.include_router(notas_credito_app.router,  prefix="/api/v1/app/notas-credito",    tags=["📱 App - Notas de Crédito"])
 
-# API Pública (API Key Auth)
 app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones", tags=["🌍 API Facturación"])
 app.include_router(invoices_public.router,       prefix="/api/v1/public",              tags=["🌍 API Facturación"])
 app.include_router(clientes_public.router,       prefix="/api/v1/public/clientes",      tags=["🌍 API Facturación"])
 
-# Admin / n8n (Headers Internos)
 app.include_router(integraciones_n8n.router, prefix="/api/v1/admin", tags=["🤖 n8n Automations - Core"])
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 async def root():
     return {
-        "status":  "Kipu API is running! 🚀",
-        "docs":    "Visita /docs para la documentación interactiva."
+        "status": "Kipu API is running! 🚀",
+        "docs":   "Visita /docs para la documentación interactiva."
     }
 
 # ─── OPENAPI PÚBLICO PARA CLIENTES ────────────────────────────────────────────
-@app.get("/api-docs", include_in_schema=False, tags=["Health"])
+@app.get("/api-docs", include_in_schema=False)
 async def openapi_publico():
-    """OpenAPI limpio — solo endpoints para clientes externos (API Key)"""
-    from fastapi.openapi.utils import get_openapi
     from fastapi.responses import JSONResponse
-
     schema = get_openapi(
         title="Kipu — API de Facturación Electrónica",
         version="2.0.0",
@@ -204,7 +197,6 @@ async def openapi_publico():
 Integra facturación electrónica SRI en tu sistema en minutos.
 
 ## Autenticación
-Todos los endpoints requieren tu API Key en el header:
 X-Api-Key: tu_api_key_aqui
 Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https://app.kipu.ec).
 
@@ -213,15 +205,9 @@ Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https:/
 2. **Emitir factura** → `POST /api/v1/public/integraciones/invoice`
 3. **Descargar PDF** → `GET /api/v1/public/pdf/{clave_acceso}`
 4. **Descargar XML** → `GET /api/v1/public/xml/{clave_acceso}`
-
-## Ambientes
-- **Pruebas**: Las facturas van al SRI en ambiente de pruebas — no tienen validez fiscal.
-- **Producción**: Facturas reales autorizadas por el SRI.
 """,
         routes=app.routes,
     )
-
-    # ── Solo rutas públicas para clientes ─────────────────────────────────────
     rutas_publicas = {
         "/api/v1/public/integraciones/validate",
         "/api/v1/public/integraciones/status",
@@ -232,47 +218,26 @@ Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https:/
         "/api/v1/public/clientes/buscar",
         "/api/v1/public/clientes/{identificacion}",
     }
-    schema["paths"] = {
-        k: v for k, v in schema["paths"].items()
-        if k in rutas_publicas
-    }
-
-    # ── Solo ApiKeyAuth ────────────────────────────────────────────────────────
+    schema["paths"] = {k: v for k, v in schema["paths"].items() if k in rutas_publicas}
     schema["components"]["securitySchemes"] = {
         "ApiKeyAuth": {
-            "type":        "apiKey",
-            "in":          "header",
-            "name":        "X-Api-Key",
-            "description": "API Key obtenida desde Configuración → API Keys en app.kipu.ec"
+            "type": "apiKey", "in": "header", "name": "X-Api-Key",
+            "description": "API Key desde Configuración → API Keys en app.kipu.ec"
         }
     }
-
-    # ── Aplicar seguridad y limpiar tags ──────────────────────────────────────
     for path, path_item in schema["paths"].items():
         for method_data in path_item.values():
             method_data["security"] = [{"ApiKeyAuth": []}]
-            # Tags legibles
-            if "integraciones" in path:
-                method_data["tags"] = ["🧾 Facturación"]
-            elif "clientes" in path:
-                method_data["tags"] = ["👥 Clientes"]
-            elif "pdf" in path or "xml" in path:
-                method_data["tags"] = ["📄 Documentos"]
-
-    # ── Solo schemas necesarios ────────────────────────────────────────────────
+            if "integraciones" in path:              method_data["tags"] = ["🧾 Facturación"]
+            elif "clientes" in path:                method_data["tags"] = ["👥 Clientes"]
+            elif "pdf" in path or "xml" in path:    method_data["tags"] = ["📄 Documentos"]
     schemas_necesarios = {
-        "ValidatePuntoRequest",
-        "ClienteCreate",
-        "ClienteBusquedaMasiva",
-        "ClienteFactura",
-        "ItemFactura",
-        "PagoFactura",
-        "HTTPValidationError",
-        "ValidationError",
+        "ValidatePuntoRequest", "ClienteCreate", "ClienteBusquedaMasiva",
+        "ClienteFactura", "ItemFactura", "PagoFactura",
+        "HTTPValidationError", "ValidationError",
     }
     schema["components"]["schemas"] = {
         k: v for k, v in schema["components"]["schemas"].items()
         if k in schemas_necesarios
     }
-
     return JSONResponse(content=schema)

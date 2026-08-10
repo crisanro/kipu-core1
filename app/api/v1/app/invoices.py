@@ -1,6 +1,7 @@
 # app/api/v1/app/invoices.py — CON IDEMPOTENCY KEY
 from typing import Optional
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -51,3 +52,51 @@ async def historial_facturas(
     return await obtener_historial_core(
         auth_data["emisor_id"], db, fecha_inicio, fecha_fin
     )
+
+
+@router.post("/{factura_id}/reintentar", summary="Reintentar envío al SRI")
+async def reintentar_factura(
+    factura_id: str,
+    auth_data:  dict        = Depends(verify_firebase_token),
+    db:         AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="EMISOR NO VINCULADO.")
+
+    # Verificar que la factura existe, pertenece al emisor y está en estado reintentable
+    res = await db.execute(text("""
+        SELECT id, estado, clave_acceso FROM invoices_emitidas
+        WHERE id = :id AND emisor_id = :eid
+    """), {"id": factura_id, "eid": emisor_id})
+    factura = res.fetchone()
+
+    if not factura:
+        raise HTTPException(status_code=404, detail="Factura no encontrada.")
+
+    if factura.estado not in ("DEVUELTA", "RECHAZADO", "FIRMADO"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede reintentar una factura en estado {factura.estado}."
+        )
+
+    # Resetear estado a FIRMADO y encolar de nuevo
+    await db.execute(text("""
+        UPDATE invoices_emitidas
+        SET estado = 'FIRMADO', mensajes_sri = NULL, updated_at = NOW()
+        WHERE id = :id AND emisor_id = :eid
+    """), {"id": factura_id, "eid": emisor_id})
+    await db.commit()
+
+    # Encolar
+    from app.core.cache import get_redis
+    redis = await get_redis()
+    await redis.lpush("kipu:queue:emision", str(factura_id))
+
+    print(f"[Reintento] 🔄 {factura.clave_acceso} → reencola")
+
+    return {
+        "ok":      True,
+        "mensaje": "Factura reencolada para reintento.",
+        "estado":  "FIRMADO",
+    }

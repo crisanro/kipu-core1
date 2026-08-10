@@ -402,6 +402,7 @@ async def update_config(
 
 
 # ── POST /produccion ───────────────────────────────────────────────────────────
+# ── POST /produccion ───────────────────────────────────────────────────────────
 @router.post("/produccion", summary="Activar ambiente de producción")
 async def activar_produccion(
     pin:       str,
@@ -429,11 +430,11 @@ async def activar_produccion(
     await validar_y_quemar_pin(db, emisor_id, pin, "ACTIVAR_PRODUCCION")
 
     try:
-        # Limpiar facturas de prueba
+        # 1. Limpiar facturas de prueba
         await db.execute(text("DELETE FROM invoices_emitidas WHERE emisor_id = :eid"), {"eid": emisor_id})
         await db.execute(text("UPDATE puntos_emision SET secuencial_actual = 0 WHERE emisor_id = :eid"), {"eid": emisor_id})
 
-        # Bono de bienvenida a producción
+        # 2. Bono de bienvenida a producción
         await db.execute(text("""
             UPDATE user_credits
             SET balance_emision = 25, balance_recepcion = 0, last_updated = NOW()
@@ -444,19 +445,48 @@ async def activar_produccion(
             VALUES (:eid, 'BONO', 25, 0.00, 'SISTEMA', 'BONO DE BIENVENIDA A PRODUCCIÓN')
         """), {"eid": emisor_id})
 
-        # Activar producción
+        # 3. Activar producción
         await db.execute(text("UPDATE emisores SET ambiente = 2, updated_at = NOW() WHERE id = :eid"), {"eid": emisor_id})
+
+        # 4. Crear declaración del mes actual
+        hoy            = date.today()
+        periodo_inicio = date(hoy.year, hoy.month, 1)
+        await db.execute(text("""
+            INSERT INTO declaraciones_sri (emisor_id, tipo, periodo, declarado)
+            VALUES (:eid, '104', :periodo, false)
+            ON CONFLICT (emisor_id, tipo, periodo) DO NOTHING
+        """), {"eid": emisor_id, "periodo": periodo_inicio})
+
+        # COMMIT ÚNICO DE TODO EL PROCESO
         await db.commit()
         await invalidate_emisor(emisor_id)
 
+        # Notificar bienvenida a producción
+        try:
+            from app.services.notification_service import crear_notificacion
+            from calendar import monthrange
+            from app.workers.declaraciones_worker import calcular_vencimiento
+            vencimiento = calcular_vencimiento(emisor.ruc, periodo_inicio)
+            await crear_notificacion(
+                db        = db,
+                emisor_id = emisor_id,
+                tipo      = "SISTEMA",
+                titulo    = "🎉 ¡Bienvenido a Producción!",
+                mensaje   = f"Tu cuenta está lista. Tienes 25 créditos y tu primera declaración vence el {vencimiento.strftime('%d de %B')}.",
+                referencia = "/dashboard",
+            )
+        except Exception as e:
+            print(f"[PRODUCCION] ⚠️ No se pudo notificar: {e}")
+
     except HTTPException:
+        await db.rollback()
         raise
     except Exception as e:
         await db.rollback()
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL ACTIVAR PRODUCCIÓN.")
 
-    # Limpiar R2 (no crítico)
+    # Limpiar R2 (operación I/O fuera de la transacción SQL)
     try:
         delete_folder(f"{emisor.ruc}/facturas/")
         print(f"[PRODUCCION] 🗑️ R2 limpiado para RUC: {emisor.ruc}")
