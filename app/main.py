@@ -388,10 +388,16 @@ async def validar_cloudflare(request: Request, call_next):
     if not getattr(settings, "CLOUDFLARE_ONLY", False):
         return await call_next(request)
 
-    ip_servidor = request.client.host if request.client else ""
+    # IP real del cliente — Cloudflare la pone en CF-Connecting-IP
+    cf_ip = request.headers.get("cf-connecting-ip", "")
 
-    if not es_ip_cloudflare(ip_servidor):
-        print(f"[CF] ⛔ Bloqueado — IP no Cloudflare: {ip_servidor}")
+    # Si no viene CF-Connecting-IP no pasó por Cloudflare
+    if not cf_ip:
+        # Verificar si viene de red interna (Traefik/Docker)
+        ip_servidor = request.client.host if request.client else ""
+        if es_ip_cloudflare(ip_servidor):
+            return await call_next(request)
+        print(f"[CF] ⛔ Sin CF-Connecting-IP — IP servidor: {ip_servidor}")
         return JSONResponse(
             status_code = 403,
             content     = {"error": "Acceso no autorizado."}
