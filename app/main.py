@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import time
 from datetime import datetime
@@ -7,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.openapi.docs import get_swagger_ui_html  # ← Importante para /api-docs
 from contextlib import asynccontextmanager
 from starlette.responses import Response as StarResponse
 from app.core.cloudflare import es_ip_cloudflare
@@ -86,18 +86,24 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 # APP
 # =============================================================================
+ES_PRODUCCION = getattr(settings, "ENVIRONMENT", "development") == "production"
 
 app = FastAPI(
-    title          = "Kipu Core API",
-    description    = "Backend de facturación electrónica SRI Ecuador",
-    version        = "3.0.0",
-    lifespan       = lifespan,
+    title            = "Kipu Core API",
+    description      = "Backend de facturación electrónica SRI Ecuador",
+    version          = "3.0.0",
+    lifespan         = lifespan,
     redirect_slashes = False,
+    
+    # 🔒 En producción desactiva la documentación completa e interna
+    docs_url         = None if ES_PRODUCCION else "/docs",
+    redoc_url        = None if ES_PRODUCCION else "/redoc",
+    openapi_url      = None if ES_PRODUCCION else "/openapi.json",
 )
 
 
 # =============================================================================
-# OPENAPI PERSONALIZADO
+# OPENAPI PERSONALIZADO (INTERNO / FULL)
 # =============================================================================
 
 def custom_openapi():
@@ -288,7 +294,7 @@ async def log_y_alertas(request: Request, call_next):
     response.headers["X-Process-Time-Ms"] = str(round(process_time_ms, 2))
 
     if getattr(settings, "ALERT_EMAIL_ERRORS", False) and status >= 400:
-        rutas_ignoradas = {"/", "/docs", "/openapi.json", "/api-docs", "/redoc", "/favicon.ico", "/api/v1/public/openapi-public",}
+        rutas_ignoradas = {"/", "/docs", "/openapi.json", "/api-docs", "/openapi-public.json", "/redoc", "/favicon.ico"}
         if path not in rutas_ignoradas and not path.startswith("/wp-"):
             if await _puede_alertar(path, status):
                 resp_body_bytes = b""
@@ -296,10 +302,10 @@ async def log_y_alertas(request: Request, call_next):
                     async for chunk in response.body_iterator:
                         resp_body_bytes += chunk
                     response = StarResponse(
-                        content    = resp_body_bytes,
+                        content     = resp_body_bytes,
                         status_code = status,
-                        headers    = dict(response.headers),
-                        media_type = response.media_type,
+                        headers     = dict(response.headers),
+                        media_type  = response.media_type,
                     )
                 except Exception as e:
                     print(f"[Alert] ⚠️ No se pudo leer body: {e}")
@@ -351,7 +357,7 @@ app.include_router(clientes_app.router,      prefix="/api/v1/app/clientes",     
 app.include_router(productos_app.router,     prefix="/api/v1/app/productos",               tags=["📱 Productos"])
 app.include_router(catalogo_app.router,      prefix="/api/v1/app/catalogo",                tags=["📱 Catálogo"])
 app.include_router(documentos_app.router,    prefix="/api/v1/app/documentos",              tags=["📱 Documentos Emitidos"])
-app.include_router(recibidas_app.router, prefix="/api/v1/app/recibidos", tags=["📱 Documentos Recibidos"])
+app.include_router(recibidas_app.router,     prefix="/api/v1/app/recibidos",               tags=["📱 Documentos Recibidos"])
 app.include_router(declaraciones_app.router, prefix="/api/v1/app/declaraciones",           tags=["📱 Declaraciones"])
 app.include_router(dashboard_app.router,     prefix="/api/v1/app/dashboard",               tags=["📱 Dashboard"])
 app.include_router(apikeys_app.router,       prefix="/api/v1/app/apikeys",                 tags=["📱 API Keys"])
@@ -360,13 +366,13 @@ app.include_router(suscripcion_app.router,   prefix="/api/v1/app/suscripcion",  
 app.include_router(creditos_app.router,      prefix="/api/v1/app/creditos",                tags=["📱 Créditos API"])
 
 # =============================================================================
-# RUTAS — PUBLIC
+# RUTAS — PUBLIC (SOLO ESTAS LLEVAN "public_export")
 # =============================================================================
 
-app.include_router(documentos_public.router,    prefix="/api/v1/public",                  tags=["🌍 Documentos Públicos"])
-app.include_router(clientes_public.router,      prefix="/api/v1/public/clientes",         tags=["🌍 Clientes"])
-app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones",    tags=["🌍 API Externa"])
-app.include_router(dev_docs_public.router,      prefix="/api/v1/public",               tags=["📖 Dev Docs"])  # ← AGREGAR ESTO
+app.include_router(documentos_public.router,    prefix="/api/v1/public",                  tags=["🌍 Documentos Públicos", "public_export"])
+app.include_router(clientes_public.router,      prefix="/api/v1/public/clientes",         tags=["🌍 Clientes", "public_export"])
+app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones",    tags=["🌍 API Externa", "public_export"])
+app.include_router(dev_docs_public.router,      prefix="/api/v1/public",                  tags=["📖 Dev Docs"])
 
 # =============================================================================
 # RUTAS — ADMIN
@@ -384,28 +390,37 @@ app.include_router(stripe_webhook.router,      prefix="/api/v1/admin/stripe",  t
 @app.get("/", tags=["Health"])
 async def root():
     return {
-        "status":  "Kipu API v3.0 🚀",
-        "docs":    "/docs",
+        "status":   "Kipu API v0.1.0 🚀",
         "api_docs": "/api-docs",
     }
 
 
 # =============================================================================
-# OPENAPI PÚBLICO PARA CLIENTES API
+# DOCUMENTACIÓN PÚBLICA DE SWAGGER Y ESQUEMA OPENAPI
 # =============================================================================
 
 @app.get("/api-docs", include_in_schema=False)
+async def swagger_publico():
+    """Renderiza la interfaz visual de Swagger UI para desarrolladores externos."""
+    return get_swagger_ui_html(
+        openapi_url="/openapi-public.json",
+        title="Kipu — Documentación Pública API",
+        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+    )
+
+
+@app.get("/openapi-public.json", include_in_schema=False)
 async def openapi_publico():
+    """Genera el JSON de OpenAPI filtrando NADA por defecto, salvo lo etiquetado."""
     schema = get_openapi(
-        title       = "Kipu — API de Facturación Electrónica",
-        version     = "3.0.0",
-        description = """
-# Kipu API — Facturación Electrónica Ecuador
+        title="Kipu — API de Facturación Electrónica",
+        version="0.1.0",
+        description="""
 
 Integra facturación electrónica SRI en tu sistema en minutos.
 
 ## Autenticación
-X-Api-Key: tu_api_key_aqui
+`X-Api-Key: tu_api_key_aqui`  
 Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https://app.kipu.ec).
 
 ## Flujo básico
@@ -414,45 +429,42 @@ Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https:/
 3. **PDF** → `GET /api/v1/public/pdf/{clave_acceso}`
 4. **XML** → `GET /api/v1/public/xml/{clave_acceso}`
         """,
-        routes = app.routes,
+        routes=app.routes,
     )
 
-    rutas_publicas = {
-        "/api/v1/public/integraciones/validate",
-        "/api/v1/public/integraciones/status",
-        "/api/v1/public/integraciones/invoice",
-        "/api/v1/public/pdf/{clave_acceso}",
-        "/api/v1/public/xml/{clave_acceso}",
-        "/api/v1/public/clientes/",
-        "/api/v1/public/clientes/buscar",
-        "/api/v1/public/clientes/{identificacion}",
-    }
+    paths_publicos = {}
 
-    schema["paths"] = {k: v for k, v in schema["paths"].items() if k in rutas_publicas}
+    # Por defecto NADA se muestra
+    for path, path_item in schema.get("paths", {}).items():
+        metodos_filtrados = {}
+
+        for method, operation in path_item.items():
+            tags = operation.get("tags", [])
+
+            # REGLA: Si NO tiene la etiqueta 'public_export', SE IGNORA POR COMPLETO
+            if "public_export" in tags:
+                # Removemos la etiqueta 'public_export' para que no ensucie la UI
+                operation["tags"] = [t for t in tags if t != "public_export"]
+                
+                # Asignamos la seguridad con API Key
+                operation["security"] = [{"ApiKeyAuth": []}]
+                
+                metodos_filtrados[method] = operation
+
+        if metodos_filtrados:
+            paths_publicos[path] = metodos_filtrados
+
+    # Reemplazamos todos los paths por ÚNICAMENTE los aprobados
+    schema["paths"] = paths_publicos
+
+    # Configuración de Seguridad global
     schema["components"]["securitySchemes"] = {
         "ApiKeyAuth": {
-            "type":        "apiKey",
-            "in":          "header",
-            "name":        "X-Api-Key",
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Api-Key",
             "description": "API Key desde Configuración → API Keys en app.kipu.ec",
         }
-    }
-
-    for path, path_item in schema["paths"].items():
-        for method_data in path_item.values():
-            method_data["security"] = [{"ApiKeyAuth": []}]
-            if "integraciones" in path:          method_data["tags"] = ["🧾 Facturación"]
-            elif "clientes" in path:             method_data["tags"] = ["👥 Clientes"]
-            elif "pdf" in path or "xml" in path: method_data["tags"] = ["📄 Documentos"]
-
-    schemas_necesarios = {
-        "ValidatePuntoRequest", "ClienteCreate", "ClienteBusquedaMasiva",
-        "ClienteFactura", "ItemFactura", "PagoFactura",
-        "HTTPValidationError", "ValidationError",
-    }
-    schema["components"]["schemas"] = {
-        k: v for k, v in schema["components"]["schemas"].items()
-        if k in schemas_necesarios
     }
 
     return JSONResponse(content=schema)
