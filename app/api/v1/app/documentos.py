@@ -6,7 +6,7 @@
 # Tipos soportados: FAC | LIQ | NCR | NDB | RET
 
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
@@ -106,20 +106,26 @@ class ActualizarCobro(BaseModel):
 
 @router.post("/emit/{tipo_doc}", summary="Emitir comprobante electrónico")
 async def emitir_documento(
-    tipo_doc:   str,
-    data:       EmitirDocumentoRequest,
-    auth_data:  dict         = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db),
-    _rl:        None         = Depends(RateLimit(RateLimitScope.INVOICE)),
-    x_idempotency_key: Optional[str] = None,
+    tipo_doc:          str,
+    data:              EmitirDocumentoRequest,
+    auth_data:         dict         = Depends(verify_firebase_token),
+    db:                AsyncSession = Depends(get_db),
+    _rl:               None         = Depends(RateLimit(RateLimitScope.INVOICE)),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),  # ← agregar alias
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
+    # Idempotency obligatoria
+    if not x_idempotency_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Se requiere el header X-Idempotency-Key. Usa un UUID v4 único por comprobante."
+        )
+
     tipo_doc = tipo_doc.upper()
 
-    # Idempotencia
     cached = await verificar_idempotency(emisor_id, x_idempotency_key)
     if cached:
         return cached

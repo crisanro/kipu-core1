@@ -48,6 +48,7 @@ from app.api.v1.public import (
     clientes      as clientes_public,
     integraciones as integraciones_public,
     documentos    as documentos_public,
+    dev_docs      as dev_docs_public,
 )
 
 # ─── ROUTERS ADMIN ────────────────────────────────────────────────────────────
@@ -287,7 +288,7 @@ async def log_y_alertas(request: Request, call_next):
     response.headers["X-Process-Time-Ms"] = str(round(process_time_ms, 2))
 
     if getattr(settings, "ALERT_EMAIL_ERRORS", False) and status >= 400:
-        rutas_ignoradas = {"/", "/docs", "/openapi.json", "/api-docs", "/redoc", "/favicon.ico"}
+        rutas_ignoradas = {"/", "/docs", "/openapi.json", "/api-docs", "/redoc", "/favicon.ico", "/api/v1/public/openapi-public",}
         if path not in rutas_ignoradas and not path.startswith("/wp-"):
             if await _puede_alertar(path, status):
                 resp_body_bytes = b""
@@ -365,6 +366,7 @@ app.include_router(creditos_app.router,      prefix="/api/v1/app/creditos",     
 app.include_router(documentos_public.router,    prefix="/api/v1/public",                  tags=["🌍 Documentos Públicos"])
 app.include_router(clientes_public.router,      prefix="/api/v1/public/clientes",         tags=["🌍 Clientes"])
 app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones",    tags=["🌍 API Externa"])
+app.include_router(dev_docs_public.router,      prefix="/api/v1/public",               tags=["📖 Dev Docs"])  # ← AGREGAR ESTO
 
 # =============================================================================
 # RUTAS — ADMIN
