@@ -605,12 +605,13 @@ class AuthChallenge(Base):
     email           = Column(Text, nullable=False)
     whatsapp_number = Column(String(20))
     pin             = Column(String(10), nullable=False)
-    tipo_accion     = Column(String(30), nullable=False)            # LOGIN | CAMBIO_EMAIL | NUKE
+    tipo_accion     = Column(String(30), nullable=False)  # LOGIN | CAMBIO_EMAIL | NUKE | CREAR_TOKEN | ELIMINAR_TOKEN | ACTIVAR_PRODUCCION
+    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=True)  # ← agregar
     extra_data      = Column(JSONB)
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=False)
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
-
+    
 class EmailRateLimit(Base):
     """Anti-spam para envío de correos."""
     __tablename__ = "email_rate_limits"

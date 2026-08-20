@@ -19,7 +19,7 @@ async def verify_api_key(
     
     # Consultar DB
     query = text("""
-        SELECT id, emisor_id, nombre, unlimited 
+        SELECT id, emisor_id, nombre
         FROM api_keys 
         WHERE key_hash = :hash AND revoked = false
     """)
@@ -37,7 +37,7 @@ async def verify_api_key(
     return {
         "emisor_id":  key_data.emisor_id,
         "api_key_id": key_data.id,
-        "unlimited":  key_data.unlimited,
+        "unlimited":  False,
         "role":       "external_app",
         "app_name":   key_data.nombre
     }
@@ -139,11 +139,10 @@ async def verify_whatsapp_service(
 
 
 async def validar_y_quemar_pin(db: AsyncSession, emisor_id: int, pin: str, tipo_accion: str):
-    """Busca el PIN en auth_challenges. Si es válido, lo elimina. Si no, lanza 403."""
     query = text("""
         DELETE FROM auth_challenges
         WHERE emisor_id = :eid
-          AND pin = :pin
+          AND pin       = :pin
           AND tipo_accion = :tipo
           AND expires_at > NOW()
         RETURNING id

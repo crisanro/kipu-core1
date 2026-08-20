@@ -176,14 +176,15 @@ async def request_pin(
         pin = f"{random.randint(100000, 999999)}"
         await db.execute(text("""
             INSERT INTO auth_challenges
-                (email, pin, tipo_accion, extra_data, expires_at)
+                (email, pin, tipo_accion, emisor_id, extra_data, expires_at)
             VALUES
-                (:email, :pin, :tipo, CAST(:meta AS jsonb), NOW() + INTERVAL '10 minutes')
+                (:email, :pin, :tipo, :emisor_id, CAST(:meta AS jsonb), NOW() + INTERVAL '10 minutes')
         """), {
-            "email": user.email,
-            "pin":   pin,
-            "tipo":  data.tipo_accion,
-            "meta":  json.dumps(data.metadata) if hasattr(data, "metadata") and data.metadata else "{}",
+            "email":    user.email,
+            "pin":      pin,
+            "tipo":     data.tipo_accion,
+            "emisor_id": user.emisor_id,  # ← agregar
+            "meta":     json.dumps(data.metadata) if hasattr(data, "metadata") and data.metadata else "{}",
         })
         await db.commit()
 

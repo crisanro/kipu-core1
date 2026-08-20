@@ -75,8 +75,8 @@ async def crear_api_key(
     key_prefix = raw_key[:8]  # Primeros caracteres para identificación/auditoría
 
     await db.execute(text("""
-        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, unlimited, revoked)
-        VALUES (:eid, :nombre, :hash, :prefix, false, false)
+        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, revoked)
+        VALUES (:eid, :nombre, :hash, :prefix, false)
     """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash, "prefix": key_prefix})
 
     await db.commit()
