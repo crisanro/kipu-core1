@@ -24,10 +24,9 @@ async def listar_api_keys(
     emisor_id = auth_data.get("emisor_id")
     try:
         res = await db.execute(text("""
-            SELECT id, nombre, tipo, revoked, created_at, last_used_at
+            SELECT id, nombre, revoked, created_at, last_used_at
             FROM api_keys
             WHERE emisor_id = :eid
-              AND tipo = 'external'
             ORDER BY created_at DESC
         """), {"eid": emisor_id})
         keys = res.fetchall()
@@ -35,7 +34,6 @@ async def listar_api_keys(
             {
                 "id":           k.id,
                 "nombre":       k.nombre,
-                "tipo":         k.tipo,
                 "estado":       "activa" if not k.revoked else "revocada",
                 "created_at":   k.created_at,
                 "last_used_at": k.last_used_at
@@ -59,7 +57,7 @@ async def crear_api_key(
     # Verificar límite de keys activas
     res_count = await db.execute(text("""
         SELECT COUNT(*) FROM api_keys
-        WHERE emisor_id = :eid AND revoked = false AND tipo = 'external'
+        WHERE emisor_id = :eid AND revoked = false
     """), {"eid": emisor_id})
     total = res_count.scalar()
     if total >= MAX_API_KEYS:
@@ -72,17 +70,16 @@ async def crear_api_key(
     await validar_y_quemar_pin(db, emisor_id, data.pin, "CREAR_TOKEN")
 
     # Generar key
-    # Generar key
     raw_key    = f"kp_live_{secrets.token_urlsafe(32)}"
     key_hash   = hashlib.sha256(raw_key.encode()).hexdigest()
-    key_prefix = raw_key[:8]  # AGREGAR — primeros 12 chars para mostrar al usuario
+    key_prefix = raw_key[:8]  # Primeros caracteres para identificación/auditoría
 
     await db.execute(text("""
-        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, tipo, unlimited, revoked)
-        VALUES (:eid, :nombre, :hash, :prefix, 'external', false, false)
+        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, unlimited, revoked)
+        VALUES (:eid, :nombre, :hash, :prefix, false, false)
     """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash, "prefix": key_prefix})
 
-    await db.commit()  # AGREGAR ESTO
+    await db.commit()
 
     return {
         "ok":      True,
@@ -104,7 +101,7 @@ async def revocar_api_key(
     # Verificar que la key pertenece al emisor
     res = await db.execute(text("""
         SELECT id FROM api_keys
-        WHERE id = :kid AND emisor_id = :eid AND revoked = false AND tipo = 'external'
+        WHERE id = :kid AND emisor_id = :eid AND revoked = false
     """), {"kid": key_id, "eid": emisor_id})
     if not res.fetchone():
         raise HTTPException(status_code=404, detail="API Key no encontrada o ya revocada.")

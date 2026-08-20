@@ -1,3 +1,4 @@
+# app/schemas/cliente.py
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 import re
@@ -7,7 +8,6 @@ _EMAIL_REGEX   = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$
 
 
 def _validar_email(v):
-    """Helper reutilizable para validar email opcional."""
     if not v or not str(v).strip():
         return ""
     v = v.strip().lower()
@@ -17,9 +17,9 @@ def _validar_email(v):
 
 
 class ClienteCreate(BaseModel):
-    tipo_identificacion_sri: str          = Field(..., description="04=RUC, 05=Cédula, 06=Pasaporte, 08=Exterior")
-    identificacion:          str          = Field(..., min_length=3)
-    razon_social:            str          = Field(..., min_length=2)
+    tipo_identificacion_sri: str           = Field(..., description="04=RUC 05=Cédula 06=Pasaporte 08=Exterior")
+    identificacion:          str           = Field(..., min_length=3)
+    razon_social:            str           = Field(..., min_length=2)
     direccion:               Optional[str] = None
     email:                   Optional[str] = None
     telefono:                Optional[str] = None
@@ -30,7 +30,7 @@ class ClienteCreate(BaseModel):
         if not v or not str(v).strip():
             raise ValueError("El tipo de identificación es obligatorio.")
         if v not in _TIPOS_VALIDOS:
-            raise ValueError("Tipo inválido. Use: 04=RUC, 05=Cédula, 06=Pasaporte, 08=Exterior")
+            raise ValueError("Tipo inválido. Use: 04=RUC 05=Cédula 06=Pasaporte 08=Exterior")
         return v
 
     @field_validator("identificacion")
@@ -94,7 +94,7 @@ class ClienteUpdate(BaseModel):
         if not v or not str(v).strip():
             return None
         return v.strip()
-    
-    
+
+
 class ClienteBusquedaMasiva(BaseModel):
     terminos: list[str] = Field(..., description="Lista de RUCs, cédulas o UUIDs internos")

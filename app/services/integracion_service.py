@@ -1,4 +1,4 @@
-# app/services/integracion_service.py — OPTIMIZADO con cache
+# app/services/integracion_service.py
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
@@ -6,9 +6,14 @@ from datetime import datetime, timezone, date
 from app.core.cache import cache_get, cache_set, CK, TTL
 
 
-async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codigo: str, db: AsyncSession):
-    """Valida que exista la combinación establecimiento/punto. Sin cache — es una validación puntual."""
-    query = text("""
+async def validar_estructura_core(
+    emisor_id:    int,
+    estab_codigo: str,
+    punto_codigo: str,
+    db:           AsyncSession
+):
+    """Valida que exista la combinación establecimiento/punto. Sin cache."""
+    res = await db.execute(text("""
         SELECT p.id, p.secuencial_actual, e.direccion
         FROM puntos_emision p
         JOIN establecimientos e ON p.establecimiento_id = e.id
@@ -17,10 +22,9 @@ async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codig
           AND p.codigo    = :punto
           AND e.is_active = true
           AND p.is_active = true
-    """)
-    res = await db.execute(query, {"eid": emisor_id, "estab": estab_codigo, "punto": punto_codigo})
-    row = res.fetchone()
+    """), {"eid": emisor_id, "estab": estab_codigo, "punto": punto_codigo})
 
+    row = res.fetchone()
     if not row:
         raise HTTPException(
             status_code=404,
@@ -31,53 +35,50 @@ async def validar_estructura_core(emisor_id: int, estab_codigo: str, punto_codig
 
 async def obtener_status_core(emisor_id: int, db: AsyncSession):
     """
-    Resumen completo del estado del emisor para integraciones externas.
-    CON CACHE — TTL 3 min. Se invalida cuando cambia el emisor.
+    Resumen del estado del emisor para integraciones externas.
+    Cache TTL 3 min.
     """
     cache_key = CK.fmt(CK.STATUS, eid=emisor_id)
-    cached = await cache_get(cache_key)
+    cached    = await cache_get(cache_key)
     if cached:
         return cached
 
-    # OPTIMIZACIÓN: subquery de últimas facturas embebida en el SELECT principal
-    # Evita una segunda roundtrip a la DB
-    query = text("""
+    res = await db.execute(text("""
         SELECT
-            e.ruc,
-            e.razon_social,
-            e.nombre_comercial,
-            e.ambiente,
-            e.p12_expiration,
-            COALESCE(c.balance_emision, 0) AS creditos_disponibles,
+            e.ruc, e.razon_social, e.nombre_comercial, e.ambiente, e.p12_expiration,
+            COALESCE(uc.balance, 0)  AS balance_api,
+            s.estado                 AS sub_estado,
+            s.plan                   AS sub_plan,
+            s.current_period_end,
             (
                 SELECT json_agg(last_docs)
                 FROM (
                     SELECT
-                        id, fecha_emision, estado,
-                        identificacion_comprador, razon_social_comprador,
-                        importe_total AS total, clave_acceso, created_at
-                    FROM invoices_emitidas
+                        id, fecha_emision, estado_sri,
+                        importe_total, clave_acceso, numero_doc,
+                        tipo_doc, created_at
+                    FROM documentos_emitidos
                     WHERE emisor_id = e.id
+                      AND tipo_doc IN ('FAC', 'LIQ')
                     ORDER BY created_at DESC
                     LIMIT 20
                 ) last_docs
-            ) AS ultimas_facturas
+            ) AS ultimos_documentos
         FROM emisores e
-        LEFT JOIN user_credits c ON e.id = c.emisor_id
+        LEFT JOIN user_credits  uc ON uc.emisor_id = e.id
+        LEFT JOIN subscriptions s  ON s.emisor_id  = e.id
         WHERE e.id = :eid
-    """)
+    """), {"eid": emisor_id})
 
-    res = await db.execute(query, {"eid": emisor_id})
     row = res.fetchone()
-
     if not row:
-        raise HTTPException(status_code=404, detail="Emisor no encontrado")
+        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
 
     data = row._mapping
 
-    expiracion  = data["p12_expiration"]
+    # Firma
+    expiracion   = data["p12_expiration"]
     firma_valida = False
-
     if expiracion:
         if isinstance(expiracion, date) and not isinstance(expiracion, datetime):
             expiracion = datetime.combine(expiracion, datetime.min.time())
@@ -87,6 +88,10 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
 
     dias_restantes = (expiracion - datetime.now(timezone.utc)).days if expiracion else 0
 
+    # Suscripción
+    sub_estado = data["sub_estado"]
+    suscripcion_activa = sub_estado in ("ACTIVO", "TRIAL")
+
     result = {
         "ok": True,
         "emisor": {
@@ -95,13 +100,18 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             "nombre_comercial": data["nombre_comercial"],
             "ambiente":        "PRUEBAS" if data["ambiente"] == 1 else "PRODUCCIÓN",
             "firma": {
-                "valida":          firma_valida,
-                "vencimiento":     expiracion.isoformat() if expiracion else None,
-                "dias_restantes":  dias_restantes
+                "valida":         firma_valida,
+                "vencimiento":    expiracion.isoformat() if expiracion else None,
+                "dias_restantes": dias_restantes,
             },
         },
-        "creditos": data["creditos_disponibles"],
-        "historial": data["ultimas_facturas"] or [],
+        "suscripcion": {
+            "activa": suscripcion_activa,
+            "estado": sub_estado,
+            "plan":   data["sub_plan"],
+        },
+        "balance_api":  data["balance_api"],
+        "historial":    data["ultimos_documentos"] or [],
     }
 
     await cache_set(cache_key, result, TTL.STATUS_INTEGRACION)

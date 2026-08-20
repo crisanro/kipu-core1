@@ -43,18 +43,21 @@ async def listar_empresas(
     if cached:
         return cached  # ← cached ya incluye role
 
-    # ← Agregar p.role al SELECT
     res = await db.execute(text("""
         SELECT
             e.id, e.ruc, e.razon_social, e.nombre_comercial,
-            e.ambiente, e.p12_path, e.p12_expiration,
+            e.ambiente, e.p12_path, e.p12_expiration, e.tipo_emisor,
             eu.rol,
-            c.balance_emision, c.balance_recepcion,
-            p.role as profile_role
+            COALESCE(uc.balance, 0)  AS balance_api,
+            s.estado                 AS sub_estado,
+            s.plan                   AS sub_plan,
+            s.current_period_end,
+            p.role                   AS profile_role
         FROM emisor_usuarios eu
-        JOIN emisores e      ON e.id = eu.emisor_id
-        JOIN profiles p      ON p.id = eu.profile_id
-        LEFT JOIN user_credits c ON c.emisor_id = e.id
+        JOIN emisores e          ON e.id = eu.emisor_id
+        JOIN profiles p          ON p.id = eu.profile_id
+        LEFT JOIN user_credits   uc ON uc.emisor_id = e.id
+        LEFT JOIN subscriptions s  ON s.emisor_id  = e.id
         WHERE eu.profile_id = :pid
         ORDER BY e.razon_social ASC
     """), {"pid": str(profile_id)})
@@ -62,15 +65,21 @@ async def listar_empresas(
 
     data = [
         {
-            "id":               r.id,
-            "ruc":              r.ruc,
-            "razon_social":     r.razon_social,
+            "id":                 r.id,
+            "ruc":                r.ruc,
+            "razon_social":       r.razon_social,
             "nombre_comercial": r.nombre_comercial or "",
-            "ambiente":         r.ambiente,
-            "firma_ok":         bool(r.p12_path),
-            "rol":              r.rol,
-            "balance_emision":  r.balance_emision  or 0,
-            "balance_recepcion": r.balance_recepcion or 0,
+            "ambiente":           r.ambiente,
+            "tipo_emisor":        r.tipo_emisor,
+            "firma_ok":           bool(r.p12_path),
+            "rol":                r.rol,
+            "balance_api":        r.balance_api,
+            "suscripcion_activa": r.sub_estado in ("ACTIVO", "TRIAL"),
+            "suscripcion": {
+                "activa": r.sub_estado in ("ACTIVO", "TRIAL"),
+                "estado": r.sub_estado,
+                "plan":   r.sub_plan,
+            },
         }
         for r in rows
     ]
@@ -101,11 +110,13 @@ async def cambiar_empresa(
 
     # Verificar que el usuario pertenece a esa empresa
     res = await db.execute(text("""
-        SELECT eu.rol, e.ruc, e.razon_social, e.ambiente,
-               c.balance_emision, c.balance_recepcion
+        SELECT eu.rol, e.ruc, e.razon_social, e.ambiente, e.tipo_emisor,
+               COALESCE(uc.balance, 0) AS balance_api,
+               s.estado AS sub_estado, s.plan AS sub_plan
         FROM emisor_usuarios eu
-        JOIN emisores e      ON e.id = eu.emisor_id
-        LEFT JOIN user_credits c ON c.emisor_id = e.id
+        JOIN emisores e          ON e.id = eu.emisor_id
+        LEFT JOIN user_credits   uc ON uc.emisor_id = e.id
+        LEFT JOIN subscriptions s  ON s.emisor_id  = e.id
         WHERE eu.profile_id = :pid AND eu.emisor_id = :eid
     """), {"pid": str(profile_id), "eid": data.emisor_id})
     row = res.fetchone()
@@ -119,13 +130,19 @@ async def cambiar_empresa(
         "ok": True,
         "mensaje": "Empresa cambiada exitosamente.",
         "data": {
-            "emisor_id":        data.emisor_id,
-            "ruc":              row.ruc,
-            "razon_social":     row.razon_social,
-            "ambiente":         row.ambiente,
-            "rol":              row.rol,
-            "balance_emision":  row.balance_emision  or 0,
-            "balance_recepcion": row.balance_recepcion or 0,
+            "emisor_id":         data.emisor_id,
+            "ruc":               row.ruc,
+            "razon_social":      row.razon_social,
+            "ambiente":          row.ambiente,
+            "tipo_emisor":       row.tipo_emisor,
+            "rol":               row.rol,
+            "balance_api":       row.balance_api,
+            "suscripcion_activa": row.sub_estado in ("ACTIVO", "TRIAL"),
+            "suscripcion": {
+                "activa": row.sub_estado in ("ACTIVO", "TRIAL"),
+                "estado": row.sub_estado,
+                "plan":   row.sub_plan,
+            },
         }
     }
 

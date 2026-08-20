@@ -1,120 +1,184 @@
 # app/api/v1/app/creditos.py
 #
-# Endpoints para recarga de créditos via Stripe.
-# El webhook de Stripe va directo a n8n — n8n se encarga de:
-#   1. Verificar el pago
-#   2. Llamar a /admin/topup para acreditar créditos
-#   3. Emitir factura electrónica
-#   4. Enviar email de confirmación
+# Endpoints para gestión de créditos API via Stripe.
+# Los créditos son exclusivos para consumo de la API REST externa.
+# Los suscriptores no necesitan créditos para usar la app web.
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
+from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.config import settings
 from app.core.rate_limit import RateLimit, RateLimitScope
+from app.api.v1.app.suscripcion import _obtener_o_crear_customer
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
-
 router = APIRouter()
 
 
-class CheckoutRequest(BaseModel):
+# =============================================================================
+# SCHEMAS
+# =============================================================================
+
+class CheckoutCreditosRequest(BaseModel):
     plan_id: int
 
 
-@router.post("/stripe/checkout", summary="Crear sesión de pago Stripe")
-async def crear_checkout(
-    data: CheckoutRequest,
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
+@router.get("/balance", summary="Balance actual de créditos API")
+async def balance_creditos(
     auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db),
-    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
+    db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
-        raise HTTPException(status_code=400, detail="El usuario no tiene una empresa vinculada.")
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
-    # ── Obtener el plan ────────────────────────────────────────────────────
+    res = await db.execute(text("""
+        SELECT balance, last_updated FROM user_credits
+        WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    credits = res.fetchone()
+
+    return {
+        "ok":           True,
+        "balance":      credits.balance if credits else 0,
+        "last_updated": str(credits.last_updated) if credits else None,
+    }
+
+
+@router.get("/planes", summary="Planes de créditos disponibles")
+async def listar_planes(
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(text("""
+        SELECT id, nombre, descripcion, cantidad, precio
+        FROM planes_creditos
+        WHERE activo = true
+        ORDER BY cantidad ASC
+    """))
+    planes = res.fetchall()
+
+    return {
+        "ok":   True,
+        "data": [
+            {
+                "id":          p.id,
+                "nombre":      p.nombre,
+                "descripcion": p.descripcion,
+                "cantidad":    p.cantidad,
+                "precio":      float(p.precio),
+                "precio_por_credito": round(float(p.precio) / p.cantidad, 4),
+            }
+            for p in planes
+        ]
+    }
+
+
+@router.post("/checkout", summary="Crear sesión de pago para créditos API")
+async def crear_checkout_creditos(
+    data:      CheckoutCreditosRequest,
+    auth_data: dict = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    _rl:       None = Depends(RateLimit(RateLimitScope.GENERAL)),
+):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
+    # Obtener plan
     res_plan = await db.execute(text("""
         SELECT id, nombre, descripcion, cantidad, precio
         FROM planes_creditos
-        WHERE id = :pid AND activo = true AND tipo = 'emision'
+        WHERE id = :pid AND activo = true
     """), {"pid": data.plan_id})
     plan = res_plan.fetchone()
 
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
 
-    # ── Obtener o crear customer en Stripe ─────────────────────────────────
-    res_emisor = await db.execute(text("""
-        SELECT e.ruc, e.razon_social, e.stripe_customer_id, p.email
-        FROM emisores e
-        JOIN emisor_usuarios eu ON eu.emisor_id = e.id
-        JOIN profiles p ON p.id = eu.profile_id
-        WHERE e.id = :eid
-        LIMIT 1
-    """), {"eid": emisor_id})
-    emisor = res_emisor.fetchone()
+    # Obtener o crear customer
+    stripe_customer_id = await _obtener_o_crear_customer(emisor_id, db)
 
-    if not emisor:
-        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-
-    # Si ya tiene customer_id en Stripe lo usamos, si no lo creamos
-    stripe_customer_id = emisor.stripe_customer_id
-
-    if not stripe_customer_id:
-        customer = stripe.Customer.create(
-            email=emisor.email,
-            name=emisor.razon_social,
-            metadata={
-                "emisor_id": str(emisor_id),
-                "ruc":       emisor.ruc,
-            }
-        )
-        stripe_customer_id = customer.id
-
-        # Guardar en DB
-        await db.execute(text("""
-            UPDATE emisores SET stripe_customer_id = :cid WHERE id = :eid
-        """), {"cid": stripe_customer_id, "eid": emisor_id})
-        await db.commit()
-
-    # ── Crear sesión de checkout ───────────────────────────────────────────
     try:
         session = stripe.checkout.Session.create(
-            customer=stripe_customer_id,
-            payment_method_types=["card"],
-            line_items=[{
+            customer             = stripe_customer_id,
+            mode                 = "payment",
+            line_items           = [{
                 "price_data": {
                     "currency":     "usd",
-                    "unit_amount": int(float(plan.precio) * (1 + settings.IVA_RATE)), # Stripe usa centavos
+                    "unit_amount":  int(float(plan.precio) * 100),  # USD sin IVA
                     "product_data": {
-                        "name":        f"Kipu — {plan.nombre}",
-                        "description": f"{plan.cantidad} créditos de emisión · {plan.descripcion or ''}",
+                        "name":        f"Kipu API — {plan.nombre}",
+                        "description": f"{plan.cantidad} créditos · {plan.descripcion or ''}",
                     },
                 },
                 "quantity": 1,
             }],
-            mode="payment",
-            success_url=f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=exitoso",
-            cancel_url=f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=cancelado",
-            metadata={
+            success_url          = f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=exitoso",
+            cancel_url           = f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=cancelado",
+            metadata             = {
                 "emisor_id": str(emisor_id),
+                "tipo":      "CREDITOS",
                 "plan_id":   str(plan.id),
                 "cantidad":  str(plan.cantidad),
-                "ruc":       emisor.ruc,
             },
-            invoice_creation={"enabled": False},  # La factura la emite Kipu, no Stripe
+            invoice_creation     = {"enabled": False},  # Kipu emite su propia factura
         )
     except stripe.StripeError as e:
-        raise HTTPException(status_code=500, detail=f"Error al crear sesión de pago: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
 
     return {
-        "ok":          True,
+        "ok":           True,
         "checkout_url": session.url,
-        "session_id":  session.id,
+        "session_id":   session.id,
+    }
+
+
+@router.get("/historial", summary="Historial de transacciones de créditos")
+async def historial_creditos(
+    auth_data: dict = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    limit:     int  = 20,
+    offset:    int  = 0,
+):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
+    res = await db.execute(text("""
+        SELECT
+            id, tipo, cantidad, precio_total,
+            metodo_pago, referencia_pago, notas, created_at
+        FROM credit_transactions
+        WHERE emisor_id = :eid
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
+    """), {"eid": emisor_id, "limit": limit, "offset": offset})
+
+    rows = res.fetchall()
+
+    return {
+        "ok":   True,
+        "data": [
+            {
+                "id":             str(r.id),
+                "tipo":           r.tipo,
+                "cantidad":       r.cantidad,
+                "precio_total":   float(r.precio_total or 0),
+                "metodo_pago":    r.metodo_pago,
+                "referencia_pago": r.referencia_pago,
+                "notas":          r.notas,
+                "created_at":     str(r.created_at),
+            }
+            for r in rows
+        ]
     }

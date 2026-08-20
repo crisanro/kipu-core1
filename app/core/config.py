@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "https://core.kipu.ec"
     STRIPE_SECRET_KEY: str
     STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_PRICE_NATURAL_MENSUAL:  str = ""
+    STRIPE_PRICE_NATURAL_ANUAL:    str = ""
+    STRIPE_PRICE_JURIDICO_MENSUAL: str = ""
+    STRIPE_PRICE_JURIDICO_ANUAL:   str = ""
     KIPU_EMISOR_ID:        int = 0
     KIPU_ESTABLECIMIENTO:  str = "001"
     KIPU_PUNTO_EMISION:    str = "001"

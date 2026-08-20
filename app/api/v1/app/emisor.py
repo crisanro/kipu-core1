@@ -143,9 +143,9 @@ async def onboarding(
             {"eid": new_emisor_id, "pid": str(profile_id)}
         )
 
-        # Créditos iniciales
+        # Créditos iniciales (balance unificado de créditos API)
         await db.execute(
-            text("INSERT INTO user_credits (emisor_id, balance_emision, balance_recepcion) VALUES (:eid, 10, 0)"),
+            text("INSERT INTO user_credits (emisor_id, balance) VALUES (:eid, 10)"),
             {"eid": new_emisor_id}
         )
         await db.execute(text("""
@@ -334,10 +334,13 @@ async def get_config(
             e.ruc, e.razon_social, e.nombre_comercial, e.direccion_matriz,
             e.contribuyente_especial, e.obligado_contabilidad, e.ambiente,
             e.p12_path, e.p12_expiration, e.created_at,
-            e.ws_establecimiento, e.ws_punto_emision,
-            c.balance_emision, c.balance_recepcion
+            COALESCE(uc.balance, 0)      AS balance_api,
+            s.estado                      AS sub_estado,
+            s.plan                        AS sub_plan,
+            s.current_period_end          AS sub_vence
         FROM emisores e
-        LEFT JOIN user_credits c ON c.emisor_id = e.id
+        LEFT JOIN user_credits  uc ON uc.emisor_id = e.id
+        LEFT JOIN subscriptions s  ON s.emisor_id  = e.id
         WHERE e.id = :eid
     """), {"eid": emisor_id})
     data = res.fetchone()
@@ -365,12 +368,8 @@ async def get_config(
         else:
             firma_info.update({"estado": "VIGENTE",  "mensaje_vencimiento": f"Vigente hasta el {fecha_fmt}"})
 
-    # WhatsApp
-    ws_ok = bool(data.ws_establecimiento and data.ws_punto_emision)
-
     # Legal — excluir campos internos
-    excluir   = {"p12_path", "p12_expiration", "ws_establecimiento", "ws_punto_emision",
-                 "balance_emision", "balance_recepcion"}
+    excluir    = {"p12_path", "p12_expiration"}
     legal_data = {k: v for k, v in data._mapping.items() if k not in excluir}
 
     response = {
@@ -379,14 +378,12 @@ async def get_config(
         "data": {
             "legal":    legal_data,
             "firma":    firma_info,
-            "whatsapp": {
-                "configurado":     ws_ok,
-                "establecimiento": data.ws_establecimiento if ws_ok else None,
-                "punto_emision":   data.ws_punto_emision   if ws_ok else None,
-            },
+            "whatsapp": {"configurado": False},
             "creditos": {
-                "balance_emision":   data.balance_emision,
-                "balance_recepcion": data.balance_recepcion,
+                "balance_api": data.balance_api,
+                "sub_estado":  data.sub_estado,
+                "sub_plan":    data.sub_plan,
+                "sub_vence":   str(data.sub_vence) if data.sub_vence else None,
             },
         }
     }
@@ -458,13 +455,13 @@ async def activar_produccion(
 
     try:
         # 1. Limpiar facturas de prueba
-        await db.execute(text("DELETE FROM invoices_emitidas WHERE emisor_id = :eid"), {"eid": emisor_id})
+        await db.execute(text("DELETE FROM documentos_emitidos WHERE emisor_id = :eid"), {"eid": emisor_id})
         await db.execute(text("UPDATE puntos_emision SET secuencial_actual = 0 WHERE emisor_id = :eid"), {"eid": emisor_id})
 
         # 2. Bono de bienvenida a producción
         await db.execute(text("""
             UPDATE user_credits
-            SET balance_emision = 25, balance_recepcion = 0, last_updated = NOW()
+            SET balance = 25, last_updated = NOW()
             WHERE emisor_id = :eid
         """), {"eid": emisor_id})
         await db.execute(text("""
@@ -491,11 +488,10 @@ async def activar_produccion(
         # Notificar bienvenida a producción
         try:
             from app.services.notification_service import crear_notificacion
-            from calendar import monthrange
             from app.workers.declaraciones_worker import calcular_vencimiento
             vencimiento = calcular_vencimiento(emisor.ruc, periodo_inicio)
             await crear_notificacion(
-                db        = db,
+                db         = db,
                 emisor_id = emisor_id,
                 tipo      = "SISTEMA",
                 titulo    = "🎉 ¡Bienvenido a Producción!",
@@ -523,5 +519,5 @@ async def activar_produccion(
     return {
         "ok":      True,
         "mensaje": "¡BIENVENIDO A PRODUCCIÓN! TU CUENTA ESTÁ LISTA PARA EMITIR FACTURAS REALES.",
-        "data":    {"ambiente": 2, "balance_emision": 25, "balance_recepcion": 0}
+        "data":    {"ambiente": 2, "balance_api": 25}
     }

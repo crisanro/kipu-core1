@@ -7,10 +7,11 @@ from app.core.security import verify_api_key
 from app.core.config import settings
 from app.schemas.integracion import ValidatePuntoRequest
 from app.services.integracion_service import validar_estructura_core, obtener_status_core
-from app.utils.factura_service import emitir_factura_core
+from app.services.documento_service import emitir_documento_core
 from app.core.idempotency import verificar_idempotency, guardar_idempotency
 
 router = APIRouter()
+
 
 @router.post("/validate", summary="Validar establecimiento y punto de emisión")
 async def api_validate_structure(
@@ -29,7 +30,7 @@ async def api_get_status(
     return await obtener_status_core(auth["emisor_id"], db)
 
 
-@router.post("/invoice", summary="Emitir una factura electrónica (API Externa)")
+@router.post("/invoice", summary="Emitir factura electrónica (API Externa)")
 async def api_invoice(
     request:           Request,
     factura_data:      dict          = Body(...),
@@ -38,13 +39,12 @@ async def api_invoice(
     x_api_key:         Optional[str] = Header(None, alias="X-Api-Key"),
     x_internal_key:    Optional[str] = Header(None, alias="X-Internal-Key"),
 ):
-    # ── Autenticar — clave interna tiene prioridad ─────────────────────────────
+    # Autenticar — clave interna tiene prioridad
     if x_internal_key:
         if x_internal_key != settings.INTERNAL_API_KEY:
             raise HTTPException(status_code=403, detail="Clave interna inválida.")
         auth = {
             "emisor_id":  settings.KIPU_EMISOR_ID,
-            "unlimited":  True,
             "api_key_id": None,
         }
     elif x_api_key:
@@ -54,18 +54,20 @@ async def api_invoice(
 
     emisor_id = auth["emisor_id"]
 
-    # ── Idempotencia ───────────────────────────────────────────────────────────
+    # Idempotencia
     cached = await verificar_idempotency(emisor_id, x_idempotency_key)
     if cached:
         return cached
 
-    # ── Emitir ─────────────────────────────────────────────────────────────────
-    result = await emitir_factura_core(
-        factura_data,
-        emisor_id,
-        db,
+    # Emitir — la API externa solo emite FAC por ahora
+    tipo_doc = factura_data.pop("tipo_doc", "FAC").upper()
+
+    result = await emitir_documento_core(
+        tipo_doc  = tipo_doc,
+        data      = factura_data,
+        emisor_id = emisor_id,
+        db        = db,
         api_key_id = auth.get("api_key_id"),
-        unlimited  = auth.get("unlimited", False),
     )
 
     if result.get("ok"):

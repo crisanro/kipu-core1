@@ -1,9 +1,17 @@
 # app/api/v1/admin/stripe_webhook.py
 #
-# Webhook de Stripe — recibe eventos de pago y acredita créditos.
-# Flujo: checkout.session.completed → acreditar → facturar → notificar
+# Webhook de Stripe — maneja eventos de suscripción y compra de créditos API.
+#
+# Eventos manejados:
+#   checkout.session.completed     → nueva suscripción o compra de créditos
+#   customer.subscription.updated  → renovación, cambio de plan
+#   customer.subscription.deleted  → cancelación
+#   invoice.paid                   → renovación exitosa (mensual/anual)
+#   invoice.payment_failed         → pago fallido → suspender acceso
 
 import stripe
+import json
+from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -11,157 +19,458 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import AsyncSessionLocal
 from app.core.config import settings
 from app.services.notification_service import crear_notificacion
-from app.utils.factura_service import emitir_factura_core
+from app.services.documento_service import emitir_documento_core
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 router         = APIRouter()
 
-# ── POST /webhook ──────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
 @router.post("/webhook", summary="Webhook de Stripe")
 async def stripe_webhook(request: Request):
     payload    = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
-    # ── Verificar firma ────────────────────────────────────────────────────────
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, settings.STRIPE_WEBHOOK_SECRET
         )
-        # Convertir evento a dict para un acceso seguro a claves mediante .get()
         event = event.to_dict() if hasattr(event, "to_dict") else dict(event)
     except stripe.errors.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Firma inválida.")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # ── Solo procesar pagos completados ───────────────────────────────────────
-    if event["type"] != "checkout.session.completed":
-        return JSONResponse({"ok": True, "mensaje": "Evento ignorado."})
+    tipo = event["type"]
+    obj  = event["data"]["object"]
 
-    session  = event["data"]["object"]
-    metadata = session.get("metadata") or {}
-
-    emisor_id = metadata.get("emisor_id")
-    plan_id   = metadata.get("plan_id")
-    cantidad  = metadata.get("cantidad")
-
-    if not emisor_id or not cantidad:
-        print(f"[Stripe] ⚠️ Metadata incompleto: {metadata}")
-        return JSONResponse({"ok": True, "mensaje": "Metadata incompleto."})
-
-    emisor_id  = int(emisor_id)
-    cantidad   = int(cantidad)
-    monto      = float(session.get("amount_total") or 0) / 100  # centavos → USD
-    payment_id = session.get("payment_intent") or session.get("id") or ""
-
-    print(f"[Stripe] 💳 Pago recibido — emisor {emisor_id}, {cantidad} créditos, ${monto}")
+    print(f"[Stripe] 📩 Evento recibido: {tipo}")
 
     async with AsyncSessionLocal() as db:
         try:
-            # ── 1. Verificar idempotencia ──────────────────────────────────────
-            res_dup = await db.execute(text("""
-                SELECT id FROM credit_transactions
-                WHERE metodo_pago = 'STRIPE' AND notas LIKE :pid
-            """), {"pid": f"%{payment_id}%"})
-            if res_dup.fetchone():
-                print(f"[Stripe] ⚠️ Pago ya procesado: {payment_id}")
-                return JSONResponse({"ok": True, "mensaje": "Ya procesado."})
+            if tipo == "checkout.session.completed":
+                await _handle_checkout(obj, db)
 
-            # ── 2. Acreditar créditos ──────────────────────────────────────────
-            await db.execute(text("""
-                UPDATE user_credits
-                SET balance_emision = balance_emision + :qty,
-                    last_updated    = NOW()
-                WHERE emisor_id = :eid
-            """), {"qty": cantidad, "eid": emisor_id})
+            elif tipo == "customer.subscription.updated":
+                await _handle_subscription_updated(obj, db)
 
-            await db.execute(text("""
-                INSERT INTO credit_transactions
-                    (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
-                VALUES (:eid, 'RECARGA', :qty, :monto, 'STRIPE', :notas)
-            """), {
-                "eid":   emisor_id,
-                "qty":   cantidad,
-                "monto": monto,
-                "notas": f"Stripe payment_intent={payment_id} plan_id={plan_id}",
-            })
-            await db.commit()
-            print(f"[Stripe] ✅ {cantidad} créditos acreditados al emisor {emisor_id}")
+            elif tipo == "customer.subscription.deleted":
+                await _handle_subscription_deleted(obj, db)
 
-            # ── 3. Obtener datos del emisor para facturar ──────────────────────
-            res_emisor = await db.execute(text("""
-                SELECT
-                    e.ruc, e.razon_social, e.nombre_comercial,
-                    e.ws_establecimiento, e.ws_punto_emision,
-                    p.email
-                FROM emisores e
-                JOIN emisor_usuarios eu ON eu.emisor_id = e.id
-                JOIN profiles p         ON p.id = eu.profile_id
-                WHERE e.id = :eid
-                ORDER BY eu.created_at ASC
-                LIMIT 1
-            """), {"eid": emisor_id})
-            emisor = res_emisor.fetchone()
+            elif tipo == "invoice.paid":
+                await _handle_invoice_paid(obj, db)
 
-            # ── 4. Emitir factura desde Kipu hacia el cliente ─────────────────────────────
-            if emisor and settings.KIPU_EMISOR_ID and settings.KIPU_ESTABLECIMIENTO and settings.KIPU_PUNTO_EMISION:
-                try:
-                    subtotal = round(monto / (1 + settings.IVA_RATE), 2)
+            elif tipo == "invoice.payment_failed":
+                await _handle_invoice_payment_failed(obj, db)
 
-                    factura_data = {
-                        "establecimiento": settings.KIPU_ESTABLECIMIENTO,
-                        "punto_emision":   settings.KIPU_PUNTO_EMISION,
-                        "cliente": {
-                            "tipo_id":        "04",
-                            "nombre":         emisor.razon_social,
-                            "identificacion": emisor.ruc,
-                            "email":          emisor.email,
-                        },
-                        "items": [{
-                            "descripcion":     f"Recarga de {cantidad} créditos de emisión — Kipu",
-                            "cantidad":        1,
-                            "precio_unitario": subtotal,
-                            "tipo_iva":        "15",
-                        }],
-                        "pagos": [{
-                            "forma_pago": "16",
-                            "total":      monto,
-                        }],
-                        "campos_adicionales": [
-                            {"nombre": "Plan",       "valor": f"{cantidad} créditos"},
-                            {"nombre": "Referencia", "valor": payment_id[:20]},
-                        ],
-                    }
-
-                    result = await emitir_factura_core(
-                        factura_data = factura_data,
-                        emisor_id    = settings.KIPU_EMISOR_ID,  # ← tu RUC
-                        db           = db,
-                        api_key_id   = None,
-                        unlimited    = True,                      # ← sin descuento
-                    )
-                    print(f"[Stripe] 🧾 Factura emitida: {result.get('secuencial', '?')}")
-
-                except Exception as e:
-                    print(f"[Stripe] ⚠️ Error emitiendo factura: {e}")
             else:
-                print(f"[Stripe] ⚠️ Emisor sin estructura configurada — factura omitida")
-
-            # ── 5. Notificar al usuario ────────────────────────────────────────
-            await crear_notificacion(
-                db        = db,
-                emisor_id = emisor_id,
-                tipo      = "CREDITOS",
-                titulo    = f"✅ {cantidad} créditos acreditados",
-                mensaje   = f"Tu pago de ${monto:.2f} fue procesado. Ya tienes {cantidad} créditos nuevos disponibles.",
-                referencia = "/creditos",
-            )
+                print(f"[Stripe] ℹ️ Evento ignorado: {tipo}")
 
         except Exception as e:
             await db.rollback()
-            print(f"[Stripe] ❌ Error procesando webhook: {e}")
+            print(f"[Stripe] ❌ Error procesando {tipo}: {e}")
             import traceback; traceback.print_exc()
-            # Retornar 200 para que Stripe no reintente
+            # Retornar 200 para que Stripe no reintente indefinidamente
             return JSONResponse({"ok": False, "error": str(e)})
 
-    return JSONResponse({"ok": True, "mensaje": "Pago procesado correctamente."})
+    return JSONResponse({"ok": True})
+
+
+# =============================================================================
+# HANDLERS
+# =============================================================================
+
+async def _handle_checkout(session: dict, db: AsyncSession):
+    """
+    checkout.session.completed
+    Distingue entre suscripción nueva y compra de créditos API
+    según metadata.tipo
+    """
+    metadata   = session.get("metadata") or {}
+    emisor_id  = metadata.get("emisor_id")
+    tipo       = metadata.get("tipo")  # SUSCRIPCION | CREDITOS
+
+    if not emisor_id:
+        print("[Stripe] ⚠️ Checkout sin emisor_id en metadata.")
+        return
+
+    emisor_id = int(emisor_id)
+
+    if tipo == "SUSCRIPCION":
+        await _activar_suscripcion(session, emisor_id, metadata, db)
+    elif tipo == "CREDITOS":
+        await _acreditar_creditos(session, emisor_id, metadata, db)
+    else:
+        print(f"[Stripe] ⚠️ Checkout con tipo desconocido: {tipo}")
+
+
+async def _handle_subscription_updated(sub: dict, db: AsyncSession):
+    """
+    customer.subscription.updated
+    Actualiza estado, período y plan en la tabla subscriptions.
+    """
+    stripe_sub_id = sub.get("id")
+    if not stripe_sub_id:
+        return
+
+    estado = _mapear_estado_stripe(sub.get("status"))
+
+    await db.execute(text("""
+        UPDATE subscriptions SET
+            estado               = :estado,
+            stripe_price_id      = :price_id,
+            current_period_start = :period_start,
+            current_period_end   = :period_end,
+            cancel_at_period_end = :cancel_at_end,
+            updated_at           = NOW()
+        WHERE stripe_subscription_id = :sub_id
+    """), {
+        "estado":       estado,
+        "price_id":     sub.get("items", {}).get("data", [{}])[0].get("price", {}).get("id"),
+        "period_start": datetime.fromtimestamp(sub["current_period_start"], tz=timezone.utc) if sub.get("current_period_start") else None,
+        "period_end":   datetime.fromtimestamp(sub["current_period_end"], tz=timezone.utc) if sub.get("current_period_end") else None,
+        "cancel_at_end": sub.get("cancel_at_period_end", False),
+        "sub_id":       stripe_sub_id,
+    })
+
+    # Obtener emisor_id para notificar
+    res = await db.execute(text("""
+        SELECT emisor_id FROM subscriptions WHERE stripe_subscription_id = :sub_id
+    """), {"sub_id": stripe_sub_id})
+    row = res.fetchone()
+
+    await db.commit()
+
+    if row and estado == "CANCELADO":
+        await crear_notificacion(
+            db        = db,
+            emisor_id = row.emisor_id,
+            tipo      = "SUSCRIPCION",
+            titulo    = "⚠️ Tu suscripción fue cancelada",
+            mensaje   = "Tu suscripción a Kipu ha sido cancelada. Puedes reactivarla desde Configuración.",
+            referencia = "/configuracion?tab=suscripcion",
+        )
+
+    print(f"[Stripe] 🔄 Suscripción actualizada: {stripe_sub_id} → {estado}")
+
+
+async def _handle_subscription_deleted(sub: dict, db: AsyncSession):
+    """
+    customer.subscription.deleted
+    Marca la suscripción como VENCIDO.
+    """
+    stripe_sub_id = sub.get("id")
+    if not stripe_sub_id:
+        return
+
+    res = await db.execute(text("""
+        UPDATE subscriptions SET
+            estado     = 'VENCIDO',
+            updated_at = NOW()
+        WHERE stripe_subscription_id = :sub_id
+        RETURNING emisor_id
+    """), {"sub_id": stripe_sub_id})
+
+    row = res.fetchone()
+    await db.commit()
+
+    if row:
+        await crear_notificacion(
+            db        = db,
+            emisor_id = row.emisor_id,
+            tipo      = "SUSCRIPCION",
+            titulo    = "❌ Suscripción vencida",
+            mensaje   = "Tu suscripción a Kipu ha vencido. Renuévala para seguir emitiendo comprobantes.",
+            referencia = "/configuracion?tab=suscripcion",
+        )
+        print(f"[Stripe] ❌ Suscripción vencida: {stripe_sub_id} — emisor {row.emisor_id}")
+
+
+async def _handle_invoice_paid(invoice: dict, db: AsyncSession):
+    """
+    invoice.paid
+    Renovación exitosa — actualizar período y asegurar estado ACTIVO.
+    """
+    stripe_sub_id = invoice.get("subscription")
+    if not stripe_sub_id:
+        return
+
+    # Obtener detalles de la suscripción actualizada desde Stripe
+    try:
+        sub = stripe.Subscription.retrieve(stripe_sub_id)
+    except Exception as e:
+        print(f"[Stripe] ⚠️ No se pudo recuperar suscripción {stripe_sub_id}: {e}")
+        return
+
+    res = await db.execute(text("""
+        UPDATE subscriptions SET
+            estado               = 'ACTIVO',
+            current_period_start = :period_start,
+            current_period_end   = :period_end,
+            updated_at           = NOW()
+        WHERE stripe_subscription_id = :sub_id
+        RETURNING emisor_id
+    """), {
+        "period_start": datetime.fromtimestamp(sub["current_period_start"], tz=timezone.utc),
+        "period_end":   datetime.fromtimestamp(sub["current_period_end"], tz=timezone.utc),
+        "sub_id":       stripe_sub_id,
+    })
+
+    row = res.fetchone()
+    await db.commit()
+
+    if row:
+        await _emitir_factura_kipu(invoice, row.emisor_id, db)
+        print(f"[Stripe] ✅ Renovación procesada: {stripe_sub_id} — emisor {row.emisor_id}")
+
+
+async def _handle_invoice_payment_failed(invoice: dict, db: AsyncSession):
+    """
+    invoice.payment_failed
+    Pago fallido — notificar al usuario. Stripe reintentará automáticamente
+    (Smart Retries). No suspendemos acceso hasta subscription.deleted.
+    """
+    stripe_sub_id = invoice.get("subscription")
+    if not stripe_sub_id:
+        return
+
+    res = await db.execute(text("""
+        SELECT emisor_id FROM subscriptions
+        WHERE stripe_subscription_id = :sub_id
+    """), {"sub_id": stripe_sub_id})
+    row = res.fetchone()
+
+    if row:
+        await crear_notificacion(
+            db        = db,
+            emisor_id = row.emisor_id,
+            tipo      = "SUSCRIPCION",
+            titulo    = "⚠️ Pago fallido",
+            mensaje   = "No pudimos procesar el pago de tu suscripción. Verifica tu método de pago en Configuración.",
+            referencia = "/configuracion?tab=suscripcion",
+        )
+        print(f"[Stripe] ⚠️ Pago fallido: {stripe_sub_id} — emisor {row.emisor_id}")
+
+
+# =============================================================================
+# SUB-HANDLERS
+# =============================================================================
+
+async def _activar_suscripcion(session: dict, emisor_id: int, metadata: dict, db: AsyncSession):
+    """Activa o crea la suscripción tras checkout exitoso."""
+    stripe_sub_id = session.get("subscription")
+    plan          = metadata.get("plan", "NATURAL")
+    periodo       = metadata.get("periodo", "MENSUAL")
+
+    if not stripe_sub_id:
+        print("[Stripe] ⚠️ Checkout de suscripción sin subscription ID.")
+        return
+
+    # Verificar idempotencia
+    res_dup = await db.execute(text("""
+        SELECT id FROM subscriptions WHERE stripe_subscription_id = :sub_id
+    """), {"sub_id": stripe_sub_id})
+    if res_dup.fetchone():
+        print(f"[Stripe] ⚠️ Suscripción ya procesada: {stripe_sub_id}")
+        return
+
+    # Obtener detalles de la suscripción desde Stripe
+    try:
+        sub = stripe.Subscription.retrieve(stripe_sub_id)
+        period_start = datetime.fromtimestamp(sub["current_period_start"], tz=timezone.utc)
+        period_end   = datetime.fromtimestamp(sub["current_period_end"], tz=timezone.utc)
+        price_id     = sub["items"]["data"][0]["price"]["id"]
+    except Exception as e:
+        print(f"[Stripe] ⚠️ Error obteniendo suscripción: {e}")
+        period_start = period_end = price_id = None
+
+    # Upsert en subscriptions
+    await db.execute(text("""
+        INSERT INTO subscriptions (
+            emisor_id, plan, periodo, estado,
+            stripe_subscription_id, stripe_price_id,
+            current_period_start, current_period_end
+        ) VALUES (
+            :eid, :plan, :periodo, 'ACTIVO',
+            :sub_id, :price_id,
+            :period_start, :period_end
+        )
+        ON CONFLICT (emisor_id) DO UPDATE SET
+            plan                 = EXCLUDED.plan,
+            periodo              = EXCLUDED.periodo,
+            estado               = 'ACTIVO',
+            stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+            stripe_price_id      = EXCLUDED.stripe_price_id,
+            current_period_start = EXCLUDED.current_period_start,
+            current_period_end   = EXCLUDED.current_period_end,
+            updated_at           = NOW()
+    """), {
+        "eid":          emisor_id,
+        "plan":         plan,
+        "periodo":      periodo,
+        "sub_id":       stripe_sub_id,
+        "price_id":     price_id,
+        "period_start": period_start,
+        "period_end":   period_end,
+    })
+
+    await db.commit()
+
+    await crear_notificacion(
+        db        = db,
+        emisor_id = emisor_id,
+        tipo      = "SUSCRIPCION",
+        titulo    = "✅ Suscripción activada",
+        mensaje   = f"Tu suscripción {plan} ({periodo}) está activa. ¡Bienvenido a Kipu!",
+        referencia = "/dashboard",
+    )
+
+    # Emitir factura de Kipu al cliente
+    monto = float(session.get("amount_total", 0)) / 100
+    await _emitir_factura_kipu(session, emisor_id, db, monto=monto, descripcion=f"Suscripción Kipu {plan} — {periodo}")
+
+    print(f"[Stripe] ✅ Suscripción activada: {stripe_sub_id} — emisor {emisor_id}")
+
+
+async def _acreditar_creditos(session: dict, emisor_id: int, metadata: dict, db: AsyncSession):
+    """Acredita créditos API tras compra exitosa."""
+    cantidad   = int(metadata.get("cantidad", 0))
+    plan_id    = metadata.get("plan_id")
+    monto      = float(session.get("amount_total", 0)) / 100
+    payment_id = session.get("payment_intent") or session.get("id") or ""
+
+    if not cantidad:
+        print("[Stripe] ⚠️ Compra de créditos sin cantidad en metadata.")
+        return
+
+    # Verificar idempotencia
+    res_dup = await db.execute(text("""
+        SELECT id FROM credit_transactions
+        WHERE metodo_pago = 'STRIPE' AND referencia_pago = :pid
+    """), {"pid": payment_id})
+    if res_dup.fetchone():
+        print(f"[Stripe] ⚠️ Créditos ya procesados: {payment_id}")
+        return
+
+    # Acreditar
+    await db.execute(text("""
+        UPDATE user_credits
+        SET balance = balance + :qty, last_updated = NOW()
+        WHERE emisor_id = :eid
+    """), {"qty": cantidad, "eid": emisor_id})
+
+    await db.execute(text("""
+        INSERT INTO credit_transactions
+            (emisor_id, tipo, cantidad, precio_total, metodo_pago, referencia_pago, notas)
+        VALUES
+            (:eid, 'COMPRA', :qty, :monto, 'STRIPE', :pid, :notas)
+    """), {
+        "eid":   emisor_id,
+        "qty":   cantidad,
+        "monto": monto,
+        "pid":   payment_id,
+        "notas": f"plan_id={plan_id}",
+    })
+
+    await db.commit()
+
+    await crear_notificacion(
+        db        = db,
+        emisor_id = emisor_id,
+        tipo      = "CREDITOS",
+        titulo    = f"✅ {cantidad} créditos acreditados",
+        mensaje   = f"Tu pago de ${monto:.2f} fue procesado. Ya tienes {cantidad} créditos API disponibles.",
+        referencia = "/configuracion?tab=creditos",
+    )
+
+    # Emitir factura de Kipu al cliente
+    await _emitir_factura_kipu(
+        session, emisor_id, db,
+        monto       = monto,
+        descripcion = f"Recarga {cantidad} créditos API — Kipu"
+    )
+
+    print(f"[Stripe] ✅ {cantidad} créditos acreditados — emisor {emisor_id}")
+
+
+async def _emitir_factura_kipu(obj: dict, emisor_id: int, db: AsyncSession, monto: float = None, descripcion: str = None):
+    """
+    Emite una factura electrónica de Kipu hacia el cliente
+    después de cualquier pago exitoso.
+    """
+    if not settings.KIPU_EMISOR_ID or not settings.KIPU_ESTABLECIMIENTO or not settings.KIPU_PUNTO_EMISION:
+        print("[Stripe] ⚠️ KIPU_EMISOR_ID no configurado — factura omitida.")
+        return
+
+    try:
+        # Obtener datos del emisor (cliente de Kipu)
+        res = await db.execute(text("""
+            SELECT e.ruc, e.razon_social, p.email
+            FROM emisores e
+            JOIN emisor_usuarios eu ON eu.emisor_id = e.id
+            JOIN profiles p ON p.id = eu.profile_id
+            WHERE e.id = :eid
+            ORDER BY eu.created_at ASC
+            LIMIT 1
+        """), {"eid": emisor_id})
+        cliente = res.fetchone()
+        if not cliente:
+            print("[Stripe] ⚠️ Cliente no encontrado para facturar.")
+            return
+
+        if not monto:
+            monto = float(obj.get("amount_total", 0)) / 100
+
+        subtotal = round(monto / (1 + settings.IVA_RATE), 2)
+
+        factura_data = {
+            "establecimiento": settings.KIPU_ESTABLECIMIENTO,
+            "punto_emision":   settings.KIPU_PUNTO_EMISION,
+            "cliente": {
+                "tipo_id":        "04",
+                "nombre":         cliente.razon_social,
+                "identificacion": cliente.ruc,
+                "email":          cliente.email,
+            },
+            "items": [{
+                "descripcion":     descripcion or "Servicio Kipu",
+                "cantidad":        1,
+                "precio_unitario": subtotal,
+                "tipo_iva":        "15",
+            }],
+            "pagos": [{
+                "forma_pago": "16",  # tarjeta de débito/crédito
+                "total":      monto,
+            }],
+            "origen": "web",
+        }
+
+        result = await emitir_documento_core(
+            tipo_doc  = "FAC",
+            data      = factura_data,
+            emisor_id = settings.KIPU_EMISOR_ID,
+            db        = db,
+        )
+        print(f"[Stripe] 🧾 Factura emitida: {result.get('claveAcceso', '?')}")
+
+    except Exception as e:
+        print(f"[Stripe] ⚠️ Error emitiendo factura: {e}")
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _mapear_estado_stripe(status: str) -> str:
+    """Mapea estados de Stripe a estados internos de Kipu."""
+    return {
+        "active":   "ACTIVO",
+        "trialing": "TRIAL",
+        "past_due": "ACTIVO",    # Stripe reintenta — no suspender todavía
+        "canceled": "CANCELADO",
+        "unpaid":   "VENCIDO",
+        "paused":   "CANCELADO",
+    }.get(status, "VENCIDO")
