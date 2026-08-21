@@ -111,7 +111,8 @@ async def emitir_documento(
     auth_data:         dict         = Depends(verify_firebase_token),
     db:                AsyncSession = Depends(get_db),
     _rl:               None         = Depends(RateLimit(RateLimitScope.INVOICE)),
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),  # ← agregar alias
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+        x_sandbox:         Optional[str] = Header(None, alias="X-Sandbox"),  # ← agregar
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
@@ -123,7 +124,8 @@ async def emitir_documento(
             status_code=400,
             detail="Se requiere el header X-Idempotency-Key. Usa un UUID v4 único por comprobante."
         )
-
+    
+    es_sandbox = x_sandbox == "true"
     tipo_doc = tipo_doc.upper()
 
     cached = await verificar_idempotency(emisor_id, x_idempotency_key)
@@ -135,6 +137,7 @@ async def emitir_documento(
         data      = data.model_dump(exclude_none=True),
         emisor_id = emisor_id,
         db        = db,
+        es_sandbox = es_sandbox,
     )
 
     if result.get("ok"):
@@ -156,6 +159,7 @@ async def historial_documentos(
     fecha_inicio: Optional[str] = Query(None),
     fecha_fin:    Optional[str] = Query(None),
     q:            Optional[str] = Query(None, description="Buscar por número, razón social o identificación"),
+    sandbox:      bool          = Query(False, description="Mostrar documentos de prueba"),
     limit:        int           = Query(50, le=100),
     offset:       int           = Query(0),
     _rl:          None          = Depends(RateLimit(RateLimitScope.GENERAL)),
@@ -171,8 +175,8 @@ async def historial_documentos(
         if (ff - fi).days > 45:
             raise HTTPException(status_code=400, detail="El rango máximo es 45 días.")
 
-    filtros = "WHERE emisor_id = :eid"
-    params  = {"eid": emisor_id}
+    filtros = "WHERE emisor_id = :eid AND es_sandbox = :sandbox"
+    params  = {"eid": emisor_id, "sandbox": sandbox}
 
     if tipo_doc:
         filtros += " AND tipo_doc = :tipo_doc"
@@ -253,7 +257,7 @@ async def resumen_documentos(
     db:           AsyncSession = Depends(get_db),
     fecha_inicio: Optional[str] = Query(None),
     fecha_fin:    Optional[str] = Query(None),
-    _rl:          None          = Depends(RateLimit(RateLimitScope.GENERAL)),
+    _rl:          None         = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
@@ -286,6 +290,7 @@ async def resumen_documentos(
         WHERE d.emisor_id     = :eid
           AND d.estado_sri    = 'AUTORIZADO'
           AND d.fecha_emision BETWEEN :fi AND :ff
+          AND d.es_sandbox    = false
           AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
         GROUP BY d.tipo_doc, (imp->>'tarifa')::numeric
         ORDER BY d.tipo_doc, tarifa
@@ -312,12 +317,13 @@ async def resumen_documentos(
         WHERE d.emisor_id     = :eid
           AND d.estado_sri    = 'AUTORIZADO'
           AND d.fecha_emision BETWEEN :fi AND :ff
+          AND d.es_sandbox    = false
           AND d.tipo_doc      = 'RET'
         GROUP BY (imp->>'codigo'), (imp->>'codigoRetencion')
         ORDER BY codigo_impuesto, codigo_retencion
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
 
-    # ── Totales simples por tipo (para NCR/NDB que no tienen desglose IVA) ──
+    # ── Totales simples por tipo ──
     res_totales = await db.execute(text("""
         SELECT
             tipo_doc,
@@ -327,6 +333,7 @@ async def resumen_documentos(
         WHERE emisor_id     = :eid
           AND estado_sri    = 'AUTORIZADO'
           AND fecha_emision BETWEEN :fi AND :ff
+          AND es_sandbox    = false
         GROUP BY tipo_doc
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
 
@@ -424,9 +431,9 @@ async def detalle_documento(
             d.origen, d.created_at,
             d.doc_origen_emitido_id,
             d.doc_origen_recibido_id,
+            d.es_sandbox,
 
             -- Documentos que YO emití referenciando este doc
-            -- (NCR, NDB emitidas desde esta FAC; RET emitida desde esta LIQ)
             (
                 SELECT json_agg(json_build_object(
                     'id',            dd.id,
@@ -441,7 +448,7 @@ async def detalle_documento(
                   AND dd.emisor_id = d.emisor_id
             ) AS documentos_derivados,
 
-            -- Doc origen si este es una NCR/NDB/RET (referencia al doc emitido padre)
+            -- Doc origen si este es una NCR/NDB/RET
             (
                 SELECT json_build_object(
                     'id',            dp.id,
@@ -454,7 +461,7 @@ async def detalle_documento(
                 WHERE dp.id = d.doc_origen_emitido_id
             ) AS doc_origen_emitido,
 
-            -- Doc recibido origen si este es una RET (referencia al doc recibido)
+            -- Doc recibido origen si este es una RET
             (
                 SELECT json_build_object(
                     'id',                     dr.id,
@@ -499,13 +506,13 @@ async def detalle_documento(
             "xml_path":                doc.xml_path,
             "pdf_path":                doc.pdf_path,
             "origen":                  doc.origen,
+            "es_sandbox":              doc.es_sandbox,
             "created_at":              str(doc.created_at),
             "doc_origen_emitido_id":  str(doc.doc_origen_emitido_id) if doc.doc_origen_emitido_id else None,
             "doc_origen_recibido_id": str(doc.doc_origen_recibido_id) if doc.doc_origen_recibido_id else None,
-            # Relaciones
             "documentos_derivados":   doc.documentos_derivados or [],
             "doc_origen_emitido":      doc.doc_origen_emitido,
-            "doc_origen_recibido":     doc.doc_origen_recibido,
+            "doc_origen_recibido":      doc.doc_origen_recibido,
         }
     }
 
@@ -525,13 +532,19 @@ async def reintentar_documento(
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
     res = await db.execute(text("""
-        SELECT id, estado_sri, clave_acceso FROM documentos_emitidos
+        SELECT id, estado_sri, clave_acceso, es_sandbox FROM documentos_emitidos
         WHERE id = :did AND emisor_id = :eid
     """), {"did": doc_id, "eid": emisor_id})
     doc = res.fetchone()
 
     if not doc:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
+
+    if doc.es_sandbox:
+        raise HTTPException(
+            status_code=400,
+            detail="No se pueden reintentar documentos generados en ambiente Sandbox."
+        )
 
     if doc.estado_sri not in ("DEVUELTA", "RECHAZADO", "FIRMADO"):
         raise HTTPException(
@@ -570,10 +583,6 @@ async def actualizar_cobro(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    """
-    Marca una FAC o LIQ como pagada, parcial o anulada.
-    Registra forma de pago, número de comprobante y fecha.
-    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
@@ -624,7 +633,6 @@ async def actualizar_cobro(
     }
 
 
-
 # =============================================================================
 # DESGLOSE — GET /{doc_id}/desglose
 # =============================================================================
@@ -642,7 +650,7 @@ async def desglose_documento(
         SELECT
             importe_total,
             datos->'resumenImpuestos' AS resumen_impuestos,
-            datos->'infoFactura'->>'totalSinImpuestos'          AS subtotal_fac,
+            datos->'infoFactura'->>'totalSinImpuestos'           AS subtotal_fac,
             datos->'infoLiquidacionCompra'->>'totalSinImpuestos' AS subtotal_liq
         FROM documentos_emitidos
         WHERE id = :did AND emisor_id = :eid
@@ -662,7 +670,6 @@ async def desglose_documento(
         "data": {
             "importe_total":     float(doc.importe_total),
             "subtotal":          subtotal,
-            "resumen_impuestos": resumen,  # [{tarifa, baseImponible, valor}]
+            "resumen_impuestos": resumen,
         }
     }
-

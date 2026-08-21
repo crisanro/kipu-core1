@@ -10,6 +10,7 @@
 #   - Campo: email_comprador → datos JSONB (legacy_email_comprador)
 #   - Eliminado: ak.unlimited → lógica por origen (web=suscripción, api=créditos)
 #   - Evento webhook: factura.* → documento.*
+#   - Notificaciones con soporte para etiquetas Sandbox.
 
 import hmac
 import hashlib
@@ -72,6 +73,7 @@ async def recovery_al_arrancar():
         res_emision = await db.execute(text("""
             SELECT id FROM documentos_emitidos
             WHERE estado_sri = 'FIRMADO'
+            AND es_sandbox = false
             ORDER BY created_at ASC
         """))
         ids_emision = res_emision.fetchall()
@@ -80,6 +82,7 @@ async def recovery_al_arrancar():
             SELECT id FROM documentos_emitidos
             WHERE estado_sri = 'RECIBIDA'
             AND fecha_autorizacion IS NULL
+            AND es_sandbox = false
             ORDER BY created_at ASC
         """))
         ids_auth = res_auth.fetchall()
@@ -134,11 +137,9 @@ def _email_desde_datos(datos: dict) -> str | None:
     """Extrae el email del comprador desde el JSONB datos."""
     if not datos:
         return None
-    # Primero buscar en campo legacy (migrado desde invoices_emitidas)
     email = datos.get("legacy_email_comprador")
     if email:
         return email
-    # Buscar en infoFactura
     info = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
     return info.get("emailComprador") or info.get("email")
 
@@ -159,14 +160,13 @@ async def procesar_emision(doc_id: str):
                     SELECT
                         d.id, d.xml_path, d.clave_acceso, d.numero_doc,
                         d.api_key_id, d.origen, d.datos,
-                        d.tipo_doc,
+                        d.tipo_doc, d.es_sandbox,
                         e.ambiente, e.id as emisor_id,
                         e.contribuyente_especial
                     FROM documentos_emitidos d
                     JOIN emisores e ON d.emisor_id = e.id
                     WHERE d.id = :did AND d.estado_sri = 'FIRMADO'
                 """), {"did": doc_id})
-
                 doc = res.fetchone()
                 if not doc:
                     print(f"[Emisión] ℹ️ {doc_id} ya no está en FIRMADO, se omite.")
@@ -174,7 +174,8 @@ async def procesar_emision(doc_id: str):
 
                 xml_bytes  = download_file(doc.xml_path)
                 xml_base64 = base64.b64encode(xml_bytes).decode("utf-8")
-                urls       = URLS_SRI[str(doc.ambiente)]
+                ambiente_efectivo = "1" if doc.es_sandbox else str(doc.ambiente)
+                urls = URLS_SRI[ambiente_efectivo]
 
                 soap_body = (
                     f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -208,7 +209,6 @@ async def procesar_emision(doc_id: str):
                     await redis.lpush(QUEUE_AUTORIZACION, str(doc.id))
 
                 else:
-                    # DEVUELTA — revertir crédito si era API
                     await db.execute(text("""
                         UPDATE documentos_emitidos
                         SET estado_sri = 'DEVUELTA',
@@ -231,13 +231,14 @@ async def procesar_emision(doc_id: str):
 
                     tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
                     numero     = doc.numero_doc or doc.clave_acceso[-10:]
+                    prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
 
                     await crear_notificacion(
                         db         = db,
                         emisor_id = doc.emisor_id,
                         tipo      = "DOCUMENTO",
-                        titulo    = f"⚠️ {tipo_label} devuelto por el SRI",
-                        mensaje   = f"{tipo_label} {numero} fue devuelto. Revisa los errores en el detalle.",
+                        titulo    = f"{prefijo}⚠️ {tipo_label} devuelto por el SRI",
+                        mensaje   = f"{prefijo}{tipo_label} {numero} fue devuelto. Revisa los errores en el detalle.",
                         referencia = f"/documentos/{doc.id}",
                     )
                     print(f"[Emisión] ⚠️ DEVUELTA: {doc.clave_acceso}")
@@ -278,7 +279,7 @@ async def procesar_autorizacion(doc_id: str):
                     SELECT
                         d.id, d.clave_acceso, d.xml_path, d.numero_doc,
                         d.api_key_id, d.origen, d.datos,
-                        d.tipo_doc, d.secuencial,
+                        d.tipo_doc, d.secuencial, d.es_sandbox,
                         e.ambiente, e.ruc, e.razon_social,
                         e.contribuyente_especial, e.id as emisor_id
                     FROM documentos_emitidos d
@@ -293,7 +294,8 @@ async def procesar_autorizacion(doc_id: str):
                     print(f"[Auth] ℹ️ {doc_id} ya no está en RECIBIDA, se omite.")
                     return
 
-                urls      = URLS_SRI[str(doc.ambiente)]
+                ambiente_efectivo = "1" if doc.es_sandbox else str(doc.ambiente)
+                urls = URLS_SRI[ambiente_efectivo]
                 soap_body = (
                     f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
                     f'xmlns:ec="http://ec.gob.sri.ws.autorizacion">'
@@ -309,7 +311,6 @@ async def procesar_autorizacion(doc_id: str):
                 doc_dict  = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in doc._mapping.items()}
 
                 if not resp_auth or int(resp_auth.get("numeroComprobantes", 0)) == 0:
-                    # SRI aún no tiene el comprobante — reintentar en 10s
                     await asyncio.sleep(10)
                     redis = await get_redis()
                     await redis.lpush(QUEUE_AUTORIZACION, doc_id)
@@ -320,16 +321,14 @@ async def procesar_autorizacion(doc_id: str):
 
                 tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
                 numero     = doc.numero_doc or doc.clave_acceso[-10:]
+                prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
 
                 if autorizacion.get("estado") == "AUTORIZADO":
                     xml_autorizado = autorizacion["comprobante"]
                     fecha_auth_str = autorizacion["fechaAutorizacion"]
                     fecha_auth_obj = datetime.fromisoformat(fecha_auth_str.replace("Z", "+00:00"))
 
-                    # Actualizar XML con el autorizado
                     upload_file(doc.xml_path, xml_autorizado.encode("utf-8"), "text/xml")
-
-                    # Generar PDF
                     pdf_bytes = await _generar_pdf(xml_autorizado, doc, fecha_auth_str)
 
                     await db.execute(text("""
@@ -343,28 +342,45 @@ async def procesar_autorizacion(doc_id: str):
                     await _invalidar_cache(doc.emisor_id)
                     await disparar_webhooks(doc.id, doc.emisor_id, "documento.autorizado", doc_dict)
 
-                    # Notificación interna
                     await crear_notificacion(
                         db         = db,
                         emisor_id = doc.emisor_id,
                         tipo      = "DOCUMENTO",
-                        titulo    = f"✅ {tipo_label} autorizado",
-                        mensaje   = f"{tipo_label} {numero} autorizado por el SRI.",
+                        titulo    = f"{prefijo}✅ {tipo_label} autorizado",
+                        mensaje   = f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
                         referencia = f"/documentos/{doc.id}",
                     )
 
-                    # Email al comprador (solo FAC y LIQ)
                     if doc.tipo_doc in ("FAC", "LIQ"):
-                        email_comprador = _email_desde_datos(doc.datos)
-                        if email_comprador:
-                            await _enviar_email_comprobante(
-                                email        = email_comprador,
-                                razon_social = doc.razon_social,
-                                secuencial   = doc.secuencial,
-                                clave_acceso = doc.clave_acceso,
-                                xml_str      = xml_autorizado,
-                                pdf_bytes    = pdf_bytes,
-                            )
+                        if doc.es_sandbox:
+                            res_owner = await db.execute(text("""
+                                SELECT p.email, p.full_name FROM profiles p
+                                JOIN emisor_usuarios eu ON eu.profile_id = p.id
+                                WHERE eu.emisor_id = :eid
+                                ORDER BY eu.created_at ASC
+                                LIMIT 1
+                            """), {"eid": doc.emisor_id})
+                            owner = res_owner.fetchone()
+                            if owner:
+                                await _enviar_email_comprobante(
+                                    email        = owner.email,
+                                    razon_social = f"[SANDBOX] {doc.razon_social}",
+                                    secuencial   = doc.secuencial,
+                                    clave_acceso = doc.clave_acceso,
+                                    xml_str      = xml_autorizado,
+                                    pdf_bytes    = pdf_bytes,
+                                )
+                        else:
+                            email_comprador = _email_desde_datos(doc.datos)
+                            if email_comprador:
+                                await _enviar_email_comprobante(
+                                    email        = email_comprador,
+                                    razon_social = doc.razon_social,
+                                    secuencial   = doc.secuencial,
+                                    clave_acceso = doc.clave_acceso,
+                                    xml_str      = xml_autorizado,
+                                    pdf_bytes    = pdf_bytes,
+                                )
 
                 elif autorizacion.get("estado") in ("RECHAZADO", "NO AUTORIZADO"):
                     await db.execute(text("""
@@ -386,12 +402,13 @@ async def procesar_autorizacion(doc_id: str):
                     await _devolver_stock_si_aplica(doc, db)
                     await _invalidar_cache(doc.emisor_id)
                     await notificar_cambio_estado(doc_dict, "RECHAZADO", autorizacion.get("mensajes"))
+                    
                     await crear_notificacion(
                         db         = db,
                         emisor_id = doc.emisor_id,
                         tipo      = "DOCUMENTO",
-                        titulo    = f"❌ {tipo_label} rechazado por el SRI",
-                        mensaje   = f"{tipo_label} {numero} fue rechazado. Revisa los errores en el detalle.",
+                        titulo    = f"{prefijo}❌ {tipo_label} rechazado por el SRI",
+                        mensaje   = f"{prefijo}{tipo_label} {numero} fue rechazado. Revisa los errores en el detalle.",
                         referencia = f"/documentos/{doc.id}",
                     )
                     await disparar_webhooks(doc.id, doc.emisor_id, "documento.rechazado", doc_dict)
@@ -491,7 +508,6 @@ async def _enviar_email_comprobante(
 
 
 async def _devolver_stock_si_aplica(doc, db: AsyncSession):
-    """Devuelve stock solo si el documento era FAC o LIQ."""
     if doc.tipo_doc not in ("FAC", "LIQ"):
         return
     try:

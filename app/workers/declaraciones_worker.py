@@ -343,6 +343,64 @@ async def crear_declaracion_emisor(db, emisor_id: int, ruc: str):
 
 
 # =============================================================================
+# LIMPIEZA SANDBOX
+# =============================================================================
+async def limpiar_sandbox(db):
+    """
+    Elimina documentos de prueba con más de 30 días.
+    Corre el día 1 de cada mes.
+    """
+    print("[Sandbox] 🧹 Limpiando documentos de prueba antiguos...")
+    try:
+        from app.services.storage_service import delete_folder
+
+        # Obtener emisores con docs sandbox viejos
+        res = await db.execute(text("""
+            SELECT DISTINCT e.ruc
+            FROM documentos_emitidos d
+            JOIN emisores e ON e.id = d.emisor_id
+            WHERE d.es_sandbox = true
+              AND d.created_at < NOW() - INTERVAL '30 days'
+        """))
+        rucs = res.fetchall()
+
+        # Eliminar carpetas sandbox en R2 por RUC
+        for row in rucs:
+            try:
+                delete_folder(f"{row.ruc}/sandbox/")
+                print(f"[Sandbox] 🗑️ R2 limpiado para RUC: {row.ruc}")
+            except Exception as e:
+                print(f"[Sandbox] ⚠️ Error R2 {row.ruc}: {e}")
+
+        # Eliminar notificaciones de documentos sandbox
+        await db.execute(text("""
+            DELETE FROM notificaciones
+            WHERE referencia IN (
+                SELECT '/documentos/' || id::text
+                FROM documentos_emitidos
+                WHERE es_sandbox = true
+                  AND created_at < NOW() - INTERVAL '30 days'
+            )
+        """))
+
+        # Eliminar registros de DB
+        res_del = await db.execute(text("""
+            DELETE FROM documentos_emitidos
+            WHERE es_sandbox = true
+              AND created_at < NOW() - INTERVAL '30 days'
+            RETURNING id
+        """))
+        eliminados = len(res_del.fetchall())
+        await db.commit()
+
+        print(f"[Sandbox] ✅ {eliminados} documentos de prueba eliminados")
+
+    except Exception as e:
+        await db.rollback()
+        print(f"[Sandbox] ❌ Error en limpieza: {e}")
+
+        
+# =============================================================================
 # LOOP PRINCIPAL
 # =============================================================================
 
@@ -369,6 +427,7 @@ async def iniciar_worker_declaraciones():
                             periodo = date(hoy.year, hoy.month - 1, 1)
 
                         await crear_declaraciones_mes(db, periodo)
+                        await limpiar_sandbox(db)
                         ultima_ejecucion_mes = hoy
 
                     # Todos los días — recordatorios y alertas

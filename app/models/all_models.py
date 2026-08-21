@@ -209,7 +209,6 @@ class Referido(Base):
 # =============================================================================
 # API KEYS Y WEBHOOKS
 # =============================================================================
-
 class ApiKey(Base):
     """API Keys para integraciones externas. Siempre consume créditos."""
     __tablename__ = "api_keys"
@@ -217,16 +216,17 @@ class ApiKey(Base):
     id              = Column(Integer, primary_key=True, autoincrement=True)
     emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
     nombre          = Column(String(100), nullable=False)
-    key_prefix      = Column(String(10), nullable=False)            # "kp_live_"
+    key_prefix      = Column(String(10), nullable=False)
     key_hash        = Column(String(64), unique=True, nullable=False)
+    key_plain       = Column(Text, nullable=True)   # ← agregar — solo para sandbox
     revoked         = Column(Boolean, default=False)
+    es_sandbox      = Column(Boolean, default=False, nullable=False)
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=True)
     last_used_at    = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     emisor          = relationship("Emisor", back_populates="api_keys")
     webhooks        = relationship("Webhook", back_populates="api_key")
-
 
 class Webhook(Base):
     """Endpoints para notificar eventos a sistemas externos."""
@@ -401,6 +401,7 @@ class DocumentoEmitido(Base):
     numero_doc              = Column(String(17))                    # 001-001-000000001
     secuencial              = Column(String(9))
     fecha_emision           = Column(Date, server_default=func.current_date())
+    es_sandbox              = Column(Boolean, default=False, nullable=False)
 
     # Estado SRI
     estado_sri              = Column(String(20), default="PENDIENTE")

@@ -153,7 +153,7 @@ async def crear_punto_emision(
                 (establecimiento_id, emisor_id, codigo, secuencial_actual,
                  secuenciales, nombre, is_active)
             VALUES (:estab_id, :eid, :cod, 1,
-                    '{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0}'::jsonb,
+                    '{"produccion":{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0},"pruebas":{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0}}'::jsonb
                     :nom, true)
             RETURNING id, establecimiento_id, codigo, secuencial_actual,
                       secuenciales, nombre, is_active
@@ -261,20 +261,29 @@ async def editar_secuencial(
     emisor_id = auth_data["emisor_id"]
 
     # Caso nuevo — secuenciales por tipo en JSONB
+    # Reemplazar el bloque "Caso nuevo":
     nuevos_secs = data.get("secuenciales")
     if nuevos_secs:
-        for tipo, val in nuevos_secs.items():
-            if int(val) < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"El secuencial de {tipo} no puede ser negativo."
-                )
+        # Validar estructura anidada por rama
+        for rama in ("produccion", "pruebas"):
+            if rama in nuevos_secs:
+                for tipo, val in nuevos_secs[rama].items():
+                    if int(val) < 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"El secuencial {rama}.{tipo} no puede ser negativo."
+                        )
+            # Compatibilidad — si viene flat (viejo formato) validar igual
+            elif isinstance(nuevos_secs.get(rama), int):
+                if nuevos_secs[rama] < 0:
+                    raise HTTPException(status_code=400, detail=f"El secuencial de {rama} no puede ser negativo.")
+
         res = await db.execute(text("""
             UPDATE puntos_emision pe
             SET secuenciales = CAST(:secs AS jsonb)
             FROM establecimientos e
             WHERE pe.establecimiento_id = e.id
-              AND pe.id = :pid AND e.emisor_id = :eid
+            AND pe.id = :pid AND e.emisor_id = :eid
             RETURNING pe.id, pe.codigo, pe.secuenciales
         """), {
             "secs": json.dumps(nuevos_secs),

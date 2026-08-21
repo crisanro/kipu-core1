@@ -426,7 +426,6 @@ async def update_config(
         raise HTTPException(status_code=500, detail="ERROR INTERNO AL ACTUALIZAR.")
 
 
-# ── POST /produccion ───────────────────────────────────────────────────────────
 @router.post("/produccion", summary="Activar ambiente de producción")
 async def activar_produccion(
     pin:       str,
@@ -454,11 +453,9 @@ async def activar_produccion(
     await validar_y_quemar_pin(db, emisor_id, pin, "ACTIVAR_PRODUCCION")
 
     try:
-        # 1. Limpiar facturas de prueba
-        await db.execute(text("DELETE FROM documentos_emitidos WHERE emisor_id = :eid"), {"eid": emisor_id})
-        await db.execute(text("UPDATE puntos_emision SET secuencial_actual = 0 WHERE emisor_id = :eid"), {"eid": emisor_id})
+        from app.workers.declaraciones_worker import calcular_vencimiento
 
-        # 2. Bono de bienvenida a producción
+        # 1. Bono de bienvenida a producción
         await db.execute(text("""
             UPDATE user_credits
             SET balance = 25, last_updated = NOW()
@@ -469,29 +466,29 @@ async def activar_produccion(
             VALUES (:eid, 'BONO', 25, 0.00, 'SISTEMA', 'BONO DE BIENVENIDA A PRODUCCIÓN')
         """), {"eid": emisor_id})
 
-        # 3. Activar producción
-        await db.execute(text("UPDATE emisores SET ambiente = 2, updated_at = NOW() WHERE id = :eid"), {"eid": emisor_id})
+        # 2. Activar producción
+        await db.execute(text("""
+            UPDATE emisores SET ambiente = 2, updated_at = NOW() WHERE id = :eid
+        """), {"eid": emisor_id})
 
-        # 4. Crear declaración del mes actual
+        # 3. Crear declaración del mes actual con vencimiento
         hoy            = date.today()
         periodo_inicio = date(hoy.year, hoy.month, 1)
+        vencimiento    = calcular_vencimiento(emisor.ruc, periodo_inicio)
         await db.execute(text("""
-            INSERT INTO declaraciones_sri (emisor_id, tipo, periodo, declarado)
-            VALUES (:eid, '104', :periodo, false)
+            INSERT INTO declaraciones_sri (emisor_id, tipo, periodo, vencimiento, declarado)
+            VALUES (:eid, '104', :periodo, :vencimiento, false)
             ON CONFLICT (emisor_id, tipo, periodo) DO NOTHING
-        """), {"eid": emisor_id, "periodo": periodo_inicio})
+        """), {"eid": emisor_id, "periodo": periodo_inicio, "vencimiento": vencimiento})
 
-        # COMMIT ÚNICO DE TODO EL PROCESO
         await db.commit()
         await invalidate_emisor(emisor_id)
 
-        # Notificar bienvenida a producción
+        # Notificación de bienvenida
         try:
             from app.services.notification_service import crear_notificacion
-            from app.workers.declaraciones_worker import calcular_vencimiento
-            vencimiento = calcular_vencimiento(emisor.ruc, periodo_inicio)
             await crear_notificacion(
-                db         = db,
+                db        = db,
                 emisor_id = emisor_id,
                 tipo      = "SISTEMA",
                 titulo    = "🎉 ¡Bienvenido a Producción!",
@@ -508,13 +505,6 @@ async def activar_produccion(
         await db.rollback()
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL ACTIVAR PRODUCCIÓN.")
-
-    # Limpiar R2 (operación I/O fuera de la transacción SQL)
-    try:
-        delete_folder(f"{emisor.ruc}/facturas/")
-        print(f"[PRODUCCION] 🗑️ R2 limpiado para RUC: {emisor.ruc}")
-    except Exception as e:
-        print(f"[PRODUCCION] ⚠️ No se pudo limpiar R2: {e}")
 
     return {
         "ok":      True,

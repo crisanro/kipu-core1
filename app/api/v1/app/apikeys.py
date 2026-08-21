@@ -115,3 +115,72 @@ async def revocar_api_key(
     await db.commit()
 
     return {"ok": True, "mensaje": "API Key revocada exitosamente."}
+
+# GET /sandbox — obtener key de sandbox
+@router.get("/sandbox", summary="Obtener API Key de sandbox")
+async def obtener_sandbox_key(
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data.get("emisor_id")
+    res = await db.execute(text("""
+        SELECT id, key_prefix, key_plain, created_at, last_used_at
+        FROM api_keys
+        WHERE emisor_id = :eid AND es_sandbox = true AND revoked = false
+        ORDER BY created_at DESC
+        LIMIT 1
+    """), {"eid": emisor_id})
+    key = res.fetchone()
+    if not key:
+        return {"ok": True, "data": None}
+    return {
+        "ok": True,
+        "data": {
+            "id":           key.id,
+            "key":          key.key_plain,  # ← texto plano
+            "created_at":   str(key.created_at),
+            "last_used_at": str(key.last_used_at) if key.last_used_at else None,
+        }
+    }
+
+# POST /sandbox/regenerar — regenerar key de sandbox
+@router.post("/sandbox/regenerar", summary="Regenerar API Key de sandbox")
+async def regenerar_sandbox_key(
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    import secrets, hashlib
+    emisor_id = auth_data.get("emisor_id")
+
+    # Revocar key anterior si existe
+    await db.execute(text("""
+        UPDATE api_keys SET revoked = true
+        WHERE emisor_id = :eid AND es_sandbox = true
+    """), {"eid": emisor_id})
+
+    raw_key    = f"kp_test_{secrets.token_urlsafe(32)}"
+    key_hash   = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:10]
+
+    res = await db.execute(text("""
+        INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, key_plain, revoked, es_sandbox)
+        VALUES (:eid, 'Sandbox Key', :hash, :prefix, :key_plain, false, true)
+        RETURNING id, created_at
+    """), {
+        "eid":       emisor_id,
+        "hash":      key_hash,
+        "prefix":    key_prefix,
+        "key_plain": raw_key,
+    })
+    nueva = res.fetchone()
+    await db.commit()
+
+    return {
+        "ok": True,
+        "data": {
+            "id":           nueva.id,
+            "key":          raw_key,
+            "created_at":   str(nueva.created_at),
+            "last_used_at": None,
+        }
+    }
