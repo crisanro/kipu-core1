@@ -20,15 +20,21 @@ NODE_SIGNER_URL = f"{settings.NODE_SIGNER_URL}/api/firmar"
 
 # ── Cliente ────────────────────────────────────────────────────────────────────
 
+import uuid as uuid_lib
+
+# Aliases reconocidos como consumidor final
+_CONSUMIDOR_FINAL_ALIASES = {
+    "consumidor_final",
+    "cliente-final",
+    "consumidor-final",
+    "9999999999999",
+    "cf",
+}
+
 async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession) -> tuple[dict, any]:
-    """
-    Resuelve la identidad del cliente desde cliente_id, objeto cliente, o consumidor final.
-    Retorna (cliente_final, cliente_emisor_id).
-    """
     cliente_id    = factura_data.get("cliente_id")
     cliente_obj   = factura_data.get("cliente")
     cliente_emisor_id = None
-
     cliente_final = {
         "identificacion": None,
         "razon_social":   None,
@@ -39,7 +45,7 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
     }
 
     # ── Consumidor Final ───────────────────────────────────────────────────────
-    if cliente_id and str(cliente_id).strip().lower() == "consumidor_final":
+    if cliente_id and str(cliente_id).strip().lower() in _CONSUMIDOR_FINAL_ALIASES:
         return {
             "identificacion": "9999999999999",
             "razon_social":   "CONSUMIDOR FINAL",
@@ -51,6 +57,15 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
 
     # ── Por UUID ───────────────────────────────────────────────────────────────
     if cliente_id and str(cliente_id).strip():
+        # Validar formato UUID antes de ir a la DB
+        try:
+            uuid_lib.UUID(str(cliente_id))
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'cliente_id' inválido: '{cliente_id}'. Debe ser un UUID, 'consumidor_final', o usa el objeto 'cliente'."
+            )
+
         res = await db.execute(text("""
             SELECT id, tipo_identificacion_sri, identificacion, razon_social,
                    direccion, email, telefono
@@ -77,7 +92,6 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
         email          = cliente_obj.get("email")
         direccion      = cliente_obj.get("direccion", "S/N")
         telefono       = cliente_obj.get("telefono", "")
-
         cliente_final.update({
             "identificacion": identificacion,
             "razon_social":   razon_social,
@@ -86,8 +100,6 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
             "telefono":       telefono,
             "tipo_id":        tipo_id,
         })
-
-        # Buscar o crear en clientes_emisor
         if tipo_id in ("04", "05", "06", "08") and identificacion:
             try:
                 res = await db.execute(text("""
@@ -96,7 +108,6 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
                     WHERE emisor_id = :eid AND identificacion = :id
                 """), {"eid": emisor_id, "id": identificacion})
                 existente = res.fetchone()
-
                 if existente:
                     cliente_emisor_id             = existente.id
                     cliente_final["razon_social"] = existente.razon_social
@@ -117,14 +128,12 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
                     cliente_emisor_id = res_creacion.get("uid")
             except Exception as e:
                 print(f"⚠️ Cliente no persistido, modo invitado: {e}")
-
         return cliente_final, cliente_emisor_id
 
     raise HTTPException(
         status_code=400,
         detail="Debe proporcionar 'cliente_id' o un objeto 'cliente' completo."
     )
-
 
 # ── Items ──────────────────────────────────────────────────────────────────────
 
