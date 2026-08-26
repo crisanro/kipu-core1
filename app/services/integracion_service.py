@@ -56,10 +56,21 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
                     SELECT
                         id, fecha_emision, estado_sri,
                         importe_total, clave_acceso, numero_doc,
-                        tipo_doc, created_at
+                        tipo_doc, created_at,
+                        CASE tipo_doc
+                            WHEN 'RET' THEN datos->'infoCompRetencion'->>'razonSocialSujetoRetenido'
+                            ELSE             datos->'infoFactura'->>'razonSocialComprador'
+                        END AS cliente_razon_social,
+                        CASE tipo_doc
+                            WHEN 'RET' THEN datos->'infoCompRetencion'->>'identificacionSujetoRetenido'
+                            ELSE             datos->'infoFactura'->>'identificacionComprador'
+                        END AS cliente_identificacion,
+                        CASE tipo_doc
+                            WHEN 'RET' THEN datos->'infoCompRetencion'->>'tipoIdentificacionSujetoRetenido'
+                            ELSE             datos->'infoFactura'->>'tipoIdentificacionComprador'
+                        END AS cliente_tipo_identificacion
                     FROM documentos_emitidos
                     WHERE emisor_id = e.id
-                      AND tipo_doc IN ('FAC', 'LIQ')
                     ORDER BY created_at DESC
                     LIMIT 20
                 ) last_docs
@@ -95,10 +106,10 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
     result = {
         "ok": True,
         "emisor": {
-            "ruc":             data["ruc"],
-            "razon_social":    data["razon_social"],
+            "ruc":              data["ruc"],
+            "razon_social":     data["razon_social"],
             "nombre_comercial": data["nombre_comercial"],
-            "ambiente":        "PRUEBAS" if data["ambiente"] == 1 else "PRODUCCIÓN",
+            "ambiente":         "PRUEBAS" if data["ambiente"] == 1 else "PRODUCCIÓN",
             "firma": {
                 "valida":         firma_valida,
                 "vencimiento":    expiracion.isoformat() if expiracion else None,
@@ -110,8 +121,8 @@ async def obtener_status_core(emisor_id: int, db: AsyncSession):
             "estado": sub_estado,
             "plan":   data["sub_plan"],
         },
-        "balance_api":  data["balance_api"],
-        "historial":    data["ultimos_documentos"] or [],
+        "balance_api": data["balance_api"],
+        "historial":   data["ultimos_documentos"] or [],
     }
 
     await cache_set(cache_key, result, TTL.STATUS_INTEGRACION)
