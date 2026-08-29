@@ -229,7 +229,7 @@ async def emitir_documento_core(
 # BLOQUE 0 — VERIFICAR ACCESO
 # =============================================================================
 async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, db: AsyncSession):
-    # Validar firma electrónica (aplica para Sandbox y Producción)
+    # Validar firma electrónica
     res_firma = await db.execute(text("""
         SELECT p12_path, p12_expiration 
         FROM emisores WHERE id = :eid
@@ -241,14 +241,13 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
             status_code=402,
             detail="Debes cargar tu firma electrónica antes de emitir."
         )
-
     if not firma.p12_expiration or firma.p12_expiration <= date.today():
         raise HTTPException(
             status_code=402,
             detail="Tu firma electrónica está vencida. Actualízala para continuar."
         )
 
-    # Sandbox — sin verificación de créditos ni suscripción
+    # ── Sandbox ───────────────────────────────────────────────────────────────
     if es_sandbox:
         res = await db.execute(text("""
             SELECT e.* FROM emisores e WHERE e.id = :eid
@@ -256,53 +255,96 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
         emisor = res.fetchone()
         if not emisor:
             raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-        return emisor, {"tipo": "sandbox", "descontar_credito": False}
 
-    # Producción
-    if api_key_id:
-        res = await db.execute(text("""
-            SELECT e.*, COALESCE(uc.balance, 0) AS balance
-            FROM emisores e
-            LEFT JOIN user_credits uc ON e.id = uc.emisor_id
-            WHERE e.id = :eid
-        """), {"eid": emisor_id})
-        emisor = res.fetchone()
-        if not emisor or (getattr(emisor, "balance", 0) or 0) <= 0:
-            raise HTTPException(status_code=402, detail="Créditos insuficientes.")
-        await db.execute(text("""
-            SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
-        """), {"eid": emisor_id})
-        return emisor, {"tipo": "api", "descontar_credito": True}
-    else:
-        res = await db.execute(text("""
-            SELECT e.*,
-                   s.estado               AS sub_estado,
-                   s.current_period_end,
-                   COALESCE(uc.balance, 0) AS balance
-            FROM emisores e
-            LEFT JOIN subscriptions s  ON e.id = s.emisor_id
-            LEFT JOIN user_credits  uc ON e.id = uc.emisor_id
-            WHERE e.id = :eid
-        """), {"eid": emisor_id})
-        emisor = res.fetchone()
-        if not emisor:
-            raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-        sub_estado = getattr(emisor, "sub_estado", None)
-        balance    = getattr(emisor, "balance", 0) or 0
-        if sub_estado not in ("ACTIVO", "TRIAL") and balance <= 0:
-            raise HTTPException(
-                status_code=402,
-                detail="Se requiere suscripción activa o créditos API para emitir."
-            )
-        usa_creditos = sub_estado not in ("ACTIVO", "TRIAL") and balance > 0
-        if usa_creditos:
-            await db.execute(text("""
-                SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
+        redis    = await get_redis()
+        hoy      = datetime.now(TZ_EC).strftime("%Y-%m-%d")
+        key_sand = f"kipu:usage:sandbox:{emisor_id}:{hoy}"
+
+        uso_hoy_raw = await redis.get(key_sand)
+        if uso_hoy_raw is None:
+            # Redis vacío — recontar desde DB
+            res_count = await db.execute(text("""
+                SELECT COUNT(*) FROM documentos_emitidos
+                WHERE emisor_id  = :eid
+                  AND es_sandbox = true
+                  AND DATE(created_at AT TIME ZONE 'America/Guayaquil') = CURRENT_DATE
             """), {"eid": emisor_id})
-        return emisor, {
-            "tipo":              "credito" if usa_creditos else "web",
-            "descontar_credito": usa_creditos,
-        }
+            uso_hoy = res_count.scalar() or 0
+            await redis.set(key_sand, uso_hoy, ex=86400)  # TTL 24h
+        else:
+            uso_hoy = int(uso_hoy_raw)
+
+        if uso_hoy >= 100:
+            raise HTTPException(
+                status_code=429,
+                detail="Límite de 100 documentos de prueba por día alcanzado."
+            )
+
+        return emisor, {"tipo": "sandbox", "descontar_credito": False, "redis_key": key_sand, "redis_ttl": 1}
+
+    # ── Producción ────────────────────────────────────────────────────────────
+    res = await db.execute(text("""
+        SELECT e.*,
+               COALESCE(uc.balance, 0) AS balance,
+               s.estado                AS sub_estado,
+               s.current_period_end,
+               s.api_limit_mensual
+        FROM emisores e
+        LEFT JOIN user_credits  uc ON e.id = uc.emisor_id
+        LEFT JOIN subscriptions s  ON e.id = s.emisor_id
+        WHERE e.id = :eid
+    """), {"eid": emisor_id})
+    emisor = res.fetchone()
+    if not emisor:
+        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
+
+    sub_estado = getattr(emisor, "sub_estado", None)
+    balance    = getattr(emisor, "balance", 0) or 0
+    tiene_sub  = sub_estado in ("ACTIVO", "TRIAL")
+
+    if not tiene_sub and balance <= 0:
+        raise HTTPException(
+            status_code=402,
+            detail="Se requiere suscripción activa o créditos API para emitir."
+        )
+
+    # Suscriptor — verificar límite mensual
+    if tiene_sub:
+        limite   = getattr(emisor, "api_limit_mensual", 200) or 200
+        redis    = await get_redis()
+        mes      = datetime.now(TZ_EC).strftime("%Y-%m")
+        key_prod = f"kipu:usage:prod:{emisor_id}:{mes}"
+
+        uso_mes_raw = await redis.get(key_prod)
+        if uso_mes_raw is None:
+            # Redis vacío — recontar desde DB
+            res_count = await db.execute(text("""
+                SELECT COUNT(*) FROM documentos_emitidos
+                WHERE emisor_id  = :eid
+                  AND es_sandbox = false
+                  AND DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guayaquil')
+                    = DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guayaquil')
+            """), {"eid": emisor_id})
+            uso_mes = res_count.scalar() or 0
+            await redis.set(key_prod, uso_mes, ex=35 * 86400)  # TTL 35 días
+        else:
+            uso_mes = int(uso_mes_raw)
+
+        if uso_mes >= limite:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Límite de {limite} documentos por mes alcanzado. Adquiere créditos adicionales para continuar."
+            )
+
+        tipo = "api" if api_key_id else "web"
+        return emisor, {"tipo": tipo, "descontar_credito": False, "redis_key": key_prod, "redis_ttl": 35}
+
+    # Sin suscripción — usa créditos
+    await db.execute(text("""
+        SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
+    """), {"eid": emisor_id})
+    tipo = "api" if api_key_id else "credito"
+    return emisor, {"tipo": tipo, "descontar_credito": True, "redis_key": None}
 
 
 # =============================================================================
@@ -887,6 +929,7 @@ async def _construir_xml(
 # =============================================================================
 # BLOQUE 5 — PERSISTIR
 # =============================================================================
+
 async def _persistir(
     tipo_doc, cod_doc, xml_firmado_str, xml_obj, xml_root,
     calculos, emisor, punto_emision, cliente_final, cliente_id,
@@ -896,9 +939,7 @@ async def _persistir(
     es_sandbox: bool = False,
     db = None,
 ) -> str:
-    carpeta = _carpeta_por_tipo(tipo_doc)
-
-    # Sandbox va a subcarpeta separada para limpieza periódica
+    carpeta  = _carpeta_por_tipo(tipo_doc)
     prefijo  = "sandbox/" if es_sandbox else ""
     xml_path = f"{emisor.ruc}/{prefijo}{carpeta}/{clave_acceso}.xml"
     upload_file(xml_path, xml_firmado_str.encode("utf-8"), "text/xml")
@@ -962,7 +1003,6 @@ async def _persistir(
         "doc_origen_recibido_id": str(doc_origen_recibido.id) if doc_origen_recibido and getattr(doc_origen_recibido, "id", None) else None,
         "es_sandbox":             es_sandbox,
     })
-
     doc_id = str(res.scalar())
 
     if tipo_doc in ("FAC", "LIQ") and calculos:
@@ -970,8 +1010,20 @@ async def _persistir(
 
     await _invalidar_cache(emisor.id)
 
-    redis = await get_redis()
-    await redis.lpush("kipu:queue:emision", doc_id)
+    # ── Redis: contador de uso + cola SRI ─────────────────────────────────────
+    try:
+        redis     = await get_redis()
+        redis_key = acceso.get("redis_key")
+        if redis_key:
+            nuevo = await redis.incr(redis_key)
+            if nuevo == 1:
+                # Primera emisión del período — establecer TTL
+                ttl_dias = acceso.get("redis_ttl", 1)  # sandbox=1día, prod=35días
+                await redis.expire(redis_key, ttl_dias * 86400)
+        # Todos van al SRI — el worker decide la URL según es_sandbox
+        await redis.lpush("kipu:queue:emision", doc_id)
+    except Exception as e:
+        print(f"[Usage/Queue] ⚠️ Error Redis: {e}")
 
     return doc_id
 

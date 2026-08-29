@@ -14,23 +14,19 @@ async def verify_api_key(
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key faltante")
 
-    # Detectar sandbox por prefix
     es_sandbox = x_api_key.startswith("kp_test_")
+    key_hash   = hashlib.sha256(x_api_key.encode('utf-8')).hexdigest()
 
-    key_hash = hashlib.sha256(x_api_key.encode('utf-8')).hexdigest()
-    
-    query = text("""
+    result   = await db.execute(text("""
         SELECT id, emisor_id, nombre, es_sandbox
         FROM api_keys 
         WHERE key_hash = :hash AND revoked = false
-    """)
-    result = await db.execute(query, {"hash": key_hash})
+    """), {"hash": key_hash})
     key_data = result.fetchone()
 
     if not key_data:
         raise HTTPException(status_code=403, detail="API Key inválida o revocada")
 
-    # Validar que el prefix coincida con es_sandbox en DB
     if key_data.es_sandbox != es_sandbox:
         raise HTTPException(
             status_code=403,
@@ -47,9 +43,8 @@ async def verify_api_key(
         "emisor_id":  key_data.emisor_id,
         "api_key_id": key_data.id,
         "es_sandbox": es_sandbox,
-        "unlimited":  es_sandbox,  # sandbox nunca descuenta créditos
         "role":       "external_app",
-        "app_name":   key_data.nombre
+        "app_name":   key_data.nombre,
     }
 
 

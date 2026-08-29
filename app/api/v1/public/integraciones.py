@@ -56,23 +56,18 @@ async def api_emit(
             detail="Se requiere el header X-Idempotency-Key. Usa un UUID v4 único por comprobante."
         )
 
-    # ── Auth — tres casos ─────────────────────────────────────────────────────
+    # ── Auth ──────────────────────────────────────────────────────────────────
     es_interno = False
-
     if x_internal_key and x_internal_key == settings.INTERNAL_API_KEY:
-        # Servicio interno (Komandapp, Wappti) — requiere api_key para identificar emisor
         if not x_api_key:
             raise HTTPException(
                 status_code=401,
                 detail="Servicios internos requieren X-Api-Key para identificar el emisor."
             )
-        auth = await verify_api_key(x_api_key, db)
-        es_interno = True  # bypass de créditos
-
+        auth       = await verify_api_key(x_api_key, db)
+        es_interno = True
     elif x_api_key:
-        # Cliente externo — cobra créditos normalmente
         auth = await verify_api_key(x_api_key, db)
-
     else:
         raise HTTPException(
             status_code=401,
@@ -81,6 +76,7 @@ async def api_emit(
 
     emisor_id  = auth["emisor_id"]
     api_key_id = auth.get("api_key_id") if not es_interno else None
+    es_sandbox = auth.get("es_sandbox", False)
 
     # ── Idempotencia ──────────────────────────────────────────────────────────
     cached = await verificar_idempotency(emisor_id, x_idempotency_key)
@@ -101,7 +97,8 @@ async def api_emit(
         data       = data,
         emisor_id  = emisor_id,
         db         = db,
-        api_key_id = api_key_id,  # None si es interno → no descuenta créditos
+        api_key_id = api_key_id,
+        es_sandbox = es_sandbox,
     )
 
     if result.get("ok"):

@@ -107,20 +107,24 @@ async def onboarding(
             profile_id = None
 
         # Crear emisor
+        tipo_emisor = "JURIDICO" if data.ruc[2] == "9" else "NATURAL"
+
         res_emisor = await db.execute(text("""
             INSERT INTO emisores (
                 ruc, razon_social, nombre_comercial,
-                direccion_matriz, obligado_contabilidad, contribuyente_especial, ambiente
+                direccion_matriz, obligado_contabilidad, contribuyente_especial, ambiente,
+                tipo_emisor
             )
-            VALUES (:ruc, :rs, :nc, :dir, :obl, :ce, 1)
+            VALUES (:ruc, :rs, :nc, :dir, :obl, :ce, 1, :tipo)
             RETURNING id
         """), {
-            "ruc": data.ruc,
-            "rs":  mayusculas(data.razon_social),
-            "nc":  mayusculas(data.nombre_comercial),
-            "dir": mayusculas(data.direccion_matriz),
-            "obl": (data.obligado_contabilidad or "NO").upper(),
-            "ce":  (data.contribuyente_especial or "").upper(),
+            "ruc":  data.ruc,
+            "rs":   mayusculas(data.razon_social),
+            "nc":   mayusculas(data.nombre_comercial),
+            "dir":  mayusculas(data.direccion_matriz),
+            "obl":  (data.obligado_contabilidad or "NO").upper(),
+            "ce":   (data.contribuyente_especial or "").upper(),
+            "tipo": tipo_emisor,
         })
         new_emisor_id = res_emisor.scalar()
 

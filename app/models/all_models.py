@@ -49,7 +49,7 @@ class Emisor(Base):
     razon_social            = Column(Text, nullable=False)
     nombre_comercial        = Column(Text)
     direccion_matriz        = Column(Text, nullable=False)
-    tipo_emisor             = Column(String(10), nullable=False, default="NATURAL")  # NATURAL | JURIDICO
+    tipo_emisor = Column(String(10), nullable=False, server_default="NATURAL")
     contribuyente_especial  = Column(String(13))
     obligado_contabilidad   = Column(String(2), default="NO")
     ambiente                = Column(SmallInteger, default=1)       # 1=Pruebas 2=Producción
@@ -124,6 +124,7 @@ class Subscription(Base):
     emisor_id               = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False, unique=True)
     plan                    = Column(String(20), nullable=False)             # NATURAL | JURIDICO
     periodo                 = Column(String(10), nullable=False)             # MENSUAL | ANUAL
+    api_limit_mensual       = Column(Integer, nullable=True, default=200)
     estado                  = Column(String(20), nullable=False, default="TRIAL")
     stripe_subscription_id  = Column(String(50), unique=True, nullable=True)
     stripe_price_id         = Column(String(50), nullable=True)
