@@ -207,7 +207,6 @@ async def consultar_comprobante(
 ):
     if body.hpValue:
         return JSONResponse(status_code=400, content={"error": "Bot detectado."})
-
     if not REGEX_CLAVE.match(clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave de acceso inválida."})
 
@@ -231,20 +230,56 @@ async def consultar_comprobante(
         print(f"[Turnstile] ⚠️ Error: {e}")
         return JSONResponse(status_code=500, content={"error": "Error de validación externa."})
 
+    # Cache Redis
+    cache_key = f"kipu:consulta:{clave_acceso}"
+    try:
+        redis  = await get_redis()
+        cached = await redis.get(cache_key)
+        if cached:
+            import json
+            return JSONResponse(content=json.loads(cached))
+    except Exception as e:
+        print(f"[Consulta Cache] ⚠️ {e}")
+
     try:
         res = await db.execute(text("""
             SELECT
                 d.clave_acceso, d.numero_doc, d.tipo_doc, d.cod_doc,
-                d.fecha_emision, d.estado_sri, d.mensajes_sri,
-                d.importe_total,
-                e.razon_social AS emisor_nombre,
-                e.ruc          AS emisor_ruc
+                d.fecha_emision, d.fecha_autorizacion,
+                d.estado_sri, d.mensajes_sri,
+                d.importe_total, d.datos,
+                e.razon_social  AS emisor_nombre,
+                e.ruc           AS emisor_ruc,
+                e.direccion_matriz,
+                -- Comprador según tipo de doc
+                COALESCE(
+                    d.datos->'infoFactura'->>'razonSocialComprador',
+                    d.datos->'infoLiquidacionCompra'->>'razonSocialProveedor',
+                    d.datos->'infoNotaCredito'->>'razonSocialComprador',
+                    d.datos->'infoNotaDebito'->>'razonSocialComprador',
+                    d.datos->'infoCompRetencion'->>'razonSocialSujetoRetenido'
+                ) AS comprador_nombre,
+                COALESCE(
+                    d.datos->'infoFactura'->>'identificacionComprador',
+                    d.datos->'infoLiquidacionCompra'->>'identificacionProveedor',
+                    d.datos->'infoNotaCredito'->>'identificacionComprador',
+                    d.datos->'infoNotaDebito'->>'identificacionComprador',
+                    d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido'
+                ) AS comprador_id,
+                -- Totales
+                COALESCE(
+                    (d.datos->'infoFactura'->>'totalSinImpuestos')::numeric,
+                    (d.datos->'infoLiquidacionCompra'->>'totalSinImpuestos')::numeric,
+                    (d.datos->'infoNotaCredito'->>'totalSinImpuestos')::numeric
+                ) AS subtotal,
+                -- Resumen impuestos
+                d.datos->'resumenImpuestos' AS impuestos
             FROM documentos_emitidos d
             JOIN emisores e ON d.emisor_id = e.id
             WHERE d.clave_acceso = :clave
         """), {"clave": clave_acceso})
-
         doc = res.fetchone()
+
         if not doc:
             return JSONResponse(status_code=404, content={
                 "success":         False,
@@ -256,19 +291,47 @@ async def consultar_comprobante(
         base_url   = settings.BACKEND_URL
 
         if estado == "AUTORIZADO":
-            return {
+            # Procesar impuestos
+            impuestos_raw = doc.impuestos or []
+            impuestos     = []
+            total_iva     = 0.0
+            for imp in impuestos_raw:
+                base  = float(imp.get("baseImponible", 0))
+                valor = float(imp.get("valor", imp.get("valorImpuesto", 0)))
+                tarifa = imp.get("tarifa", imp.get("codigoPorcentaje", ""))
+                total_iva += valor
+                impuestos.append({
+                    "tarifa":  tarifa,
+                    "base":    round(base, 2),
+                    "valor":   round(valor, 2),
+                })
+
+            subtotal = float(doc.subtotal or 0)
+            total    = float(doc.importe_total)
+
+            response_data = {
                 "success": True,
                 "estado":  "AUTORIZADO",
                 "data": {
                     "cabecera": {
-                        "tipo":    tipo_label,
-                        "emisor":  doc.emisor_nombre,
-                        "ruc":     doc.emisor_ruc,
-                        "numero":  doc.numero_doc,
-                        "fecha":   str(doc.fecha_emision),
+                        "tipo":              tipo_label,
+                        "emisor":            doc.emisor_nombre,
+                        "ruc":               doc.emisor_ruc,
+                        "direccion":         doc.direccion_matriz,
+                        "numero":            doc.numero_doc,
+                        "fecha_emision":     str(doc.fecha_emision),
+                        "fecha_autorizacion": doc.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S") if doc.fecha_autorizacion else None,
+                        "clave_acceso":      clave_acceso,
+                    },
+                    "comprador": {
+                        "nombre":          doc.comprador_nombre,
+                        "identificacion":  doc.comprador_id,
                     },
                     "totales": {
-                        "total": float(doc.importe_total),
+                        "subtotal":   round(subtotal, 2),
+                        "impuestos":  impuestos,
+                        "total_iva":  round(total_iva, 2),
+                        "total":      round(total, 2),
                     },
                     "links": {
                         "pdf": f"{base_url}/api/v1/public/pdf/{clave_acceso}",
@@ -276,6 +339,15 @@ async def consultar_comprobante(
                     }
                 }
             }
+
+            # Cachear 2 horas
+            try:
+                import json
+                await redis.setex(cache_key, 7200, json.dumps(response_data))
+            except Exception as e:
+                print(f"[Consulta Cache] ⚠️ Error guardando: {e}")
+
+            return response_data
 
         elif estado in ("RECIBIDA", "FIRMADO"):
             return JSONResponse(status_code=200, content={
