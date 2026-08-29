@@ -143,8 +143,8 @@ async def crear_checkout_suscripcion(
             customer              = stripe_customer_id,
             mode                  = "subscription",
             line_items            = [{"price": price_id, "quantity": 1}],
-            success_url           = f"{settings.FRONTEND_URL}/configuracion?tab=suscripcion&pago=exitoso",
-            cancel_url            = f"{settings.FRONTEND_URL}/configuracion?tab=suscripcion&pago=cancelado",
+            success_url           = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan={plan}&periodo={periodo}",
+            cancel_url            = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
             allow_promotion_codes = True,
             metadata              = {
                 "emisor_id": str(emisor_id),

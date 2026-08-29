@@ -123,8 +123,8 @@ async def crear_checkout_creditos(
                 },
                 "quantity": 1,
             }],
-            success_url          = f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=exitoso",
-            cancel_url           = f"{settings.FRONTEND_URL}/configuracion?tab=creditos&pago=cancelado",
+            success_url = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=creditos&cantidad={plan.cantidad}&plan={plan.nombre}",
+            cancel_url  = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
             metadata             = {
                 "emisor_id": str(emisor_id),
                 "tipo":      "CREDITOS",
