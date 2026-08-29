@@ -37,7 +37,8 @@ async def obtener_dashboard_core(
     email_verificado: bool,
     fecha_inicio:     date,
     fecha_fin:        date,
-    db:               AsyncSession
+    db:               AsyncSession,
+    sandbox:            bool = False,
 ):
     try:
         # ═══════════════════════════════════════════════════════════
@@ -102,7 +103,7 @@ async def obtener_dashboard_core(
             meses = _meses_en_rango(fecha_inicio, fecha_fin)
 
             for (año, mes) in meses:
-                cache_key_mes = f"dashboard_docs:{current_emisor_id}:{año}:{mes:02d}"
+                cache_key_mes = f"dashboard_docs:{current_emisor_id}:{año}:{mes:02d}:{sandbox}"
                 docs_mes      = await cache_get(cache_key_mes)
 
                 if docs_mes is None:
@@ -118,17 +119,19 @@ async def obtener_dashboard_core(
                             est.codigo AS estab,
                             p.codigo   AS punto
                         FROM documentos_emitidos d
-                        LEFT JOIN puntos_emision p    ON d.punto_emision_id = p.id
+                        LEFT JOIN puntos_emision p     ON d.punto_emision_id = p.id
                         LEFT JOIN establecimientos est ON p.establecimiento_id = est.id
-                        WHERE d.emisor_id = :eid
-                          AND d.fecha_emision >= :fini
-                          AND d.fecha_emision <= :ffin
-                          AND d.tipo_doc IN ('FAC', 'LIQ')
+                        WHERE d.emisor_id      = :eid
+                        AND d.fecha_emision  >= :fini
+                        AND d.fecha_emision  <= :ffin
+                        AND d.tipo_doc       IN ('FAC', 'LIQ')
+                        AND d.es_sandbox     = :sandbox
                         ORDER BY d.fecha_emision DESC, d.created_at DESC
                     """), {
-                        "eid":  current_emisor_id,
-                        "fini": primer_dia,
-                        "ffin": ultimo_dia,
+                        "eid":     current_emisor_id,
+                        "fini":    primer_dia,
+                        "ffin":    ultimo_dia,
+                        "sandbox": sandbox,
                     })
 
                     docs_mes = []

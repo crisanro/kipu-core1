@@ -29,7 +29,7 @@ class TTL:
 class CK:
     """Cache Keys — prefijos estandarizados."""
     EMISOR          = "emisor:{eid}"
-    DASHBOARD       = "dashboard:{eid}:{fi}:{ff}"
+    DASHBOARD       = "dashboard:{eid}:{fi}:{ff}:{sb}"
     CLIENTES        = "clientes:{eid}"
     CLIENTE_DETALLE = "cliente:{eid}:{cid}"
     ESTRUCTURA      = "estructura:{eid}"

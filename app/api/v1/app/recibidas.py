@@ -7,7 +7,7 @@
 
 from typing import Optional
 from datetime import date, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
@@ -84,6 +84,27 @@ class DocumentoRecibidoUpdate(BaseModel):
     fecha_pago:              Optional[date]               = None
     doc_origen_recibido_id:  Optional[str]               = None  # ← agregar
     doc_origen_emitido_id:   Optional[str]               = None  # ← agregar
+
+class DocumentoFisicoCreate(BaseModel):
+    # Proveedor
+    ruc_proveedor:          str
+    razon_social_proveedor: str
+    # Tipo
+    tipo_doc: str = "FAC"
+    cod_doc:  str = "01"
+    # Identificación
+    numero_doc:    str
+    fecha_emision: date
+    # Totales
+    subtotal_0:    Decimal = Decimal("0.00")  # base gravada 0%
+    subtotal_iva:  Decimal = Decimal("0.00")  # base gravada con IVA
+    tarifa_iva:    int     = 15               # 0 | 15
+    valor_iva:     Decimal = Decimal("0.00")
+    importe_total: Decimal
+    # Fiscal
+    deducible_renta:        bool          = True
+    credito_tributario_iva: bool          = False
+    notas:                  Optional[str] = None
 
 
 # =============================================================================
@@ -220,6 +241,181 @@ async def registrar_documento_recibido(
         "mensaje": "Documento recibido registrado correctamente.",
     }
 
+
+@router.post("/fisico", summary="Registrar documento físico (sin XML)", status_code=201)
+async def registrar_documento_fisico(
+    ruc_proveedor:          str        = Form(...),
+    razon_social_proveedor: str        = Form(...),
+    tipo_doc:               str        = Form("FAC"),
+    numero_doc:             str        = Form(...),
+    fecha_emision:          date       = Form(...),
+    subtotal_0:             Decimal    = Form(Decimal("0.00")),
+    subtotal_iva:           Decimal    = Form(Decimal("0.00")),
+    tarifa_iva:             int        = Form(15),
+    valor_iva:              Decimal    = Form(Decimal("0.00")),
+    importe_total:          Decimal    = Form(...),
+    deducible_renta:        bool       = Form(True),
+    credito_tributario_iva: bool       = Form(False),
+    notas:                  Optional[str] = Form(None),
+    imagen:                 Optional[UploadFile] = File(None),
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data["emisor_id"]
+
+    # Verificar suscripción
+    res_sub = await db.execute(text("""
+        SELECT estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    sub = res_sub.fetchone()
+    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
+        raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
+
+    # Validar tipo_doc
+    tipos_validos = ("FAC", "LIQ", "NCR", "NDB", "RET")
+    tipo_doc = tipo_doc.upper()
+    if tipo_doc not in tipos_validos:
+        raise HTTPException(status_code=400, detail=f"tipo_doc inválido. Válidos: {', '.join(tipos_validos)}")
+
+    # Mapear cod_doc
+    cod_map = {"FAC": "01", "LIQ": "03", "NCR": "04", "NDB": "05", "RET": "07"}
+    cod_doc = cod_map.get(tipo_doc, "01")
+
+    # Obtener RUC emisor
+    res_emisor = await db.execute(text("""
+        SELECT ruc FROM emisores WHERE id = :eid
+    """), {"eid": emisor_id})
+    emisor = res_emisor.fetchone()
+    if not emisor:
+        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
+
+    # Generar clave_acceso sintética para físicos
+    # Formato: FISICO-{emisor_id}-{numero_doc}-{fecha}
+    clave_sintetica = f"FISICO-{emisor_id}-{numero_doc.replace('-','')}-{fecha_emision.strftime('%Y%m%d')}"
+
+    # Verificar duplicado por número + proveedor
+    res_dup = await db.execute(text("""
+        SELECT id FROM documentos_recibidos
+        WHERE numero_doc = :num AND ruc_proveedor = :ruc AND emisor_id = :eid
+    """), {"num": numero_doc, "ruc": ruc_proveedor, "eid": emisor_id})
+    if res_dup.fetchone():
+        raise HTTPException(status_code=409, detail="Este documento ya fue registrado.")
+
+    # Subir imagen si existe
+    imagen_path = None
+    if imagen and imagen.filename:
+        extensiones_validas = (".jpg", ".jpeg", ".png", ".webp", ".pdf")
+        ext = "".join(
+            c for c in imagen.filename.lower()
+            if c in ".abcdefghijklmnopqrstuvwxyz0123456789"
+        )
+        # Determinar extensión
+        for e in extensiones_validas:
+            if imagen.filename.lower().endswith(e):
+                ext = e
+                break
+        else:
+            raise HTTPException(status_code=400, detail="Formato de imagen no soportado. Usa JPG, PNG, WEBP o PDF.")
+
+        img_bytes = await imagen.read()
+        if len(img_bytes) > 10 * 1024 * 1024:  # 10MB max
+            raise HTTPException(status_code=400, detail="La imagen no puede superar 10MB.")
+
+        imagen_path = f"{emisor.ruc}/recibidas/fisicos/{clave_sintetica}{ext}"
+        try:
+            content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
+            upload_file(imagen_path, img_bytes, content_type)
+        except Exception as e:
+            print(f"⚠️ Error subiendo imagen: {e}")
+            imagen_path = None
+
+    # Construir impuestos_detalle desde totales
+    impuestos_detalle = []
+    if valor_iva > 0 and subtotal_iva > 0:
+        impuestos_detalle.append({
+            "codigoPorcentaje": str(tarifa_iva),
+            "tarifa":           str(tarifa_iva),
+            "baseImponible":    float(subtotal_iva),
+            "valor":            float(valor_iva),
+            "aplicaCredito":    credito_tributario_iva,
+        })
+    if subtotal_0 > 0:
+        impuestos_detalle.append({
+            "codigoPorcentaje": "0",
+            "tarifa":           "0",
+            "baseImponible":    float(subtotal_0),
+            "valor":            0.0,
+            "aplicaCredito":    False,
+        })
+
+    # Datos mínimos para declaración
+    datos = {
+        "fuente":          "FISICO",
+        "subtotal_0":      float(subtotal_0),
+        "subtotal_iva":    float(subtotal_iva),
+        "tarifa_iva":      tarifa_iva,
+        "valor_iva":       float(valor_iva),
+        "importe_total":   float(importe_total),
+        "tiene_imagen":    imagen_path is not None,
+    }
+
+    # Insertar en DB
+    try:
+        res = await db.execute(text("""
+            INSERT INTO documentos_recibidos (
+                emisor_id,
+                ruc_proveedor, razon_social_proveedor,
+                tipo_doc, cod_doc,
+                clave_acceso, numero_doc,
+                fecha_emision,
+                importe_total,
+                impuestos_detalle,
+                deducible_renta, credito_tributario_iva, notas,
+                estado_pago,
+                datos, xml_path,
+                fuente, procesado
+            ) VALUES (
+                :eid,
+                :ruc_prov, :razon_prov,
+                :tipo_doc, :cod_doc,
+                :clave, :numero_doc,
+                :fecha_emision,
+                :total,
+                CAST(:impuestos AS jsonb),
+                :ded_renta, :cred_iva, :notas,
+                'PENDIENTE',
+                CAST(:datos AS jsonb), :xml_path,
+                'FISICO', false
+            ) RETURNING id
+        """), {
+            "eid":           emisor_id,
+            "ruc_prov":      ruc_proveedor.strip().upper(),
+            "razon_prov":    razon_social_proveedor.strip().upper(),
+            "tipo_doc":      tipo_doc,
+            "cod_doc":       cod_doc,
+            "clave":         clave_sintetica,
+            "numero_doc":    numero_doc.strip(),
+            "fecha_emision": fecha_emision,
+            "total":         importe_total,
+            "impuestos":     json.dumps(impuestos_detalle, default=str),
+            "ded_renta":     deducible_renta,
+            "cred_iva":      credito_tributario_iva,
+            "notas":         notas,
+            "datos":         json.dumps(datos, default=str),
+            "xml_path":      imagen_path,  # reutilizamos xml_path para la imagen
+        })
+        doc_id = res.scalar()
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
+
+    return {
+        "ok":      True,
+        "id":      str(doc_id),
+        "fuente":  "FISICO",
+        "mensaje": "Documento físico registrado correctamente.",
+    }
 
 # =============================================================================
 # POST /xml — Subir XML autorizado

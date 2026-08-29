@@ -17,9 +17,11 @@ router = APIRouter()
 async def get_dashboard(
     fecha_inicio: date = Query(...),
     fecha_fin:    date = Query(...),
+    sandbox:      bool = Query(False),
     auth_data:    dict         = Depends(verify_firebase_token),
     db:           AsyncSession = Depends(get_db),
 ):
+    print(f"[Dashboard] sandbox={sandbox}, emisor_id={auth_data.get('emisor_id')}")
     emisor_id = auth_data.get("emisor_id")
 
     email_verificado = False
@@ -29,8 +31,10 @@ async def get_dashboard(
     except Exception:
         pass
 
-    cache_key = CK.fmt(CK.DASHBOARD, eid=emisor_id, fi=fecha_inicio, ff=fecha_fin)
+    cache_key = CK.fmt(CK.DASHBOARD, eid=emisor_id, fi=fecha_inicio, ff=fecha_fin, sb=sandbox)
+    print(f"[Dashboard] cache_key={cache_key}")
     cached    = await cache_get(cache_key)
+    print(f"[Dashboard] cache hit={cached is not None}")   
     if cached:
         return cached
 
@@ -41,6 +45,7 @@ async def get_dashboard(
         email_verificado = email_verificado,
         fecha_inicio     = fecha_inicio,
         fecha_fin        = fecha_fin,
+        sandbox          = sandbox, 
         db               = db,
     )
 
