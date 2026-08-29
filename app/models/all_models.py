@@ -393,7 +393,8 @@ class DocumentoEmitido(Base):
     emisor_id               = Column(Integer, ForeignKey("emisores.id"), nullable=False)
     punto_emision_id        = Column(Integer, ForeignKey("puntos_emision.id"), nullable=True)
     cliente_id              = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="SET NULL"), nullable=True)
-    api_key_id              = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)
+    api_key_id  = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)
+    created_by  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)  # ← agregar
 
     # Tipo e identificación SRI
     tipo_doc                = Column(String(5), nullable=False)     # FAC | LIQ | NCR | NDB | RET

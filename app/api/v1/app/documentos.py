@@ -112,32 +112,33 @@ async def emitir_documento(
     db:                AsyncSession = Depends(get_db),
     _rl:               None         = Depends(RateLimit(RateLimitScope.INVOICE)),
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
-        x_sandbox:         Optional[str] = Header(None, alias="X-Sandbox"),  # ← agregar
+    x_sandbox:         Optional[str] = Header(None, alias="X-Sandbox"),
 ):
-    emisor_id = auth_data.get("emisor_id")
+    emisor_id  = auth_data.get("emisor_id")
+    profile_id = auth_data.get("profile_id")  # ← agregar esto
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
-    # Idempotency obligatoria
     if not x_idempotency_key:
         raise HTTPException(
             status_code=400,
             detail="Se requiere el header X-Idempotency-Key. Usa un UUID v4 único por comprobante."
         )
-    
+
     es_sandbox = x_sandbox == "true"
-    tipo_doc = tipo_doc.upper()
+    tipo_doc   = tipo_doc.upper()
 
     cached = await verificar_idempotency(emisor_id, x_idempotency_key)
     if cached:
         return cached
 
     result = await emitir_documento_core(
-        tipo_doc  = tipo_doc,
-        data      = data.model_dump(exclude_none=True),
-        emisor_id = emisor_id,
-        db        = db,
+        tipo_doc   = tipo_doc,
+        data       = data.model_dump(exclude_none=True),
+        emisor_id  = emisor_id,
+        db         = db,
         es_sandbox = es_sandbox,
+        created_by = profile_id,  # ← agregar esto
     )
 
     if result.get("ok"):

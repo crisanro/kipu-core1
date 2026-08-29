@@ -65,6 +65,7 @@ async def emitir_documento_core(
     db:         AsyncSession,
     api_key_id: int  = None,
     es_sandbox: bool = False,
+    created_by: str  = None,
 ) -> dict:
     tipo_doc = tipo_doc.upper()
     if tipo_doc not in TIPO_DOC_MAP:
@@ -201,6 +202,7 @@ async def emitir_documento_core(
             doc_origen_emitido  = doc_origen_emitido,
             doc_origen_recibido = doc_origen_recibido,
             es_sandbox          = es_sandbox,
+            created_by          = created_by,
             db                  = db,
         )
 
@@ -936,7 +938,7 @@ async def _persistir(
     secuencial, clave_acceso, importe_total, ahora_ec,
     api_key_id, acceso, data,
     doc_origen_emitido, doc_origen_recibido,
-    es_sandbox: bool = False,
+    es_sandbox: bool = False, created_by = None,
     db = None,
 ) -> str:
     carpeta  = _carpeta_por_tipo(tipo_doc)
@@ -971,7 +973,7 @@ async def _persistir(
             estado_sri, importe_total,
             datos, xml_path, origen,
             doc_origen_emitido_id, doc_origen_recibido_id,
-            es_sandbox,
+            es_sandbox, created_by,
             created_at, updated_at
         ) VALUES (
             gen_random_uuid(),
@@ -981,7 +983,7 @@ async def _persistir(
             'FIRMADO', :total,
             CAST(:datos AS jsonb), :xml_path, :origen,
             :doc_origen_emitido_id, :doc_origen_recibido_id,
-            :es_sandbox,
+            :es_sandbox, :created_by,
             NOW(), NOW()
         ) RETURNING id
     """), {
@@ -1002,6 +1004,7 @@ async def _persistir(
         "doc_origen_emitido_id":  str(doc_origen_emitido.id) if doc_origen_emitido and getattr(doc_origen_emitido, "id", None) else None,
         "doc_origen_recibido_id": str(doc_origen_recibido.id) if doc_origen_recibido and getattr(doc_origen_recibido, "id", None) else None,
         "es_sandbox":             es_sandbox,
+        "created_by":               str(created_by) if created_by else None,
     })
     doc_id = str(res.scalar())
 
