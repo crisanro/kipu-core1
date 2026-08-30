@@ -101,38 +101,40 @@ async def crear_checkout_creditos(
         WHERE id = :pid AND activo = true
     """), {"pid": data.plan_id})
     plan = res_plan.fetchone()
-
     if not plan:
         raise HTTPException(status_code=404, detail="Plan no encontrado.")
 
     # Obtener o crear customer
     stripe_customer_id = await _obtener_o_crear_customer(emisor_id, db)
 
+    # Extraer subtotal sin IVA
+    subtotal = round(float(plan.precio) / (1 + settings.IVA_RATE), 2)
+
     try:
         session = stripe.checkout.Session.create(
-            customer             = stripe_customer_id,
-            mode                 = "payment",
-            line_items           = [{
+            customer    = stripe_customer_id,
+            mode        = "payment",
+            line_items  = [{
                 "price_data": {
                     "currency":     "usd",
-                    "unit_amount":  int(float(plan.precio) * 100),  # USD sin IVA
+                    "unit_amount":  int(subtotal * 100),
                     "product_data": {
                         "name":        f"Kipu API — {plan.nombre}",
                         "description": f"{plan.cantidad} créditos · {plan.descripcion or ''}",
                     },
                 },
-                "quantity": 1,
+                "quantity":  1,
                 "tax_rates": [settings.STRIPE_TAX_RATE_ID],
             }],
-            success_url = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=creditos&cantidad={plan.cantidad}&plan={plan.nombre}",
-            cancel_url  = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
-            metadata             = {
+            success_url      = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=creditos&cantidad={plan.cantidad}&plan={plan.nombre}",
+            cancel_url       = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
+            metadata         = {
                 "emisor_id": str(emisor_id),
                 "tipo":      "CREDITOS",
                 "plan_id":   str(plan.id),
                 "cantidad":  str(plan.cantidad),
             },
-            invoice_creation     = {"enabled": False},  # Kipu emite su propia factura
+            invoice_creation = {"enabled": False},
         )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
