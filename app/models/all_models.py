@@ -71,6 +71,7 @@ class Emisor(Base):
     documentos_emitidos     = relationship("DocumentoEmitido", back_populates="emisor")
     documentos_recibidos    = relationship("DocumentoRecibido", back_populates="emisor")
     declaraciones           = relationship("DeclaracionSRI", back_populates="emisor")
+    reportes_tributarios = relationship("ReporteTributario", back_populates="emisor")
     notificaciones = relationship("Notificacion", back_populates="emisor")
 
 
@@ -652,3 +653,61 @@ class LeadExUsuario(Base):
     total_docs_recibidos    = Column(Integer)
     fecha_registro_original = Column(TIMESTAMP)
     fecha_eliminacion       = Column(TIMESTAMP, server_default=func.now())
+
+
+
+# =============================================================================
+# REPORTES TRIBUTARIOS
+# =============================================================================
+class ReporteTributario(Base):
+    """
+    Reportes fiscales generados — IVA (104) | Renta (102) | ATS.
+    Una vez generado para un período cerrado, se guarda y no se recalcula.
+    El período actual siempre se recalcula en tiempo real.
+
+    tipo:         IVA | RENTA | ATS
+    tipo_periodo: MENSUAL | SEMESTRAL | ANUAL
+    periodo:      primer día del período — 2026-08-01 para agosto, 2026-01-01 para año
+
+    Trazabilidad para auditoría SRI:
+    - doc_emitidos_ids:   UUIDs de todos los documentos emitidos incluidos
+    - doc_recibidos_ids:  UUIDs de todos los documentos recibidos incluidos
+    """
+    __tablename__ = "reportes_tributarios"
+    __table_args__ = (
+        UniqueConstraint(
+            "emisor_id", "tipo", "periodo",
+            name="uq_reporte_emisor_tipo_periodo"
+        ),
+    )
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+
+    # Tipo y período
+    tipo            = Column(String(10), nullable=False)   # IVA | RENTA | ATS
+    tipo_periodo    = Column(String(10), nullable=False)   # MENSUAL | SEMESTRAL | ANUAL
+    periodo         = Column(Date, nullable=False)          # 2026-08-01
+
+    # Datos calculados
+    casilleros      = Column(JSONB, nullable=False, server_default='{}')
+    preguntas       = Column(JSONB, nullable=False, server_default='{}')
+    desglose        = Column(JSONB, nullable=False, server_default='{}')
+    resumen         = Column(JSONB, nullable=False, server_default='{}')
+
+    # Trazabilidad — auditoría SRI
+    doc_emitidos_ids    = Column(JSONB, nullable=False, server_default='[]')  # lista de UUIDs
+    doc_recibidos_ids   = Column(JSONB, nullable=False, server_default='[]')  # lista de UUIDs
+    total_doc_emitidos  = Column(Integer, nullable=False, default=0)
+    total_doc_recibidos = Column(Integer, nullable=False, default=0)
+
+    # Quién y cuándo generó
+    generado_at     = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    generado_por    = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)
+
+    # Regeneración — cuando el usuario fuerza recálculo
+    regenerado_at   = Column(TIMESTAMP(timezone=True), nullable=True)
+    regenerado_por  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)
+
+    # Relaciones
+    emisor          = relationship("Emisor", back_populates="reportes_tributarios")

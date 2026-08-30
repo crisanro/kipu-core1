@@ -127,3 +127,20 @@ def path_xml_firmado(ruc: str, clave_acceso: str, fecha) -> str:
 
 def path_xml_autorizado(ruc: str, clave_acceso: str, fecha) -> str:
     return f"{ruc}/facturas/{fecha.year}/{fecha.month:02d}/{clave_acceso}.xml"
+
+
+def get_presigned_url(path: str, expires_in: int = 3600) -> str:
+    """
+    Genera una URL prefirmada para descarga directa desde R2.
+    expires_in: segundos de validez (default 1 hora)
+    """
+    try:
+        url = r2_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": BUCKET, "Key": path},
+            ExpiresIn=expires_in,
+        )
+        return url
+    except Exception as e:
+        print(f"❌ [Storage Error] Error generando presigned URL ({path}): {e}")
+        raise e
