@@ -40,7 +40,8 @@ from app.api.v1.app import (
     productos     as productos_app,
     usuarios      as usuarios_app,
     creditos      as creditos_app,
-    suscripcion   as suscripcion_app,
+    suscripcion   as suscripcion_app, 
+    audit
 )
 
 # ─── ROUTERS PUBLIC ───────────────────────────────────────────────────────────
@@ -364,6 +365,7 @@ app.include_router(apikeys_app.router,       prefix="/api/v1/app/apikeys",      
 app.include_router(notificaciones_app.router,prefix="/api/v1/app/notificaciones",          tags=["📱 Notificaciones"])
 app.include_router(suscripcion_app.router,   prefix="/api/v1/app/suscripcion",             tags=["📱 Suscripción"])
 app.include_router(creditos_app.router,      prefix="/api/v1/app/creditos",                tags=["📱 Créditos API"])
+app.include_router(audit.router, prefix="/api/v1/app/audit", tags=["Auditoría"])
 
 # =============================================================================
 # RUTAS — PUBLIC (SOLO ESTAS LLEVAN "public_export")

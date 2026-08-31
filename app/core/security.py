@@ -66,10 +66,10 @@ async def verify_firebase_token(
             raise HTTPException(status_code=401, detail="La sesión ha expirado")
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    # Consultar DB con soporte para multi-empresa ordenado por fecha de vinculación
     query = text("""
         SELECT p.id, p.email, p.role,
-               eu.emisor_id, eu.rol as emisor_rol
+               eu.emisor_id, eu.rol as emisor_rol,
+               eu.permisos
         FROM profiles p
         LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
         WHERE p.firebase_uid = :uid
@@ -83,17 +83,20 @@ async def verify_firebase_token(
         return {
             "uid":               decoded_token["uid"],
             "email":             decoded_token.get("email"),
+            "email_verified":    decoded_token.get("email_verified", False),
             "pending_provision": True
         }
 
     return {
-        "uid":        decoded_token["uid"],
-        "profile_id": profile.id,
-        "emisor_id":  profile.emisor_id,
-        "email":      profile.email,
-        "role":       profile.role or profile.emisor_rol
+        "uid":            decoded_token["uid"],
+        "profile_id":     profile.id,
+        "emisor_id":      profile.emisor_id,
+        "email":          profile.email,
+        "email_verified": decoded_token.get("email_verified", False),
+        "role":           profile.role or profile.emisor_rol,
+        "emisor_rol":     profile.emisor_rol,
+        "permisos":       profile.permisos or {},
     }
-
 
 # ─── 3. PUBLIC AUTH (Sitio Web Kipu) ──────────────────────────────────────────
 async def verify_public_origin(request: Request):

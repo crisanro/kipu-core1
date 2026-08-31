@@ -1,27 +1,28 @@
 # app/api/v1/app/apikeys.py
 import secrets
 import hashlib
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core.database import get_db
 from app.core.security import verify_firebase_token, validar_y_quemar_pin
+from app.core.permisos import verificar_permiso
 from app.schemas.seguridad import ApiKeyCreate
 from app.core.rate_limit import RateLimit, RateLimitScope
+from app.services.audit_service import audit_log
 
 router = APIRouter(tags=["Seguridad"])
+MAX_API_KEYS = 5
 
-MAX_API_KEYS = 5  # Máximo de keys activas por emisor
-
-
+# ── GET / ─────────────────────────────────────────────────────────────────────
 @router.get("", summary="Listar API Keys del emisor")
 async def listar_api_keys(
-    auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db),
-    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    _rl:       None         = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "api_keys")
     try:
         res = await db.execute(text("""
             SELECT id, nombre, revoked, created_at, last_used_at
@@ -36,7 +37,7 @@ async def listar_api_keys(
                 "nombre":       k.nombre,
                 "estado":       "activa" if not k.revoked else "revocada",
                 "created_at":   k.created_at,
-                "last_used_at": k.last_used_at
+                "last_used_at": k.last_used_at,
             }
             for k in keys
         ]
@@ -44,41 +45,53 @@ async def listar_api_keys(
         print(f"❌ Error al listar API Keys: {e}")
         raise HTTPException(status_code=500, detail="Error al obtener las API Keys.")
 
-
+# ── POST / — Crear ────────────────────────────────────────────────────────────
 @router.post("", summary="Generar una nueva API Key", status_code=201)
 async def crear_api_key(
-    data: ApiKeyCreate,
-    auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db),
-    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
+    data:      ApiKeyCreate,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    _rl:       None         = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "api_keys")
 
-    # Verificar límite de keys activas
     res_count = await db.execute(text("""
-        SELECT COUNT(*) FROM api_keys
-        WHERE emisor_id = :eid AND revoked = false
+        SELECT COUNT(*) FROM api_keys WHERE emisor_id = :eid AND revoked = false
     """), {"eid": emisor_id})
     total = res_count.scalar()
     if total >= MAX_API_KEYS:
         raise HTTPException(
             status_code=400,
-            detail=f"Has alcanzado el límite de {MAX_API_KEYS} API Keys activas. Revoca una antes de crear otra."
+            detail=f"Has alcanzado el límite de {MAX_API_KEYS} API Keys activas."
         )
 
-    # Validar PIN
     await validar_y_quemar_pin(db, emisor_id, data.pin, "CREAR_TOKEN")
 
-    # Generar key
     raw_key    = f"kp_live_{secrets.token_urlsafe(32)}"
     key_hash   = hashlib.sha256(raw_key.encode()).hexdigest()
-    key_prefix = raw_key[:8]  # Primeros caracteres para identificación/auditoría
+    key_prefix = raw_key[:8]
 
-    await db.execute(text("""
+    res = await db.execute(text("""
         INSERT INTO api_keys (emisor_id, nombre, key_hash, key_prefix, revoked)
         VALUES (:eid, :nombre, :hash, :prefix, false)
+        RETURNING id
     """), {"eid": emisor_id, "nombre": data.nombre, "hash": key_hash, "prefix": key_prefix})
+    nueva = res.fetchone()
 
+    await audit_log(
+        db        = db,
+        auth_data = auth_data,
+        accion    = "CREATE",
+        entidad   = "api_key",
+        entidad_id = str(nueva.id),
+        detalle   = {
+            "nombre":     data.nombre,
+            "key_prefix": key_prefix,
+        },
+        request   = request,
+    )
     await db.commit()
 
     return {
@@ -87,42 +100,58 @@ async def crear_api_key(
         "mensaje": "Guarda esta key en un lugar seguro. No podrás verla de nuevo."
     }
 
-
+# ── DELETE /{key_id} — Revocar ────────────────────────────────────────────────
 @router.delete("/{key_id}", summary="Revocar una API Key")
 async def revocar_api_key(
-    key_id: int,
-    pin: str,
-    auth_data: dict = Depends(verify_firebase_token),
-    db: AsyncSession = Depends(get_db),
-    _rl: None = Depends(RateLimit(RateLimitScope.GENERAL)),
+    key_id:    int,
+    pin:       str,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    _rl:       None         = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "api_keys")
 
-    # Verificar que la key pertenece al emisor
     res = await db.execute(text("""
-        SELECT id FROM api_keys
+        SELECT id, nombre, key_prefix FROM api_keys
         WHERE id = :kid AND emisor_id = :eid AND revoked = false
     """), {"kid": key_id, "eid": emisor_id})
-    if not res.fetchone():
+    key = res.fetchone()
+    if not key:
         raise HTTPException(status_code=404, detail="API Key no encontrada o ya revocada.")
 
-    # Validar PIN
     await validar_y_quemar_pin(db, emisor_id, pin, "ELIMINAR_TOKEN")
 
     await db.execute(text("""
         UPDATE api_keys SET revoked = true WHERE id = :kid AND emisor_id = :eid
     """), {"kid": key_id, "eid": emisor_id})
+
+    await audit_log(
+        db        = db,
+        auth_data = auth_data,
+        accion    = "REVOKE",
+        entidad   = "api_key",
+        entidad_id = str(key_id),
+        detalle   = {
+            "nombre":     key.nombre,
+            "key_prefix": key.key_prefix,
+        },
+        request   = request,
+    )
     await db.commit()
 
     return {"ok": True, "mensaje": "API Key revocada exitosamente."}
 
-# GET /sandbox — obtener key de sandbox
+# ── GET /sandbox ──────────────────────────────────────────────────────────────
 @router.get("/sandbox", summary="Obtener API Key de sandbox")
 async def obtener_sandbox_key(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "api_keys")
+
     res = await db.execute(text("""
         SELECT id, key_prefix, key_plain, created_at, last_used_at
         FROM api_keys
@@ -133,26 +162,27 @@ async def obtener_sandbox_key(
     key = res.fetchone()
     if not key:
         return {"ok": True, "data": None}
+
     return {
         "ok": True,
         "data": {
             "id":           key.id,
-            "key":          key.key_plain,  # ← texto plano
+            "key":          key.key_plain,
             "created_at":   str(key.created_at),
             "last_used_at": str(key.last_used_at) if key.last_used_at else None,
         }
     }
 
-# POST /sandbox/regenerar — regenerar key de sandbox
+# ── POST /sandbox/regenerar ───────────────────────────────────────────────────
 @router.post("/sandbox/regenerar", summary="Regenerar API Key de sandbox")
 async def regenerar_sandbox_key(
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    import secrets, hashlib
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "api_keys")
 
-    # Revocar key anterior si existe
     await db.execute(text("""
         UPDATE api_keys SET revoked = true
         WHERE emisor_id = :eid AND es_sandbox = true
@@ -173,6 +203,20 @@ async def regenerar_sandbox_key(
         "key_plain": raw_key,
     })
     nueva = res.fetchone()
+
+    await audit_log(
+        db        = db,
+        auth_data = auth_data,
+        accion    = "CREATE",
+        entidad   = "api_key",
+        entidad_id = str(nueva.id),
+        detalle   = {
+            "tipo":       "sandbox",
+            "key_prefix": key_prefix,
+            "accion":     "regeneracion",
+        },
+        request   = request,
+    )
     await db.commit()
 
     return {

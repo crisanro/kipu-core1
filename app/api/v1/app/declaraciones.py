@@ -14,6 +14,7 @@ from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
+from app.core.permisos import verificar_permiso
 from app.workers.declaraciones_worker import calcular_vencimiento
 
 import zipfile
@@ -43,6 +44,7 @@ async def obtener_declaracion_actual(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if tipo not in TIPOS_VALIDOS:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {', '.join(TIPOS_VALIDOS)}")
@@ -116,6 +118,7 @@ async def historial_declaraciones(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if tipo not in TIPOS_VALIDOS:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {', '.join(TIPOS_VALIDOS)}")
@@ -173,6 +176,7 @@ async def declaracion_periodo(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if not (1 <= mes <= 12):
         raise HTTPException(status_code=400, detail="Mes inválido.")
@@ -229,6 +233,7 @@ async def calcular_totales_periodo(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if not (1 <= mes <= 12):
         raise HTTPException(status_code=400, detail="Mes inválido.")
@@ -344,6 +349,7 @@ async def listar_reportes(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data.get("emisor_id")
+    verificar_permiso(auth_data, "reportes")
     res = await db.execute(text("""
         SELECT tipo, periodo, tipo_periodo,
                total_doc_emitidos, total_doc_recibidos,
@@ -382,6 +388,7 @@ async def marcar_declarado(
     profile_id = auth_data.get("profile_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if tipo not in TIPOS_VALIDOS:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {', '.join(TIPOS_VALIDOS)}")
@@ -433,6 +440,7 @@ async def casilleros_iva(
     profile_id = auth_data.get("profile_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
@@ -927,6 +935,7 @@ async def casilleros_renta(
     profile_id = auth_data.get("profile_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     if anio < 2020 or anio > date.today().year:
         raise HTTPException(status_code=400, detail="Año inválido.")
@@ -1266,6 +1275,7 @@ async def casilleros_ats(
     profile_id = auth_data.get("profile_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
@@ -1713,6 +1723,7 @@ async def generar_ats_xml(
     profile_id = auth_data.get("profile_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
@@ -2023,6 +2034,7 @@ async def descargar_ats(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
 
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])

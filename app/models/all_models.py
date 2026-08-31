@@ -73,6 +73,8 @@ class Emisor(Base):
     declaraciones           = relationship("DeclaracionSRI", back_populates="emisor")
     reportes_tributarios = relationship("ReporteTributario", back_populates="emisor")
     notificaciones = relationship("Notificacion", back_populates="emisor")
+    audit_logs = relationship("AuditLog", foreign_keys="AuditLog.emisor_id", backref="emisor_audit")
+
 
 
 class Profile(Base):
@@ -83,11 +85,12 @@ class Profile(Base):
     firebase_uid    = Column(Text, unique=True, nullable=False)
     email           = Column(Text, unique=True, nullable=False)
     full_name       = Column(Text)
-    role            = Column(String(20), default="admin")           # admin | contador | viewer
+    role            = Column(String(20), default="admin")
     whatsapp_number = Column(String(20))
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
     emisores        = relationship("EmisorUsuario", back_populates="profile")
+    audit_logs = relationship("AuditLog", foreign_keys="AuditLog.profile_id", backref="profile_audit")
 
 
 class EmisorUsuario(Base):
@@ -96,16 +99,14 @@ class EmisorUsuario(Base):
     __table_args__ = (
         UniqueConstraint("emisor_id", "profile_id", name="uq_emisor_profile"),
     )
-
     id          = Column(Integer, primary_key=True, autoincrement=True)
     emisor_id   = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
     profile_id  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False)
-    rol         = Column(String(20), default="emisor")              # admin | emisor | viewer
+    rol         = Column(String(20), default="emisor")              # admin | contador | emisor
+    permisos = Column(JSONB, nullable=False, server_default='{"emitir": true, "descargar": true, "clientes": true, "productos": true, "declaraciones": false, "reportes": false}')
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
-
     emisor      = relationship("Emisor", back_populates="usuarios")
     profile     = relationship("Profile", back_populates="emisores")
-
 
 # =============================================================================
 # BILLING
@@ -653,6 +654,26 @@ class LeadExUsuario(Base):
     total_docs_recibidos    = Column(Integer)
     fecha_registro_original = Column(TIMESTAMP)
     fecha_eliminacion       = Column(TIMESTAMP, server_default=func.now())
+
+
+class AuditLog(Base):
+    """
+    Registro de auditoría de todas las operaciones de escritura.
+    accion:  CREATE | UPDATE | DELETE | REVOKE | INVITE | ACTIVATE
+    entidad: documento | cliente | producto | usuario | config | api_key | firma | suscripcion | creditos
+    Solo el admin de la empresa puede ver estos logs.
+    """
+    __tablename__ = "audit_logs"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id  = Column(Integer, ForeignKey("emisores.id", ondelete="SET NULL"), nullable=True)
+    profile_id = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)
+    accion     = Column(String(50), nullable=False)   # CREATE | UPDATE | DELETE | REVOKE | INVITE | ACTIVATE
+    entidad    = Column(String(50), nullable=False)   # documento | cliente | producto | usuario | config | api_key | firma | suscripcion | creditos
+    entidad_id = Column(String(100), nullable=True)   # ID del registro afectado
+    detalle    = Column(JSONB, nullable=True)          # qué cambió exactamente
+    ip         = Column(String(45), nullable=True)    # IP del request
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
 
