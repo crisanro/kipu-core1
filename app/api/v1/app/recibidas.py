@@ -1,6 +1,6 @@
 # app/api/v1/app/recibidas.py
 from typing import Optional
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,12 +79,13 @@ class DocumentoFisicoCreate(BaseModel):
 # =============================================================================
 # POST / — Registrar documento recibido
 # =============================================================================
+
 @router.post("", summary="Registrar documento recibido", status_code=201)
 async def registrar_documento_recibido(
-    data:      DocumentoRecibidoCreate,
-    request:   Request,
+    data:       DocumentoRecibidoCreate,
+    request:    Request,
     auth_data: dict         = Depends(verify_firebase_token),
-    db:        AsyncSession = Depends(get_db),
+    db:         AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "documentos")
@@ -118,6 +119,13 @@ async def registrar_documento_recibido(
     if res_dup.fetchone():
         raise HTTPException(status_code=409, detail="Este documento ya fue registrado.")
 
+    fecha_auth_parsed = None
+    if data.fecha_autorizacion:
+        try:
+            fecha_auth_parsed = datetime.fromisoformat(data.fecha_autorizacion)
+        except Exception:
+            fecha_auth_parsed = None
+
     xml_path = None
     try:
         xml_path = f"{emisor.ruc}/recibidas/{data.clave_acceso}.json"
@@ -147,7 +155,7 @@ async def registrar_documento_recibido(
             "razon_prov": data.razon_social_proveedor,
             "tipo_doc": data.tipo_doc.upper(), "cod_doc": data.cod_doc,
             "clave": data.clave_acceso, "numero_doc": data.numero_doc,
-            "fecha_emision": data.fecha_emision, "fecha_auth": data.fecha_autorizacion,
+            "fecha_emision": data.fecha_emision, "fecha_auth": fecha_auth_parsed,
             "total": data.importe_total,
             "impuestos": json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str),
             "ded_renta": data.deducible_renta, "cred_iva": data.credito_tributario_iva,
@@ -160,7 +168,7 @@ async def registrar_documento_recibido(
         doc_id = res.scalar()
 
         await audit_log(
-            db        = db,
+            db         = db,
             auth_data = auth_data,
             accion    = "CREATE",
             entidad   = "doc_recibido",
@@ -179,10 +187,10 @@ async def registrar_documento_recibido(
         raise
     except Exception as e:
         await db.rollback()
+        import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {"ok": True, "id": str(doc_id), "mensaje": "Documento recibido registrado correctamente."}
-
 # =============================================================================
 # POST /fisico
 # =============================================================================
