@@ -370,6 +370,7 @@ async def registrar_desde_xml(
 
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
+
     datos = parsed.get("datos", {})
     info  = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
     ruc_comprador = info.get("identificacionComprador") or info.get("identificacionProveedor") or ""
@@ -391,6 +392,18 @@ async def registrar_desde_xml(
     except Exception as e:
         print(f"⚠️ Error guardando XML en R2: {e}")
 
+    # Convertir fechas a objetos date/datetime
+    fecha_emision_parsed = parsed["fecha_emision"]
+    if isinstance(fecha_emision_parsed, str):
+        fecha_emision_parsed = date.fromisoformat(fecha_emision_parsed[:10])
+
+    fecha_auth_parsed = parsed["fecha_autorizacion"]
+    if isinstance(fecha_auth_parsed, str) and fecha_auth_parsed:
+        try:
+            fecha_auth_parsed = datetime.fromisoformat(fecha_auth_parsed)
+        except Exception:
+            fecha_auth_parsed = None
+
     try:
         res = await db.execute(text("""
             INSERT INTO documentos_recibidos (
@@ -409,35 +422,42 @@ async def registrar_desde_xml(
                 CAST(:datos AS jsonb), :xml_path, 'XML', false
             ) RETURNING id
         """), {
-            "eid": emisor_id, "ruc_prov": parsed["ruc_proveedor"],
-            "razon_prov": parsed["razon_social_proveedor"],
-            "tipo_doc": parsed["tipo_doc"], "cod_doc": parsed["cod_doc"],
-            "clave": clave, "numero_doc": parsed["numero_doc"],
-            "fecha_emision": parsed["fecha_emision"], "fecha_auth": parsed["fecha_autorizacion"],
-            "total": parsed["importe_total"],
-            "items": json.dumps(parsed["items_detalle"], default=str),
-            "impuestos": json.dumps(parsed["impuestos_detalle"], default=str),
-            "ded_renta": parsed["deducible_renta"], "cred_iva": parsed["credito_tributario_iva"],
-            "datos": json.dumps(parsed["datos"], default=str), "xml_path": xml_path,
+            "eid":           emisor_id,
+            "ruc_prov":      parsed["ruc_proveedor"],
+            "razon_prov":    parsed["razon_social_proveedor"],
+            "tipo_doc":      parsed["tipo_doc"],
+            "cod_doc":       parsed["cod_doc"],
+            "clave":         clave,
+            "numero_doc":    parsed["numero_doc"],
+            "fecha_emision": fecha_emision_parsed,
+            "fecha_auth":    fecha_auth_parsed,
+            "total":         parsed["importe_total"],
+            "items":         json.dumps(parsed["items_detalle"], default=str),
+            "impuestos":     json.dumps(parsed["impuestos_detalle"], default=str),
+            "ded_renta":     parsed["deducible_renta"],
+            "cred_iva":      parsed["credito_tributario_iva"],
+            "datos":         json.dumps(parsed["datos"], default=str),
+            "xml_path":      xml_path,
         })
         doc_id = res.scalar()
 
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "CREATE",
-            entidad   = "doc_recibido",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "CREATE",
+            entidad    = "doc_recibido",
             entidad_id = str(doc_id),
-            detalle   = {
+            detalle    = {
                 "tipo_doc":   parsed["tipo_doc"],
                 "numero_doc": parsed["numero_doc"],
                 "proveedor":  parsed["razon_social_proveedor"],
                 "total":      float(parsed["importe_total"]),
                 "fuente":     "XML",
             },
-            request   = request,
+            request    = request,
         )
         await db.commit()
+
     except HTTPException:
         raise
     except Exception as e:
@@ -446,11 +466,15 @@ async def registrar_desde_xml(
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {
-        "ok": True, "id": str(doc_id),
-        "tipo_doc": parsed["tipo_doc"], "numero": parsed["numero_doc"],
-        "proveedor": parsed["razon_social_proveedor"], "total": parsed["importe_total"],
-        "items": len(parsed["items_detalle"]), "errores": parsed["errores"],
-        "mensaje": "Documento registrado correctamente.",
+        "ok":       True,
+        "id":       str(doc_id),
+        "tipo_doc": parsed["tipo_doc"],
+        "numero":   parsed["numero_doc"],
+        "proveedor": parsed["razon_social_proveedor"],
+        "total":    parsed["importe_total"],
+        "items":    len(parsed["items_detalle"]),
+        "errores":  parsed["errores"],
+        "mensaje":  "Documento registrado correctamente.",
     }
 
 # =============================================================================
