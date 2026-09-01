@@ -17,7 +17,7 @@ from app.services.audit_service import audit_log
 router = APIRouter()
 
 # =============================================================================
-# SCHEMAS — sin cambios
+# SCHEMAS
 # =============================================================================
 class ImpuestoDetalle(BaseModel):
     codigoPorcentaje: str
@@ -77,29 +77,92 @@ class DocumentoFisicoCreate(BaseModel):
     notas:                  Optional[str] = None
 
 # =============================================================================
-# POST / — Registrar documento recibido
+# HELPERS
 # =============================================================================
+def limpiar_detalle_item(det: dict) -> dict:
+    """Extraer solo campos útiles de cada ítem del comprobante."""
+    return {
+        "descripcion":            det.get("descripcion", ""),
+        "cantidad":               det.get("cantidad", ""),
+        "precioUnitario":         det.get("precioUnitario", ""),
+        "precioTotalSinImpuesto": det.get("precioTotalSinImpuesto", ""),
+        "descuento":              det.get("descuento", "0.00"),
+        "impuestos":              det.get("impuestos", {}),
+    }
 
+def limpiar_datos_xml(datos_raw: dict) -> dict:
+    """
+    Extrae solo los datos necesarios para declaraciones y contabilidad.
+    Elimina firma digital, certificados, direcciones y datos irrelevantes.
+    """
+    info_tributaria = datos_raw.get("infoTributaria", {})
+    info_factura    = (
+        datos_raw.get("infoFactura") or
+        datos_raw.get("infoLiquidacionCompra") or
+        datos_raw.get("infoNotaCredito") or
+        datos_raw.get("infoNotaDebito") or
+        datos_raw.get("infoCompRetencion") or {}
+    )
+
+    # Determinar clave de la sección info según tipo
+    clave_info = next(
+        (k for k in ("infoFactura", "infoLiquidacionCompra", "infoNotaCredito",
+                     "infoNotaDebito", "infoCompRetencion")
+         if k in datos_raw), "infoFactura"
+    )
+
+    # Limpiar detalles
+    detalles_raw   = datos_raw.get("detalles", {})
+    detalles_items = detalles_raw.get("detalle", [])
+    if isinstance(detalles_items, dict):
+        detalles_items = [detalles_items]
+    detalles_limpios = [limpiar_detalle_item(d) for d in detalles_items]
+
+    return {
+        "infoTributaria": {
+            "ruc":             info_tributaria.get("ruc", ""),
+            "razonSocial":     info_tributaria.get("razonSocial", ""),
+            "nombreComercial": info_tributaria.get("nombreComercial", ""),
+            "estab":           info_tributaria.get("estab", ""),
+            "ptoEmi":          info_tributaria.get("ptoEmi", ""),
+            "secuencial":      info_tributaria.get("secuencial", ""),
+            "claveAcceso":     info_tributaria.get("claveAcceso", ""),
+            "codDoc":          info_tributaria.get("codDoc", ""),
+        },
+        clave_info: {
+            "fechaEmision":        info_factura.get("fechaEmision", ""),
+            "importeTotal":        info_factura.get("importeTotal", ""),
+            "totalSinImpuestos":   info_factura.get("totalSinImpuestos", ""),
+            "totalDescuento":      info_factura.get("totalDescuento", "0.00"),
+            "totalConImpuestos":   info_factura.get("totalConImpuestos", {}),
+            "pagos":               info_factura.get("pagos", {}),
+            "obligadoContabilidad": info_factura.get("obligadoContabilidad", ""),
+            "moneda":              info_factura.get("moneda", "DOLAR"),
+        },
+        "detalles": detalles_limpios,
+    }
+
+# =============================================================================
+# POST / — Registrar documento recibido (manual/SRI TXT)
+# =============================================================================
 @router.post("", summary="Registrar documento recibido", status_code=201)
 async def registrar_documento_recibido(
-    data:       DocumentoRecibidoCreate,
-    request:    Request,
+    data:      DocumentoRecibidoCreate,
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db),
+    db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "documentos")
 
-    res_sub = await db.execute(text("""
-        SELECT estado FROM subscriptions WHERE emisor_id = :eid
-    """), {"eid": emisor_id})
+    res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
 
     tipos_validos = ("FAC", "LIQ", "NCR", "NDB", "RET")
     if data.tipo_doc.upper() not in tipos_validos:
-        raise HTTPException(status_code=400, detail=f"tipo_doc inválido.")
+        raise HTTPException(status_code=400, detail="tipo_doc inválido.")
 
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
@@ -151,38 +214,47 @@ async def registrar_documento_recibido(
                 CAST(:datos AS jsonb), :xml_path, :fuente, false
             ) RETURNING id
         """), {
-            "eid": emisor_id, "ruc_prov": data.ruc_proveedor,
-            "razon_prov": data.razon_social_proveedor,
-            "tipo_doc": data.tipo_doc.upper(), "cod_doc": data.cod_doc,
-            "clave": data.clave_acceso, "numero_doc": data.numero_doc,
-            "fecha_emision": data.fecha_emision, "fecha_auth": fecha_auth_parsed,
-            "total": data.importe_total,
-            "impuestos": json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str),
-            "ded_renta": data.deducible_renta, "cred_iva": data.credito_tributario_iva,
-            "notas": data.notas, "estado_pago": data.estado_pago,
-            "forma_pago": data.forma_pago, "num_comp": data.numero_comprobante_pago,
-            "fecha_pago": data.fecha_pago,
-            "datos": json.dumps(data.datos, default=str),
-            "xml_path": xml_path, "fuente": data.fuente,
+            "eid":         emisor_id,
+            "ruc_prov":    data.ruc_proveedor,
+            "razon_prov":  data.razon_social_proveedor,
+            "tipo_doc":    data.tipo_doc.upper(),
+            "cod_doc":     data.cod_doc,
+            "clave":       data.clave_acceso,
+            "numero_doc":  data.numero_doc,
+            "fecha_emision": data.fecha_emision,
+            "fecha_auth":  fecha_auth_parsed,
+            "total":       data.importe_total,
+            "impuestos":   json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str),
+            "ded_renta":   data.deducible_renta,
+            "cred_iva":    data.credito_tributario_iva,
+            "notas":       data.notas,
+            "estado_pago": data.estado_pago,
+            "forma_pago":  data.forma_pago,
+            "num_comp":    data.numero_comprobante_pago,
+            "fecha_pago":  data.fecha_pago,
+            "datos":       json.dumps(data.datos, default=str),
+            "xml_path":    xml_path,
+            "fuente":      data.fuente,
         })
         doc_id = res.scalar()
 
         await audit_log(
             db         = db,
-            auth_data = auth_data,
-            accion    = "CREATE",
-            entidad   = "doc_recibido",
+            auth_data  = auth_data,
+            accion     = "CREATE",
+            entidad    = "doc_recibido",
             entidad_id = str(doc_id),
-            detalle   = {
-                "tipo_doc":    data.tipo_doc.upper(),
-                "numero_doc":  data.numero_doc,
-                "proveedor":   data.razon_social_proveedor,
-                "total":       float(data.importe_total),
-                "fuente":      data.fuente,
+            detalle    = {
+                "tipo_doc":   data.tipo_doc.upper(),
+                "numero_doc": data.numero_doc,
+                "proveedor":  data.razon_social_proveedor,
+                "total":      float(data.importe_total),
+                "fuente":     data.fuente,
             },
-            request   = request,
+            request    = request,
         )
         await db.commit()
+
     except HTTPException:
         raise
     except Exception as e:
@@ -191,27 +263,28 @@ async def registrar_documento_recibido(
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {"ok": True, "id": str(doc_id), "mensaje": "Documento recibido registrado correctamente."}
+
 # =============================================================================
 # POST /fisico
 # =============================================================================
 @router.post("/fisico", summary="Registrar documento físico (sin XML)", status_code=201)
 async def registrar_documento_fisico(
-    ruc_proveedor:          str        = Form(...),
-    razon_social_proveedor: str        = Form(...),
-    tipo_doc:               str        = Form("FAC"),
-    numero_doc:             str        = Form(...),
-    fecha_emision:          date       = Form(...),
-    subtotal_0:             Decimal    = Form(Decimal("0.00")),
-    subtotal_iva:           Decimal    = Form(Decimal("0.00")),
-    tarifa_iva:             int        = Form(15),
-    valor_iva:              Decimal    = Form(Decimal("0.00")),
-    importe_total:          Decimal    = Form(...),
-    deducible_renta:        bool       = Form(True),
-    credito_tributario_iva: bool       = Form(False),
-    notas:                  Optional[str]      = Form(None),
+    ruc_proveedor:          str          = Form(...),
+    razon_social_proveedor: str          = Form(...),
+    tipo_doc:               str          = Form("FAC"),
+    numero_doc:             str          = Form(...),
+    fecha_emision:          date         = Form(...),
+    subtotal_0:             Decimal      = Form(Decimal("0.00")),
+    subtotal_iva:           Decimal      = Form(Decimal("0.00")),
+    tarifa_iva:             int          = Form(15),
+    valor_iva:              Decimal      = Form(Decimal("0.00")),
+    importe_total:          Decimal      = Form(...),
+    deducible_renta:        bool         = Form(True),
+    credito_tributario_iva: bool         = Form(False),
+    notas:                  Optional[str]        = Form(None),
     imagen:                 Optional[UploadFile] = File(None),
-    request:                Request    = None,
-    auth_data:              dict       = Depends(verify_firebase_token),
+    request:                Request      = None,
+    auth_data:              dict         = Depends(verify_firebase_token),
     db:                     AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
@@ -225,7 +298,7 @@ async def registrar_documento_fisico(
     tipos_validos = ("FAC", "LIQ", "NCR", "NDB", "RET")
     tipo_doc = tipo_doc.upper()
     if tipo_doc not in tipos_validos:
-        raise HTTPException(status_code=400, detail=f"tipo_doc inválido.")
+        raise HTTPException(status_code=400, detail="tipo_doc inválido.")
 
     cod_map = {"FAC": "01", "LIQ": "03", "NCR": "04", "NDB": "05", "RET": "07"}
     cod_doc = cod_map.get(tipo_doc, "01")
@@ -247,11 +320,7 @@ async def registrar_documento_fisico(
     imagen_path = None
     if imagen and imagen.filename:
         extensiones_validas = (".jpg", ".jpeg", ".png", ".webp", ".pdf")
-        ext = None
-        for e in extensiones_validas:
-            if imagen.filename.lower().endswith(e):
-                ext = e
-                break
+        ext = next((e for e in extensiones_validas if imagen.filename.lower().endswith(e)), None)
         if not ext:
             raise HTTPException(status_code=400, detail="Formato no soportado. Usa JPG, PNG, WEBP o PDF.")
         img_bytes = await imagen.read()
@@ -268,21 +337,29 @@ async def registrar_documento_fisico(
     impuestos_detalle = []
     if valor_iva > 0 and subtotal_iva > 0:
         impuestos_detalle.append({
-            "codigoPorcentaje": str(tarifa_iva), "tarifa": str(tarifa_iva),
-            "baseImponible": float(subtotal_iva), "valor": float(valor_iva),
-            "aplicaCredito": credito_tributario_iva,
+            "codigoPorcentaje": str(tarifa_iva),
+            "tarifa":           str(tarifa_iva),
+            "baseImponible":    float(subtotal_iva),
+            "valor":            float(valor_iva),
+            "aplicaCredito":    credito_tributario_iva,
         })
     if subtotal_0 > 0:
         impuestos_detalle.append({
-            "codigoPorcentaje": "0", "tarifa": "0",
-            "baseImponible": float(subtotal_0), "valor": 0.0, "aplicaCredito": False,
+            "codigoPorcentaje": "0",
+            "tarifa":           "0",
+            "baseImponible":    float(subtotal_0),
+            "valor":            0.0,
+            "aplicaCredito":    False,
         })
 
     datos = {
-        "fuente": "FISICO", "subtotal_0": float(subtotal_0),
-        "subtotal_iva": float(subtotal_iva), "tarifa_iva": tarifa_iva,
-        "valor_iva": float(valor_iva), "importe_total": float(importe_total),
-        "tiene_imagen": imagen_path is not None,
+        "fuente":        "FISICO",
+        "subtotal_0":    float(subtotal_0),
+        "subtotal_iva":  float(subtotal_iva),
+        "tarifa_iva":    tarifa_iva,
+        "valor_iva":     float(valor_iva),
+        "importe_total": float(importe_total),
+        "tiene_imagen":  imagen_path is not None,
     }
 
     try:
@@ -301,34 +378,41 @@ async def registrar_documento_fisico(
                 'PENDIENTE', CAST(:datos AS jsonb), :xml_path, 'FISICO', false
             ) RETURNING id
         """), {
-            "eid": emisor_id, "ruc_prov": ruc_proveedor.strip().upper(),
-            "razon_prov": razon_social_proveedor.strip().upper(),
-            "tipo_doc": tipo_doc, "cod_doc": cod_doc,
-            "clave": clave_sintetica, "numero_doc": numero_doc.strip(),
-            "fecha_emision": fecha_emision, "total": importe_total,
-            "impuestos": json.dumps(impuestos_detalle, default=str),
-            "ded_renta": deducible_renta, "cred_iva": credito_tributario_iva,
-            "notas": notas, "datos": json.dumps(datos, default=str),
-            "xml_path": imagen_path,
+            "eid":         emisor_id,
+            "ruc_prov":    ruc_proveedor.strip().upper(),
+            "razon_prov":  razon_social_proveedor.strip().upper(),
+            "tipo_doc":    tipo_doc,
+            "cod_doc":     cod_doc,
+            "clave":       clave_sintetica,
+            "numero_doc":  numero_doc.strip(),
+            "fecha_emision": fecha_emision,
+            "total":       importe_total,
+            "impuestos":   json.dumps(impuestos_detalle, default=str),
+            "ded_renta":   deducible_renta,
+            "cred_iva":    credito_tributario_iva,
+            "notas":       notas,
+            "datos":       json.dumps(datos, default=str),
+            "xml_path":    imagen_path,
         })
         doc_id = res.scalar()
 
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "CREATE",
-            entidad   = "doc_recibido",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "CREATE",
+            entidad    = "doc_recibido",
             entidad_id = str(doc_id),
-            detalle   = {
+            detalle    = {
                 "tipo_doc":   tipo_doc,
                 "numero_doc": numero_doc,
                 "proveedor":  razon_social_proveedor,
                 "total":      float(importe_total),
                 "fuente":     "FISICO",
             },
-            request   = request,
+            request    = request,
         )
         await db.commit()
+
     except HTTPException:
         raise
     except Exception as e:
@@ -371,8 +455,8 @@ async def registrar_desde_xml(
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
 
-    datos = parsed.get("datos", {})
-    info  = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
+    datos_raw     = parsed.get("datos", {})
+    info          = datos_raw.get("infoFactura") or datos_raw.get("infoLiquidacionCompra") or {}
     ruc_comprador = info.get("identificacionComprador") or info.get("identificacionProveedor") or ""
     if ruc_comprador and ruc_comprador != emisor.ruc:
         raise HTTPException(status_code=400, detail=f"Este documento no está dirigido a tu RUC ({emisor.ruc}).")
@@ -392,7 +476,7 @@ async def registrar_desde_xml(
     except Exception as e:
         print(f"⚠️ Error guardando XML en R2: {e}")
 
-    # Convertir fechas a objetos date/datetime
+    # Convertir fechas
     fecha_emision_parsed = parsed["fecha_emision"]
     if isinstance(fecha_emision_parsed, str):
         fecha_emision_parsed = date.fromisoformat(fecha_emision_parsed[:10])
@@ -404,20 +488,8 @@ async def registrar_desde_xml(
         except Exception:
             fecha_auth_parsed = None
 
-    # Limpiar datos — quitar firma digital (no necesaria en BD)
-    datos_raw = parsed.get("datos", {})
-    datos_limpios = {
-        k: v for k, v in datos_raw.items()
-        if k not in ("ds:Signature", "Signature")
-    }
-    # Limpiar también dentro de infoTributaria si existe firma anidada
-    for seccion in ("infoFactura", "infoLiquidacionCompra", "infoNotaCredito",
-                    "infoNotaDebito", "infoCompRetencion"):
-        if seccion in datos_limpios and isinstance(datos_limpios[seccion], dict):
-            datos_limpios[seccion] = {
-                k: v for k, v in datos_limpios[seccion].items()
-                if not k.startswith("ds:")
-            }
+    # Limpiar datos — solo lo necesario para declaraciones
+    datos_limpios = limpiar_datos_xml(datos_raw)
 
     try:
         res = await db.execute(text("""
@@ -493,12 +565,12 @@ async def registrar_desde_xml(
     }
 
 # =============================================================================
-# GET / — Historial — sin cambios, solo lectura
+# GET / — Historial
 # =============================================================================
 @router.get("", summary="Historial de documentos recibidos")
 async def historial_recibidos(
-    auth_data:    dict         = Depends(verify_firebase_token),
-    db:           AsyncSession = Depends(get_db),
+    auth_data:    dict          = Depends(verify_firebase_token),
+    db:           AsyncSession  = Depends(get_db),
     tipo_doc:     Optional[str] = Query(None),
     fecha_inicio: Optional[str] = Query(None),
     fecha_fin:    Optional[str] = Query(None),
@@ -543,7 +615,7 @@ async def historial_recibidos(
     """), params)
     rows = res.fetchall()
 
-    params_resumen = {k: v for k, v in params.items() if k not in ("limit", "offset")}
+    params_resumen  = {k: v for k, v in params.items() if k not in ("limit", "offset")}
     filtros_resumen = "WHERE emisor_id = :eid AND fecha_emision BETWEEN :fi AND :ff"
     if tipo_doc:
         filtros_resumen += " AND tipo_doc = :tipo_doc"
@@ -594,24 +666,24 @@ async def historial_recibidos(
         },
         "data": [
             {
-                "id":                     str(r.id),
-                "ruc_proveedor":          r.ruc_proveedor,
-                "razon_social_proveedor": r.razon_social_proveedor,
-                "tipo_doc":               r.tipo_doc,
-                "numero_doc":             r.numero_doc,
-                "fecha_emision":          str(r.fecha_emision),
-                "importe_total":          float(r.importe_total),
-                "impuestos_detalle":      r.impuestos_detalle or [],
-                "items_detalle":          r.items_detalle or [],
-                "deducible_renta":        r.deducible_renta,
-                "credito_tributario_iva": r.credito_tributario_iva,
-                "estado_pago":            r.estado_pago,
-                "forma_pago":             r.forma_pago,
+                "id":                      str(r.id),
+                "ruc_proveedor":           r.ruc_proveedor,
+                "razon_social_proveedor":  r.razon_social_proveedor,
+                "tipo_doc":                r.tipo_doc,
+                "numero_doc":              r.numero_doc,
+                "fecha_emision":           str(r.fecha_emision),
+                "importe_total":           float(r.importe_total),
+                "impuestos_detalle":       r.impuestos_detalle or [],
+                "items_detalle":           r.items_detalle or [],
+                "deducible_renta":         r.deducible_renta,
+                "credito_tributario_iva":  r.credito_tributario_iva,
+                "estado_pago":             r.estado_pago,
+                "forma_pago":              r.forma_pago,
                 "numero_comprobante_pago": r.numero_comprobante_pago,
-                "fecha_pago":             str(r.fecha_pago) if r.fecha_pago else None,
-                "notas":                  r.notas,
-                "fuente":                 r.fuente,
-                "created_at":             str(r.created_at),
+                "fecha_pago":              str(r.fecha_pago) if r.fecha_pago else None,
+                "notas":                   r.notas,
+                "fuente":                  r.fuente,
+                "created_at":              str(r.created_at),
             }
             for r in rows
         ],
@@ -619,7 +691,7 @@ async def historial_recibidos(
     }
 
 # =============================================================================
-# GET /{id} — Detalle — solo lectura
+# GET /{id} — Detalle
 # =============================================================================
 @router.get("/{doc_id}", summary="Detalle de documento recibido")
 async def detalle_recibido(
@@ -652,30 +724,30 @@ async def detalle_recibido(
     return {
         "ok": True,
         "data": {
-            "id":                     str(doc.id),
-            "ruc_proveedor":          doc.ruc_proveedor,
-            "razon_social_proveedor": doc.razon_social_proveedor,
-            "tipo_doc":               doc.tipo_doc,
-            "cod_doc":                doc.cod_doc,
-            "clave_acceso":           doc.clave_acceso,
-            "numero_doc":             doc.numero_doc,
-            "fecha_emision":          str(doc.fecha_emision),
-            "fecha_autorizacion":     str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
-            "importe_total":          float(doc.importe_total),
-            "impuestos_detalle":      doc.impuestos_detalle or [],
-            "items_detalle":          doc.items_detalle or [],
-            "deducible_renta":        doc.deducible_renta,
-            "credito_tributario_iva": doc.credito_tributario_iva,
-            "notas":                  doc.notas,
-            "estado_pago":            doc.estado_pago,
-            "forma_pago":             doc.forma_pago,
+            "id":                      str(doc.id),
+            "ruc_proveedor":           doc.ruc_proveedor,
+            "razon_social_proveedor":  doc.razon_social_proveedor,
+            "tipo_doc":                doc.tipo_doc,
+            "cod_doc":                 doc.cod_doc,
+            "clave_acceso":            doc.clave_acceso,
+            "numero_doc":              doc.numero_doc,
+            "fecha_emision":           str(doc.fecha_emision),
+            "fecha_autorizacion":      str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
+            "importe_total":           float(doc.importe_total),
+            "impuestos_detalle":       doc.impuestos_detalle or [],
+            "items_detalle":           doc.items_detalle or [],
+            "deducible_renta":         doc.deducible_renta,
+            "credito_tributario_iva":  doc.credito_tributario_iva,
+            "notas":                   doc.notas,
+            "estado_pago":             doc.estado_pago,
+            "forma_pago":              doc.forma_pago,
             "numero_comprobante_pago": doc.numero_comprobante_pago,
-            "fecha_pago":             str(doc.fecha_pago) if doc.fecha_pago else None,
-            "datos":                  doc.datos,
-            "xml_path":               doc.xml_path,
-            "fuente":                 doc.fuente,
-            "created_at":             str(doc.created_at),
-            "retencion_emitida":      doc.retencion_emitida,
+            "fecha_pago":              str(doc.fecha_pago) if doc.fecha_pago else None,
+            "datos":                   doc.datos,
+            "xml_path":                doc.xml_path,
+            "fuente":                  doc.fuente,
+            "created_at":              str(doc.created_at),
+            "retencion_emitida":       doc.retencion_emitida,
         }
     }
 
@@ -703,36 +775,58 @@ async def actualizar_recibido(
     params = {"did": doc_id, "eid": emisor_id}
 
     if data.deducible_renta is not None:
-        campos.append("deducible_renta = :ded_renta"); params["ded_renta"] = data.deducible_renta
+        campos.append("deducible_renta = :ded_renta")
+        params["ded_renta"] = data.deducible_renta
+
     if data.credito_tributario_iva is not None:
-        campos.append("credito_tributario_iva = :cred_iva"); params["cred_iva"] = data.credito_tributario_iva
+        campos.append("credito_tributario_iva = :cred_iva")
+        params["cred_iva"] = data.credito_tributario_iva
+
     if data.notas is not None:
-        campos.append("notas = :notas"); params["notas"] = data.notas
+        campos.append("notas = :notas")
+        params["notas"] = data.notas
+
     if data.impuestos_detalle is not None:
         campos.append("impuestos_detalle = CAST(:impuestos AS jsonb)")
         params["impuestos"] = json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str)
+
     if data.items_detalle is not None:
         campos.append("items_detalle = CAST(:items AS jsonb)")
         params["items"] = json.dumps(data.items_detalle, default=str)
-        params["ded_renta_calc"] = any(i.get("deducible_renta", False) for i in data.items_detalle)
-        params["cred_iva_calc"]  = any(i.get("credito_tributario_iva", False) for i in data.items_detalle)
-        campos.append("deducible_renta = :ded_renta_calc")
-        campos.append("credito_tributario_iva = :cred_iva_calc")
+        # Solo agregar si no vienen explícitamente en el request
+        if data.deducible_renta is None:
+            params["ded_renta_calc"] = any(i.get("deducible_renta", False) for i in data.items_detalle)
+            campos.append("deducible_renta = :ded_renta_calc")
+        if data.credito_tributario_iva is None:
+            params["cred_iva_calc"] = any(i.get("credito_tributario_iva", False) for i in data.items_detalle)
+            campos.append("credito_tributario_iva = :cred_iva_calc")
+
     if data.estado_pago is not None:
         estados_validos = ("PENDIENTE", "PAGADO", "PARCIAL", "ANULADO")
         if data.estado_pago not in estados_validos:
-            raise HTTPException(status_code=400, detail=f"estado_pago inválido.")
-        campos.append("estado_pago = :estado_pago"); params["estado_pago"] = data.estado_pago
+            raise HTTPException(status_code=400, detail="estado_pago inválido.")
+        campos.append("estado_pago = :estado_pago")
+        params["estado_pago"] = data.estado_pago
+
     if data.forma_pago is not None:
-        campos.append("forma_pago = :forma_pago"); params["forma_pago"] = data.forma_pago
+        campos.append("forma_pago = :forma_pago")
+        params["forma_pago"] = data.forma_pago
+
     if data.numero_comprobante_pago is not None:
-        campos.append("numero_comprobante_pago = :num_comp"); params["num_comp"] = data.numero_comprobante_pago
+        campos.append("numero_comprobante_pago = :num_comp")
+        params["num_comp"] = data.numero_comprobante_pago
+
     if data.fecha_pago is not None:
-        campos.append("fecha_pago = :fecha_pago"); params["fecha_pago"] = data.fecha_pago
+        campos.append("fecha_pago = :fecha_pago")
+        params["fecha_pago"] = data.fecha_pago
+
     if data.doc_origen_recibido_id is not None:
-        campos.append("doc_origen_recibido_id = :doc_rec_id"); params["doc_rec_id"] = data.doc_origen_recibido_id
+        campos.append("doc_origen_recibido_id = :doc_rec_id")
+        params["doc_rec_id"] = data.doc_origen_recibido_id
+
     if data.doc_origen_emitido_id is not None:
-        campos.append("doc_origen_emitido_id = :doc_emi_id"); params["doc_emi_id"] = data.doc_origen_emitido_id
+        campos.append("doc_origen_emitido_id = :doc_emi_id")
+        params["doc_emi_id"] = data.doc_origen_emitido_id
 
     if not campos:
         raise HTTPException(status_code=400, detail="No hay campos para actualizar.")
@@ -746,15 +840,16 @@ async def actualizar_recibido(
         """), params)
 
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "UPDATE",
-            entidad   = "doc_recibido",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "UPDATE",
+            entidad    = "doc_recibido",
             entidad_id = doc_id,
-            detalle   = data.model_dump(exclude_none=True),
-            request   = request,
+            detalle    = data.model_dump(exclude_none=True),
+            request    = request,
         )
         await db.commit()
+
     except HTTPException:
         raise
     except Exception as e:
