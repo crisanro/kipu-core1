@@ -442,6 +442,7 @@ async def registrar_desde_xml(
         raise
     except Exception as e:
         await db.rollback()
+        import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {
