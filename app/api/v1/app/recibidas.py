@@ -404,6 +404,21 @@ async def registrar_desde_xml(
         except Exception:
             fecha_auth_parsed = None
 
+    # Limpiar datos — quitar firma digital (no necesaria en BD)
+    datos_raw = parsed.get("datos", {})
+    datos_limpios = {
+        k: v for k, v in datos_raw.items()
+        if k not in ("ds:Signature", "Signature")
+    }
+    # Limpiar también dentro de infoTributaria si existe firma anidada
+    for seccion in ("infoFactura", "infoLiquidacionCompra", "infoNotaCredito",
+                    "infoNotaDebito", "infoCompRetencion"):
+        if seccion in datos_limpios and isinstance(datos_limpios[seccion], dict):
+            datos_limpios[seccion] = {
+                k: v for k, v in datos_limpios[seccion].items()
+                if not k.startswith("ds:")
+            }
+
     try:
         res = await db.execute(text("""
             INSERT INTO documentos_recibidos (
@@ -436,7 +451,7 @@ async def registrar_desde_xml(
             "impuestos":     json.dumps(parsed["impuestos_detalle"], default=str),
             "ded_renta":     parsed["deducible_renta"],
             "cred_iva":      parsed["credito_tributario_iva"],
-            "datos":         json.dumps(parsed["datos"], default=str),
+            "datos":         json.dumps(datos_limpios, default=str),
             "xml_path":      xml_path,
         })
         doc_id = res.scalar()
@@ -466,15 +481,15 @@ async def registrar_desde_xml(
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {
-        "ok":       True,
-        "id":       str(doc_id),
-        "tipo_doc": parsed["tipo_doc"],
-        "numero":   parsed["numero_doc"],
+        "ok":        True,
+        "id":        str(doc_id),
+        "tipo_doc":  parsed["tipo_doc"],
+        "numero":    parsed["numero_doc"],
         "proveedor": parsed["razon_social_proveedor"],
-        "total":    parsed["importe_total"],
-        "items":    len(parsed["items_detalle"]),
-        "errores":  parsed["errores"],
-        "mensaje":  "Documento registrado correctamente.",
+        "total":     parsed["importe_total"],
+        "items":     len(parsed["items_detalle"]),
+        "errores":   parsed["errores"],
+        "mensaje":   "Documento registrado correctamente.",
     }
 
 # =============================================================================
