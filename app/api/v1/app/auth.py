@@ -303,3 +303,29 @@ async def nuke_account(
     }
 
 
+# ── Ping / Validar sesión extensión ───────────────────────────────────────────
+@router.get("/ping")
+async def ping(
+    auth_data: dict = Depends(verify_firebase_token),
+):
+    """
+    Valida el JWT de Firebase sin tocar la base de datos.
+    Usado por la extensión Kipu Importador antes de iniciar una importación.
+    Retorna 401 si el token es inválido o expira en menos de 5 minutos.
+    """
+    import time
+    exp = auth_data.get("exp")
+    if not exp:
+        raise HTTPException(status_code=401, detail="TOKEN_SIN_EXPIRACION")
+
+    segundos_restantes = exp - int(time.time())
+    if segundos_restantes < 300:  # menos de 5 minutos
+        raise HTTPException(
+            status_code=401,
+            detail="TOKEN_POR_EXPIRAR",
+        )
+
+    return {
+        "ok": True,
+        "expira_en": segundos_restantes,  # segundos restantes, útil para debug
+    }

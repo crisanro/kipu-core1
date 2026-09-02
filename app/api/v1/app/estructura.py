@@ -145,7 +145,6 @@ async def crear_punto_emision(
 ):
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "configuracion")
-
     try:
         codigo_estab_fmt = str(data.establecimiento_codigo).zfill(3)
         res_estab = await db.execute(text("""
@@ -156,38 +155,40 @@ async def crear_punto_emision(
         if not estab:
             raise HTTPException(status_code=404, detail=f"No existe el establecimiento {codigo_estab_fmt}.")
 
+        secuenciales_iniciales = json.dumps({
+            "produccion": {"FAC": 0, "LIQ": 0, "NCR": 0, "NDB": 0, "RET": 0},
+            "pruebas":    {"FAC": 0, "LIQ": 0, "NCR": 0, "NDB": 0, "RET": 0},
+        })
+
         res = await db.execute(text("""
             INSERT INTO puntos_emision
                 (establecimiento_id, emisor_id, codigo, secuencial_actual, secuenciales, nombre, is_active)
-            VALUES (:estab_id, :eid, :cod, 1,
-                    '{"produccion":{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0},"pruebas":{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0}}'::jsonb,
-                    :nom, true)
+            VALUES (:estab_id, :eid, :cod, 1, CAST(:secs AS jsonb), :nom, true)
             RETURNING id, establecimiento_id, codigo, secuencial_actual, secuenciales, nombre, is_active
         """), {
             "estab_id": estab.id,
             "eid":      emisor_id,
             "cod":      str(data.codigo).zfill(3),
             "nom":      data.nombre or f"Punto {data.codigo}",
+            "secs":     secuenciales_iniciales,
         })
         nuevo = res.fetchone()
-
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "CREATE",
-            entidad   = "punto_emision",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "CREATE",
+            entidad    = "punto_emision",
             entidad_id = str(nuevo.id),
-            detalle   = {
+            detalle    = {
                 "codigo":              str(data.codigo).zfill(3),
                 "establecimiento_cod": codigo_estab_fmt,
                 "nombre":              nuevo.nombre,
             },
-            request   = request,
+            request    = request,
         )
         await db.commit()
         await _invalidar_estructura(emisor_id)
         return {"ok": True, "mensaje": f"Punto {data.codigo} creado.", "data": dict(nuevo._mapping)}
-
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=400, detail="El punto de emisión ya existe en este establecimiento.")
