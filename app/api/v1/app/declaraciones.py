@@ -225,31 +225,22 @@ async def calcular_totales_periodo(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    """
-    Calcula en tiempo real los totales del período cruzando
-    documentos_emitidos y documentos_recibidos.
-    Útil para preparar la declaración antes de hacerla.
-    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "declaraciones")
-
     if not (1 <= mes <= 12):
         raise HTTPException(status_code=400, detail="Mes inválido.")
 
     fi = date(anio, mes, 1)
-    if mes == 12:
-        ff = date(anio + 1, 1, 1)
-    else:
-        ff = date(anio, mes + 1, 1)
+    ff = date(anio + 1, 1, 1) if mes == 12 else date(anio, mes + 1, 1)
 
-    # Totales de ventas (documentos emitidos FAC y LIQ autorizados)
+    # ── Ventas — FAC + LIQ autorizados ───────────────────────────────────
     res_ventas = await db.execute(text("""
         SELECT
             COALESCE(SUM(importe_total), 0) AS total_ventas,
             COALESCE(SUM(
-                CASE WHEN (datos->'infoFactura'->>'totalSinImpuestos') IS NOT NULL
+                CASE WHEN tipo_doc IN ('FAC','LIQ')
                 THEN (datos->'infoFactura'->>'totalSinImpuestos')::numeric
                 ELSE 0 END
             ), 0) AS base_imponible,
@@ -261,42 +252,37 @@ async def calcular_totales_periodo(
                 ELSE 0 END
             ), 0) AS iva_cobrado
         FROM documentos_emitidos
-        WHERE emisor_id = :eid
-          AND tipo_doc IN ('FAC', 'LIQ')
+        WHERE emisor_id  = :eid
+          AND tipo_doc   IN ('FAC', 'LIQ')
           AND estado_sri = 'AUTORIZADO'
           AND fecha_emision >= :fi
-          AND fecha_emision < :ff
+          AND fecha_emision <  :ff
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     ventas = res_ventas.fetchone()
 
-    # Totales de compras (documentos recibidos)
+    # ── Compras — usa columnas desnormalizadas ────────────────────────────
     res_compras = await db.execute(text("""
         SELECT
-            COALESCE(SUM(importe_total), 0)                           AS total_compras,
-            COALESCE(SUM(CASE WHEN deducible_renta THEN importe_total ELSE 0 END), 0) AS total_deducible,
-            COALESCE(SUM(
-                CASE WHEN credito_tributario_iva THEN
-                    COALESCE((impuestos_detalle->0->>'valor')::numeric, 0)
-                ELSE 0 END
-            ), 0) AS credito_tributario
+            COALESCE(SUM(importe_total),  0)                                           AS total_compras,
+            COALESCE(SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END), 0) AS total_deducible,
+            COALESCE(SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END), 0) AS credito_tributario
         FROM documentos_recibidos
-        WHERE emisor_id = :eid
-          AND tipo_doc IN ('FAC', 'LIQ')
+        WHERE emisor_id  = :eid
+          AND tipo_doc   IN ('FAC', 'LIQ')
           AND fecha_emision >= :fi
-          AND fecha_emision < :ff
+          AND fecha_emision <  :ff
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     compras = res_compras.fetchone()
 
-    # Retenciones recibidas (RET que nos emitieron a nosotros)
+    # ── Retenciones recibidas — suma valor_iva_total de RET recibidas ─────
+    # Las RET que nos hicieron tienen el IVA retenido en valor_iva_total
     res_ret = await db.execute(text("""
-        SELECT COALESCE(SUM(
-            COALESCE((impuestos_detalle->0->>'valor')::numeric, 0)
-        ), 0) AS total_retenciones
+        SELECT COALESCE(SUM(valor_iva_total), 0) AS total_retenciones
         FROM documentos_recibidos
-        WHERE emisor_id = :eid
-          AND tipo_doc = 'RET'
+        WHERE emisor_id  = :eid
+          AND tipo_doc   = 'RET'
           AND fecha_emision >= :fi
-          AND fecha_emision < :ff
+          AND fecha_emision <  :ff
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     retenciones = res_ret.fetchone()
 
@@ -331,11 +317,10 @@ async def calcular_totales_periodo(
     }
 
     return {
-        "ok":     True,
+        "ok":      True,
         "periodo": f"{str(fi)} al {str(ff - timedelta(days=1))}",
-        "data":   totales,
+        "data":    totales,
     }
-
 
 # =============================================================================
 # POST /declarar — marcar período como declarado
@@ -487,8 +472,8 @@ async def casilleros_iva(
         cached = res_cached.fetchone()
         if cached:
             return {
-                "ok":     True,
-                "cached": True,
+                "ok":          True,
+                "cached":      True,
                 "generado_at":   str(cached.generado_at),
                 "regenerado_at": str(cached.regenerado_at) if cached.regenerado_at else None,
                 "total_doc_emitidos":  cached.total_doc_emitidos,
@@ -590,20 +575,22 @@ async def casilleros_iva(
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     cnt_e = res_cnt_e.fetchone()
 
-    # COMPRAS — recibidos por tarifa y crédito
+    # COMPRAS — usa items_detalle por tarifa y crédito
     res_compras = await db.execute(text("""
         SELECT
             d.id,
-            (imp->>'tarifa')::numeric                 AS tarifa,
-            (imp->>'aplicaCredito')::boolean          AS aplica_credito,
-            SUM((imp->>'baseImponible')::numeric)     AS subtotal,
-            SUM((imp->>'valor')::numeric)             AS iva
+            (item->>'tarifa_iva')::numeric                 AS tarifa,
+            (item->>'credito_tributario_iva')::boolean     AS aplica_credito,
+            SUM((item->>'subtotal')::numeric)              AS subtotal,
+            SUM((item->>'valor_iva')::numeric)             AS iva
         FROM documentos_recibidos d,
-             jsonb_array_elements(d.impuestos_detalle) AS imp
+             jsonb_array_elements(d.items_detalle) AS item
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      IN ('FAC', 'LIQ')
-        GROUP BY d.id, (imp->>'tarifa')::numeric, (imp->>'aplicaCredito')::boolean
+          AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
+        GROUP BY d.id, (item->>'tarifa_iva')::numeric,
+                 (item->>'credito_tributario_iva')::boolean
         ORDER BY tarifa, aplica_credito
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     cc = {}
@@ -624,19 +611,20 @@ async def casilleros_iva(
             sc[t]["subtotal"] += float(r.subtotal or 0)
             sc[t]["iva"]      += float(r.iva or 0)
 
-    # NCR recibidas
+    # NCR recibidas — desde items_detalle
     res_ncr_r = await db.execute(text("""
         SELECT
             d.id,
-            (imp->>'tarifa')::numeric             AS tarifa,
-            SUM((imp->>'baseImponible')::numeric) AS subtotal,
-            SUM((imp->>'valor')::numeric)         AS iva
+            (item->>'tarifa_iva')::numeric             AS tarifa,
+            SUM((item->>'subtotal')::numeric)          AS subtotal,
+            SUM((item->>'valor_iva')::numeric)          AS iva
         FROM documentos_recibidos d,
-             jsonb_array_elements(d.impuestos_detalle) AS imp
+             jsonb_array_elements(d.items_detalle) AS item
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      = 'NCR'
-        GROUP BY d.id, (imp->>'tarifa')::numeric
+          AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
+        GROUP BY d.id, (item->>'tarifa_iva')::numeric
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     ncr_r = {}
     for r in res_ncr_r.fetchall():
@@ -647,16 +635,21 @@ async def casilleros_iva(
         ncr_r[t]["subtotal"] += float(r.subtotal or 0)
         ncr_r[t]["iva"]      += float(r.iva or 0)
 
-    # RET que NOS hicieron (609)
+    # RET que NOS hicieron — solo IVA retenido (casillero 609)
     res_ret_r = await db.execute(text("""
-        SELECT d.id, COALESCE(SUM((imp->>'valor')::numeric), 0) AS total
+        SELECT
+            d.id,
+            SUM((item->>'total')::numeric) AS total
         FROM documentos_recibidos d,
-             jsonb_array_elements(d.impuestos_detalle) AS imp
+             jsonb_array_elements(d.items_detalle) AS item
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      = 'RET'
+          AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
+          AND (item->>'codigo_impuesto') = '2'
         GROUP BY d.id
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
+
     c609 = 0.0
     for r in res_ret_r.fetchall():
         doc_recibidos_ids.add(str(r.id))
@@ -707,7 +700,8 @@ async def casilleros_iva(
             COUNT(*) FILTER (WHERE tipo_doc IN ('FAC','NCR','NDB','RET')) AS recibidos,
             COUNT(*) FILTER (WHERE tipo_doc = 'LIQ')                      AS liq
         FROM documentos_recibidos
-        WHERE emisor_id = :eid AND fecha_emision BETWEEN :fi AND :ff
+        WHERE emisor_id     = :eid
+          AND fecha_emision BETWEEN :fi AND :ff
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     cnt_r = res_cnt_r.fetchone()
 
@@ -820,8 +814,8 @@ async def casilleros_iva(
                      "801": c801, "859": c859},
     }
     desglose_completo = {
-        "ventas":               {"desglose": ventas_desglose,  "casilleros": casilleros_completos["ventas"]},
-        "compras":              {"desglose": compras_desglose, "casilleros": casilleros_completos["compras"]},
+        "ventas":                {"desglose": ventas_desglose,  "casilleros": casilleros_completos["ventas"]},
+        "compras":               {"desglose": compras_desglose, "casilleros": casilleros_completos["compras"]},
         "retenciones_emitidas": {"desglose": ret_e_desglose,  "casilleros": casilleros_completos["ret_emit"]},
         "retenciones_recibidas":{"casilleros": casilleros_completos["ret_recib"]},
     }
@@ -883,18 +877,18 @@ async def casilleros_iva(
                     )
                     ON CONFLICT (emisor_id, tipo, periodo) DO NOTHING
                 """), {
-                    "eid":         emisor_id,
+                    "eid":          emisor_id,
                     "tipo_periodo": tipo_periodo,
-                    "periodo":     periodo_db,
-                    "casilleros":  json.dumps(casilleros_completos),
-                    "preguntas":   json.dumps(preguntas),
-                    "desglose":    json.dumps(desglose_completo),
-                    "resumen":     json.dumps(resumen_completo),
-                    "doc_e":       json.dumps(list(doc_emitidos_ids)),
-                    "doc_r":       json.dumps(list(doc_recibidos_ids)),
-                    "total_e":     len(doc_emitidos_ids),
-                    "total_r":     len(doc_recibidos_ids),
-                    "pid":         str(profile_id) if profile_id else None,
+                    "periodo":      periodo_db,
+                    "casilleros":   json.dumps(casilleros_completos),
+                    "preguntas":    json.dumps(preguntas),
+                    "desglose":     json.dumps(desglose_completo),
+                    "resumen":      json.dumps(resumen_completo),
+                    "doc_e":        json.dumps(list(doc_emitidos_ids)),
+                    "doc_r":        json.dumps(list(doc_recibidos_ids)),
+                    "total_e":      len(doc_emitidos_ids),
+                    "total_r":      len(doc_recibidos_ids),
+                    "pid":          str(profile_id) if profile_id else None,
                 })
             await db.commit()
         except Exception as e:
@@ -920,13 +914,12 @@ async def casilleros_iva(
         }
     }
 
-
 # =============================================================================
 # GET /renta — Formulario 102 — Impuesto a la Renta anual
 # =============================================================================
 @router.get("/renta", summary="Casilleros formulario 102 — Impuesto a la Renta anual")
 async def casilleros_renta(
-    anio:       int          = Query(..., description="Año a declarar, ej: 2025"),
+    anio:        int          = Query(..., description="Año a declarar, ej: 2025"),
     regenerar:  bool         = Query(False, description="Forzar recálculo aunque esté guardado"),
     auth_data:  dict         = Depends(verify_firebase_token),
     db:         AsyncSession = Depends(get_db),
@@ -1041,21 +1034,17 @@ async def casilleros_renta(
     ingresos_netos = round(ingresos_brutos - ncr_total, 2)
 
     # ══════════════════════════════════════════════════════════════
-    # GASTOS DEDUCIBLES — recibidos con deducible_renta=true
+    # GASTOS DEDUCIBLES — usa columnas desnormalizadas
     # ══════════════════════════════════════════════════════════════
     res_gastos = await db.execute(text("""
         SELECT
-            d.id,
-            d.tipo_doc,
-            SUM((imp->>'baseImponible')::numeric)  AS subtotal,
-            SUM((imp->>'valor')::numeric)          AS iva
-        FROM documentos_recibidos d,
-             jsonb_array_elements(d.impuestos_detalle) AS imp
-        WHERE d.emisor_id       = :eid
-          AND d.fecha_emision   BETWEEN :fi AND :ff
-          AND d.deducible_renta = true
-          AND d.tipo_doc        IN ('FAC', 'LIQ')
-        GROUP BY d.id, d.tipo_doc
+            id,
+            subtotal_base AS subtotal
+        FROM documentos_recibidos
+        WHERE emisor_id       = :eid
+          AND fecha_emision   BETWEEN :fi AND :ff
+          AND deducible_renta = true
+          AND tipo_doc        IN ('FAC', 'LIQ')
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
 
     gastos_deducibles = 0.0
@@ -1066,18 +1055,19 @@ async def casilleros_renta(
     gastos_deducibles = round(gastos_deducibles, 2)
 
     # ══════════════════════════════════════════════════════════════
-    # RETENCIONES DE RENTA que nos hicieron — crédito tributario
+    # RETENCIONES DE RENTA recibidas — usa items_detalle
     # ══════════════════════════════════════════════════════════════
     res_ret_renta = await db.execute(text("""
         SELECT
             d.id,
-            SUM((imp->>'valor')::numeric) AS valor
+            SUM((item->>'total')::numeric) AS valor
         FROM documentos_recibidos d,
-             jsonb_array_elements(d.impuestos_detalle) AS imp
+             jsonb_array_elements(d.items_detalle) AS item
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      = 'RET'
-          AND (imp->>'codigoPorcentaje')::text LIKE '3%'  -- código 3XX = Renta
+          AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
+          AND (item->>'codigo_impuesto') = '1'
         GROUP BY d.id
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
 
@@ -1096,7 +1086,6 @@ async def casilleros_renta(
     base_imponible = max(base_imponible, 0.0)
 
     # Tabla progresiva IR personas naturales 2025 (SRI)
-    # Actualizar cada año según resolución del SRI
     TABLA_IR = [
         {"desde": 0,       "hasta": 11902,  "base": 0,     "porcentaje": 0},
         {"desde": 11902,   "hasta": 15159,  "base": 0,     "porcentaje": 5},
@@ -1135,18 +1124,18 @@ async def casilleros_renta(
         "601": gastos_deducibles,           # total gastos deducibles
 
         # BASE IMPONIBLE
-        "699": base_imponible,             # base imponible (503-601)
-        "701": base_imponible,             # base gravada
+        "699": base_imponible,              # base imponible (503-601)
+        "701": base_imponible,              # base gravada
 
         # IMPUESTO
-        "801": impuesto_causado,           # impuesto causado
+        "801": impuesto_causado,            # impuesto causado
 
         # CRÉDITOS
-        "841": retenciones_renta,          # retenciones en la fuente
+        "841": retenciones_renta,           # retenciones en la fuente
 
         # RESULTADO
-        "859": impuesto_a_pagar,           # impuesto a pagar
-        "869": saldo_a_favor,              # saldo a favor
+        "859": impuesto_a_pagar,            # impuesto a pagar
+        "869": saldo_a_favor,               # saldo a favor
     }
 
     preguntas = {
@@ -1155,14 +1144,14 @@ async def casilleros_renta(
         "tiene_retenciones":       retenciones_renta > 0,
         "debe_pagar":              impuesto_a_pagar > 0,
         "tiene_saldo_favor":       saldo_a_favor > 0,
-        "supera_fraccion_basica":  base_imponible > TABLA_IR[0]["hasta"],
+        "supera_fraccion_basica": base_imponible > TABLA_IR[0]["hasta"],
     }
 
     desglose = {
         "ingresos": {
-            "brutos":  round(ingresos_brutos, 2),
-            "ncr":     round(ncr_total, 2),
-            "netos":   ingresos_netos,
+            "brutos": round(ingresos_brutos, 2),
+            "ncr":    round(ncr_total, 2),
+            "netos":  ingresos_netos,
         },
         "gastos": {
             "deducibles": gastos_deducibles,
@@ -1241,8 +1230,8 @@ async def casilleros_renta(
             await db.rollback()
 
     return {
-        "ok":       True,
-        "cached":   False,
+        "ok":        True,
+        "cached":    False,
         "en_curso": es_anio_actual,
         "total_doc_emitidos":  len(doc_emitidos_ids),
         "total_doc_recibidos": len(doc_recibidos_ids),
@@ -1258,7 +1247,6 @@ async def casilleros_renta(
             ] + (["⚠️ Año en curso — los valores son preliminares."] if es_anio_actual else []),
         }
     }
-
 
 # =============================================================================
 # GET /ats — Anexo Transaccional Simplificado
@@ -1290,7 +1278,7 @@ async def casilleros_ats(
     hoy        = date.today()
     es_mes_actual = (año == hoy.year and mes == hoy.month)
 
-    # Verificar que el emisor sea obligado a contabilidad
+    # Verificar que el emisor exista
     res_emisor = await db.execute(text("""
         SELECT ruc, razon_social, obligado_contabilidad, tipo_emisor
         FROM emisores WHERE id = :eid
@@ -1486,7 +1474,8 @@ async def casilleros_ats(
             d.deducible_renta,
             d.credito_tributario_iva,
             d.fuente,
-            d.impuestos_detalle
+            d.subtotal_base,
+            d.valor_iva_total
         FROM documentos_recibidos d
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
@@ -1507,30 +1496,11 @@ async def casilleros_ats(
 
     for r in res_compras.fetchall():
         doc_recibidos_ids.add(str(r.id))
-        impuestos = r.impuestos_detalle or []
-        if not isinstance(impuestos, list):
-            impuestos = []
 
-        base_nz      = 0.0
-        base_0       = 0.0
-        iva_credito  = 0.0
-        iva_sin_cred = 0.0
-
-        for imp in impuestos:
-            if not isinstance(imp, dict):
-                continue
-            tarifa  = float(imp.get("tarifa", 0) or 0)
-            base    = float(imp.get("baseImponible", 0) or 0)
-            valor   = float(imp.get("valor", 0) or 0)
-            credito = imp.get("aplicaCredito", False)
-            if tarifa == 0:
-                base_0 += base
-            else:
-                base_nz += base
-                if credito:
-                    iva_credito  += valor
-                else:
-                    iva_sin_cred += valor
+        base_nz      = float(r.subtotal_base    or 0)
+        base_0       = 0.0  # Físicos sin IVA / Exentos
+        iva_credito  = float(r.valor_iva_total or 0) if r.credito_tributario_iva else 0.0
+        iva_sin_cred = float(r.valor_iva_total or 0) if not r.credito_tributario_iva else 0.0
 
         compras_detalle.append({
             "tipo_doc":        r.tipo_doc,
@@ -1542,9 +1512,9 @@ async def casilleros_ats(
             "razon_proveedor": r.razon_social_proveedor,
             "fuente":          r.fuente,
             "base_iva_nz":     round(base_nz,      2),
-            "base_iva_0":      round(base_0,        2),
-            "iva_credito":     round(iva_credito,   2),
-            "iva_sin_credito": round(iva_sin_cred,  2),
+            "base_iva_0":      round(base_0,       2),
+            "iva_credito":     round(iva_credito,  2),
+            "iva_sin_credito": round(iva_sin_cred, 2),
             "total":           float(r.importe_total),
             "deducible_renta": r.deducible_renta,
         })
@@ -1556,7 +1526,7 @@ async def casilleros_ats(
         totales_compras["total"]                += float(r.importe_total)
         totales_compras["num_docs"]             += 1
 
-    # Retenciones recibidas
+    # Retenciones recibidas — desglosadas desde items_detalle
     res_ret_r = await db.execute(text("""
         SELECT
             d.id,
@@ -1565,7 +1535,7 @@ async def casilleros_ats(
             d.fecha_emision,
             d.ruc_proveedor,
             d.razon_social_proveedor,
-            d.impuestos_detalle
+            d.items_detalle
         FROM documentos_recibidos d
         WHERE d.emisor_id     = :eid
           AND d.fecha_emision BETWEEN :fi AND :ff
@@ -1576,17 +1546,21 @@ async def casilleros_ats(
     retenciones_recibidas = []
     for r in res_ret_r.fetchall():
         doc_recibidos_ids.add(str(r.id))
-        impuestos = r.impuestos_detalle or []
+        items = r.items_detalle or []
         lineas = []
-        for imp in impuestos:
-            if not isinstance(imp, dict):
+        for item in items:
+            if not isinstance(item, dict):
                 continue
             lineas.append({
-                "codigo_porcentaje": imp.get("codigoPorcentaje"),
-                "tarifa":            imp.get("tarifa"),
-                "base_imponible":    float(imp.get("baseImponible", 0) or 0),
-                "valor":             float(imp.get("valor", 0) or 0),
-                "aplica_credito":    imp.get("aplicaCredito", False),
+                "codigo_impuesto":  item.get("codigo_impuesto"),
+                "codigo_retencion": item.get("codigo_retencion"),
+                "descripcion":      item.get("descripcion"),
+                "base_imponible":   float(item.get("subtotal", 0) or 0),
+                "porcentaje":       float(item.get("porcentaje", 0) or 0),
+                "valor":            float(item.get("total", 0) or 0),
+                "aplica_credito":   item.get("credito_tributario_iva", False),
+                "num_doc_sustento": item.get("num_doc_sustento"),
+                "cod_doc_sustento": item.get("cod_doc_sustento"),
             })
         retenciones_recibidas.append({
             "numero_doc":    r.numero_doc,
@@ -1609,26 +1583,26 @@ async def casilleros_ats(
 
     desglose = {
         "ventas": {
-            "detalle":          ventas_detalle,
-            "retenciones":      retenciones_emitidas,
-            "totales":          totales_ventas,
+            "detalle":     ventas_detalle,
+            "retenciones": retenciones_emitidas,
+            "totales":     totales_ventas,
         },
         "compras": {
-            "detalle":          compras_detalle,
-            "retenciones":      retenciones_recibidas,
-            "totales":          totales_compras,
+            "detalle":     compras_detalle,
+            "retenciones": retenciones_recibidas,
+            "totales":     totales_compras,
         },
     }
 
     resumen = {
         "emisor": {
             "ruc":                   emisor.ruc,
-            "razon_social":          emisor.razon_social,
+            "razon_social":           emisor.razon_social,
             "obligado_contabilidad": emisor.obligado_contabilidad,
         },
         "periodo": str(fi),
-        "totales_ventas":  totales_ventas,
-        "totales_compras": totales_compras,
+        "totales_ventas":      totales_ventas,
+        "totales_compras":     totales_compras,
         "total_ret_emitidas":  len(retenciones_emitidas),
         "total_ret_recibidas": len(retenciones_recibidas),
     }
@@ -1690,8 +1664,8 @@ async def casilleros_ats(
             await db.rollback()
 
     return {
-        "ok":       True,
-        "cached":   False,
+        "ok":        True,
+        "cached":    False,
         "en_curso": es_mes_actual,
         "total_doc_emitidos":  len(doc_emitidos_ids),
         "total_doc_recibidos": len(doc_recibidos_ids),
@@ -1707,8 +1681,6 @@ async def casilleros_ats(
             ] + (["⚠️ Período en curso — los valores son preliminares."] if es_mes_actual else []),
         }
     }
-
-
 
 # =============================================================================
 # POST /ats/generar — Generar archivo XML del ATS y subirlo a R2
@@ -1730,7 +1702,6 @@ async def generar_ats_xml(
     except Exception:
         raise HTTPException(status_code=400, detail="Formato inválido. Use YYYY-MM.")
 
-
     fi = date(año, mes, 1)
     ff = date(año, mes, calendar.monthrange(año, mes)[1])
 
@@ -1749,7 +1720,7 @@ async def generar_ats_xml(
             detail="Se requiere suscripción activa para generar el ATS."
         )
 
-    # ── Compras del período ───────────────────────────────────────────────
+    # ── Compras del período (usa columnas desnormalizadas e items_detalle) ──
     res_compras = await db.execute(text("""
         SELECT
             d.id,
@@ -1762,7 +1733,10 @@ async def generar_ats_xml(
             d.ruc_proveedor,
             d.razon_social_proveedor,
             d.fuente,
-            d.impuestos_detalle,
+            d.subtotal_base,
+            d.valor_iva_total,
+            d.credito_tributario_iva,
+            d.items_detalle,
             d.datos
         FROM documentos_recibidos d
         WHERE d.emisor_id     = :eid
@@ -1801,7 +1775,7 @@ async def generar_ats_xml(
             d.clave_acceso,
             d.fecha_emision,
             d.importe_total,
-            d.datos->'infoFactura'->>'identificacionComprador'    AS id_comprador,
+            d.datos->'infoFactura'->>'identificacionComprador'     AS id_comprador,
             d.datos->'infoFactura'->>'tipoIdentificacionComprador' AS tipo_id,
             d.datos->'resumenImpuestos'                            AS resumen_impuestos
         FROM documentos_emitidos d
@@ -1828,8 +1802,8 @@ async def generar_ats_xml(
 
     # Total ventas
     total_ventas = sum(float(v.importe_total or 0) for v in ventas)
-    _t(root, "totalVentas",      fmt2(total_ventas))
-    _t(root, "codigoOperativo",  "IVA")
+    _t(root, "totalVentas",     fmt2(total_ventas))
+    _t(root, "codigoOperativo", "IVA")
 
     # ── COMPRAS ───────────────────────────────────────────────────────────
     if compras:
@@ -1838,7 +1812,6 @@ async def generar_ats_xml(
             det = SubElement(compras_el, "detalleCompras")
 
             # Parsear número: 001-001-000000555
-            partes   = (c.numero_doc or "001-001-000000001").replace("-", "").split("-") if "-" in (c.numero_doc or "") else ["001", "001", "000000001"]
             if "-" in (c.numero_doc or ""):
                 p = c.numero_doc.split("-")
                 estab = p[0] if len(p) > 0 else "001"
@@ -1847,42 +1820,41 @@ async def generar_ats_xml(
             else:
                 estab = "001"; punto = "001"; secuencial = "000000001"
 
-            # Autorizacion = clave acceso o número
+            # Autorización = clave acceso o número
             autorizacion = c.clave_acceso or secuencial
 
-            # Impuestos
-            impuestos  = c.impuestos_detalle or []
-            base_grav  = sum(float(i.get("baseImponible", 0) or 0) for i in impuestos if float(i.get("tarifa", 0) or 0) > 0)
-            base_0     = sum(float(i.get("baseImponible", 0) or 0) for i in impuestos if float(i.get("tarifa", 0) or 0) == 0)
-            monto_iva  = sum(float(i.get("valor", 0) or 0) for i in impuestos if float(i.get("tarifa", 0) or 0) > 0)
+            # Usar columnas desnormalizadas
+            base_grav = float(c.subtotal_base or 0)
+            base_0    = 0.0
+            monto_iva = float(c.valor_iva_total or 0)
 
-            # Retenciones en este doc (si tiene)
+            # Retenciones en este doc
             ret_bien10  = 0.0; ret_serv20  = 0.0; ret_bien100 = 0.0
             ret_serv50  = 0.0; ret_serv100 = 0.0; ret_serv_gen = 0.0
 
-            _t(det, "codSustento",    "01")  # 01=facturas
-            _t(det, "tpIdProv",       "01")  # 01=RUC
-            _t(det, "idProv",         c.ruc_proveedor or "9999999999999")
+            _t(det, "codSustento",     "01")  # 01=facturas
+            _t(det, "tpIdProv",        "01")  # 01=RUC
+            _t(det, "idProv",          c.ruc_proveedor or "9999999999999")
             _t(det, "tipoComprobante", c.cod_doc or "01")
-            _t(det, "parteRel",       "NO")
-            _t(det, "fechaRegistro",  c.fecha_emision.strftime("%d/%m/%Y"))
+            _t(det, "parteRel",        "NO")
+            _t(det, "fechaRegistro",   c.fecha_emision.strftime("%d/%m/%Y"))
             _t(det, "establecimiento", estab)
-            _t(det, "puntoEmision",   punto)
-            _t(det, "secuencial",     secuencial.lstrip("0") or "1")
-            _t(det, "fechaEmision",   c.fecha_emision.strftime("%d/%m/%Y"))
-            _t(det, "autorizacion",   autorizacion)
-            _t(det, "baseNoGraIva",   fmt2(0))
-            _t(det, "baseImponible",  fmt2(base_0))
-            _t(det, "baseImpGrav",    fmt2(base_grav))
-            _t(det, "baseImpExe",     fmt2(0))
-            _t(det, "montoIce",       fmt2(0))
-            _t(det, "montoIva",       fmt2(monto_iva))
-            _t(det, "valRetBien10",   fmt2(ret_bien10))
-            _t(det, "valRetServ20",   fmt2(ret_serv20))
-            _t(det, "valorRetBienes", fmt2(ret_bien100))
-            _t(det, "valRetServ50",   fmt2(ret_serv50))
+            _t(det, "puntoEmision",    punto)
+            _t(det, "secuencial",      secuencial.lstrip("0") or "1")
+            _t(det, "fechaEmision",    c.fecha_emision.strftime("%d/%m/%Y"))
+            _t(det, "autorizacion",    autorizacion)
+            _t(det, "baseNoGraIva",    fmt2(0))
+            _t(det, "baseImponible",   fmt2(base_0))
+            _t(det, "baseImpGrav",     fmt2(base_grav))
+            _t(det, "baseImpExe",      fmt2(0))
+            _t(det, "montoIce",        fmt2(0))
+            _t(det, "montoIva",        fmt2(monto_iva))
+            _t(det, "valRetBien10",    fmt2(ret_bien10))
+            _t(det, "valRetServ20",    fmt2(ret_serv20))
+            _t(det, "valorRetBienes",  fmt2(ret_bien100))
+            _t(det, "valRetServ50",    fmt2(ret_serv50))
             _t(det, "valorRetServicios", fmt2(ret_serv_gen))
-            _t(det, "valRetServ100",  fmt2(ret_serv100))
+            _t(det, "valRetServ100",   fmt2(ret_serv100))
             _t(det, "valorRetencionNc", fmt2(0))
             _t(det, "totbasesImpReemb", fmt2(0))
 
@@ -1893,24 +1865,34 @@ async def generar_ats_xml(
             _t(pago_ext, "aplicConvDobTrib",      "NA")
             _t(pago_ext, "pagExtSujRetNorLeg",    "NA")
 
-            # air — retenciones de renta
-            ret_renta_docs = [r for r in retenciones
-                if r.id_retenido == c.ruc_proveedor]
-            if ret_renta_docs:
+            # air — retenciones de renta por doc cruzando con num_doc_sustento en retenciones
+            ret_renta_doc = []
+            for r in retenciones:
+                imp_list = (r.impuestos or {}).get("impuesto", [])
+                if not isinstance(imp_list, list):
+                    imp_list = [imp_list] if imp_list else []
+                for imp in imp_list:
+                    if not isinstance(imp, dict):
+                        continue
+                    if str(imp.get("codigo", "")) == "1":  # Renta
+                        num_sustento = str(imp.get("numDocSustento", "")).replace("-", "")
+                        num_compra   = str(c.numero_doc or "").replace("-", "")
+                        if num_sustento and num_compra and (num_sustento in num_compra or num_compra in num_sustento):
+                            ret_renta_doc.append({
+                                "codigo_retencion": str(imp.get("codigoRetencion", "332")),
+                                "base_imponible":   float(imp.get("baseImponible", 0) or 0),
+                                "porcentaje":       float(imp.get("porcentajeRetener", 0) or 0),
+                                "valor_retenido":   float(imp.get("valorRetenido", 0) or 0),
+                            })
+
+            if ret_renta_doc:
                 air_el = SubElement(det, "air")
-                for r in ret_renta_docs:
-                    imp_list = (r.impuestos or {}).get("impuesto", [])
-                    if not isinstance(imp_list, list):
-                        imp_list = [imp_list] if imp_list else []
-                    for imp in imp_list:
-                        if not isinstance(imp, dict):
-                            continue
-                        if str(imp.get("codigo", "")) == "1":  # Renta
-                            det_air = SubElement(air_el, "detalleAir")
-                            _t(det_air, "codRetAir",     str(imp.get("codigoRetencion", "332")))
-                            _t(det_air, "baseImpAir",    fmt2(imp.get("baseImponible", 0)))
-                            _t(det_air, "porcentajeAir", fmt2(imp.get("porcentajeRetener", 0)))
-                            _t(det_air, "valRetAir",     fmt2(imp.get("valorRetenido", 0)))
+                for item in ret_renta_doc:
+                    det_air = SubElement(air_el, "detalleAir")
+                    _t(det_air, "codRetAir",     item["codigo_retencion"])
+                    _t(det_air, "baseImpAir",    fmt2(item["base_imponible"]))
+                    _t(det_air, "porcentajeAir", fmt2(item["porcentaje"]))
+                    _t(det_air, "valRetAir",     fmt2(item["valor_retenido"]))
             else:
                 # Air vacío requerido por el schema
                 air_el  = SubElement(det, "air")
@@ -1942,26 +1924,24 @@ async def generar_ats_xml(
 
             _t(det, "tpIdCliente",    v.tipo_id or "07")
             _t(det, "idCliente",      v.id_comprador or "9999999999999")
-            _t(det, "parteRel",       "NO")
+            _t(det, "parteRel",        "NO")
             _t(det, "tipoComprobante", v.cod_doc or "01")
-            _t(det, "tipoEm",         "E")  # E=electrónico
+            _t(det, "tipoEm",          "E")  # E=electrónico
             _t(det, "numeroComprobantes", "1")
-            _t(det, "baseNoGraIva",   fmt2(0))
-            _t(det, "baseImponible",  fmt2(base_0))
-            _t(det, "baseImpGrav",    fmt2(base_grav))
-            _t(det, "baseImpExe",     fmt2(0))
-            _t(det, "montoIce",       fmt2(0))
-            _t(det, "montoIva",       fmt2(monto_iva))
-            _t(det, "valorRetIva",    fmt2(0))
-            _t(det, "valorRetRenta",  fmt2(0))
+            _t(det, "baseNoGraIva",    fmt2(0))
+            _t(det, "baseImponible",   fmt2(base_0))
+            _t(det, "baseImpGrav",     fmt2(base_grav))
+            _t(det, "baseImpExe",      fmt2(0))
+            _t(det, "montoIce",        fmt2(0))
+            _t(det, "montoIva",        fmt2(monto_iva))
+            _t(det, "valorRetIva",     fmt2(0))
+            _t(det, "valorRetRenta",   fmt2(0))
 
     # ── Serializar XML ────────────────────────────────────────────────────
     xml_str = minidom.parseString(
         tostring(root, encoding="unicode")
     ).toprettyxml(indent="  ", encoding=None)
 
-    # Quitar la línea <?xml version="1.0" ?> — el SRI la quiere sin versión a veces
-    # Pero la incluimos por seguridad
     xml_bytes = xml_str.encode("utf-8")
 
     # ── Comprimir en ZIP ──────────────────────────────────────────────────
@@ -1993,8 +1973,8 @@ async def generar_ats_xml(
                 '[]', '[]', :total_e, :total_r, :pid
             )
             ON CONFLICT (emisor_id, tipo, periodo) DO UPDATE SET
-                resumen       = CAST(:resumen AS jsonb),
-                regenerado_at = NOW(),
+                resumen        = CAST(:resumen AS jsonb),
+                regenerado_at  = NOW(),
                 regenerado_por = :pid
         """), {
             "eid":     emisor_id,
@@ -2012,15 +1992,14 @@ async def generar_ats_xml(
     # Retornar URL de descarga
     url = get_presigned_url(r2_path)
     return {
-        "ok":          True,
-        "nombre_zip":  nombre_zip,
-        "r2_path":     r2_path,
+        "ok":           True,
+        "nombre_zip":   nombre_zip,
+        "r2_path":      r2_path,
         "download_url": url,
         "total_ventas": len(ventas),
         "total_compras": len(compras),
         "mensaje": f"ATS generado correctamente — {nombre_zip}",
     }
-
 
 # =============================================================================
 # GET /ats/descargar — URL de descarga del ATS

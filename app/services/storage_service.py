@@ -2,6 +2,7 @@
 
 import boto3
 import time
+import gzip
 import urllib3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -47,13 +48,17 @@ print(f"[Storage] Access Key: {settings.R2_ACCESS_KEY_ID[:8]}...")
 # =============================================================================
 
 def upload_file(path: str, file_bytes: bytes, content_type: str = 'application/octet-stream') -> str:
-    """Suba un archivo binario directamente a Cloudflare R2."""
+    """Comprime y sube un archivo binario (ej. XML) a Cloudflare R2."""
     try:
+        # 1. Comprimir los bytes con gzip
+        compressed_bytes = gzip.compress(file_bytes)
+        
         r2_client.put_object(
             Bucket=BUCKET,
             Key=path,
-            Body=file_bytes,
-            ContentType=content_type
+            Body=compressed_bytes,
+            ContentType=content_type,
+            ContentEncoding='gzip'  # 👈 Clave para que sepa que está comprimido
         )
         return path
     except Exception as e:
@@ -62,10 +67,14 @@ def upload_file(path: str, file_bytes: bytes, content_type: str = 'application/o
 
 
 def download_file(path: str) -> bytes:
-    """Descarga un archivo desde Cloudflare R2 como bytes."""
+    """Descarga y descomprime automáticamente un archivo desde Cloudflare R2."""
     try:
         response = r2_client.get_object(Bucket=BUCKET, Key=path)
-        return response['Body'].read()
+        compressed_bytes = response['Body'].read()
+        
+        # 2. Descomprimir automáticamente al leer
+        file_bytes = gzip.decompress(compressed_bytes)
+        return file_bytes
     except Exception as e:
         print(f"❌ [Storage Error] Error descargando de R2 ({path}): {e}")
         raise e

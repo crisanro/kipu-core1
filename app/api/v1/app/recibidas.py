@@ -402,10 +402,8 @@ async def registrar_desde_xml(
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
 
-    # Validar RUC comprador
-    datos_raw     = parsed.get("datos", {})
-    info          = datos_raw.get("infoFactura") or datos_raw.get("infoLiquidacionCompra") or {}
-    ruc_comprador = info.get("identificacionComprador") or info.get("identificacionProveedor") or ""
+    # Validar RUC — viene directo del parser
+    ruc_comprador = parsed.get("ruc_comprador", "")
     if ruc_comprador and ruc_comprador != emisor.ruc:
         raise HTTPException(status_code=400, detail=f"Este documento no está dirigido a tu RUC ({emisor.ruc}).")
 
@@ -514,6 +512,7 @@ async def registrar_desde_xml(
         "errores":   parsed["errores"],
         "mensaje":   "Documento registrado correctamente.",
     }
+
 
 # =============================================================================
 # GET / — Historial
