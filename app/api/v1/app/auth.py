@@ -305,27 +305,33 @@ async def nuke_account(
 
 # ── Ping / Validar sesión extensión ───────────────────────────────────────────
 @router.get("/ping")
-async def ping(
-    auth_data: dict = Depends(verify_firebase_token),
-):
+async def ping(request: Request):
     """
     Valida el JWT de Firebase sin tocar la base de datos.
-    Usado por la extensión Kipu Importador antes de iniciar una importación.
     Retorna 401 si el token es inválido o expira en menos de 5 minutos.
     """
     import time
-    exp = auth_data.get("exp")
-    if not exp:
-        raise HTTPException(status_code=401, detail="TOKEN_SIN_EXPIRACION")
 
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="TOKEN_REQUERIDO")
+
+    token = auth_header.split(" ")[1]
+
+    try:
+        decoded = auth.verify_id_token(token)
+    except Exception as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="TOKEN_POR_EXPIRAR")
+        raise HTTPException(status_code=401, detail="TOKEN_INVALIDO")
+
+    exp = decoded.get("exp", 0)
     segundos_restantes = exp - int(time.time())
-    if segundos_restantes < 300:  # menos de 5 minutos
-        raise HTTPException(
-            status_code=401,
-            detail="TOKEN_POR_EXPIRAR",
-        )
+
+    if segundos_restantes < 300:
+        raise HTTPException(status_code=401, detail="TOKEN_POR_EXPIRAR")
 
     return {
         "ok": True,
-        "expira_en": segundos_restantes,  # segundos restantes, útil para debug
+        "expira_en": segundos_restantes,
     }
