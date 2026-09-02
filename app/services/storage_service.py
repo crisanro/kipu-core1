@@ -67,13 +67,15 @@ def upload_file(path: str, file_bytes: bytes, content_type: str = 'application/o
 
 
 def download_file(path: str) -> bytes:
-    """Descarga y descomprime automáticamente un archivo desde Cloudflare R2."""
+    """Descarga un archivo desde Cloudflare R2 y lo descomprime solo si está en formato gzip."""
     try:
         response = r2_client.get_object(Bucket=BUCKET, Key=path)
-        compressed_bytes = response['Body'].read()
+        file_bytes = response['Body'].read()
         
-        # 2. Descomprimir automáticamente al leer
-        file_bytes = gzip.decompress(compressed_bytes)
+        # Verificar si el archivo comienza con los bytes mágicos de gzip (\x1f\x8b)
+        if file_bytes.startswith(b'\x1f\x8b'):
+            file_bytes = gzip.decompress(file_bytes)
+            
         return file_bytes
     except Exception as e:
         print(f"❌ [Storage Error] Error descargando de R2 ({path}): {e}")
