@@ -4,7 +4,7 @@ from datetime import date, timedelta, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from decimal import Decimal
 import json
 from app.utils.xml_parser_recibidos import parsear_xml_recibido
@@ -19,131 +19,90 @@ router = APIRouter()
 # =============================================================================
 # SCHEMAS
 # =============================================================================
-class ImpuestoDetalle(BaseModel):
-    codigoPorcentaje: str
-    tarifa:           str
-    baseImponible:    Decimal
-    valor:            Decimal
-    aplicaCredito:    bool = False
-
 class DocumentoRecibidoCreate(BaseModel):
-    ruc_proveedor:          str
-    razon_social_proveedor: str
-    tipo_doc:               str     = "FAC"
-    cod_doc:                str     = "01"
-    clave_acceso:           str
-    numero_doc:             str
-    fecha_emision:          date
-    fecha_autorizacion:     Optional[str]  = None
-    importe_total:          Decimal
-    impuestos_detalle:      list[ImpuestoDetalle] = []
-    deducible_renta:        bool           = True
-    credito_tributario_iva: bool           = False
-    notas:                  Optional[str]  = None
-    estado_pago:            Optional[str]  = "PENDIENTE"
-    forma_pago:             Optional[str]  = None
-    numero_comprobante_pago: Optional[str] = None
-    fecha_pago:             Optional[date] = None
-    datos:                  dict
-    fuente:                 str = "MANUAL"
+    ruc_proveedor:           str
+    razon_social_proveedor:  str
+    tipo_doc:                str            = "FAC"
+    cod_doc:                 str            = "01"
+    clave_acceso:            str
+    numero_doc:              str
+    fecha_emision:           date
+    fecha_autorizacion:      Optional[str]  = None
+    subtotal_base:           Decimal        = Decimal("0.00")
+    valor_iva_total:         Decimal        = Decimal("0.00")
+    importe_total:           Decimal
+    deducible_renta:         bool           = True
+    credito_tributario_iva:  bool           = False
+    notas:                   Optional[str]  = None
+    estado_pago:             Optional[str]  = "PENDIENTE"
+    forma_pago:              Optional[str]  = None
+    numero_comprobante_pago: Optional[str]  = None
+    fecha_pago:              Optional[date] = None
+    datos:                   dict
+    fuente:                  str            = "MANUAL"
+
+    @field_validator("notas")
+    @classmethod
+    def notas_max_length(cls, v):
+        if v and len(v) > 128:
+            raise ValueError("Las notas no pueden superar 128 caracteres.")
+        return v
+
 
 class DocumentoRecibidoUpdate(BaseModel):
-    deducible_renta:         Optional[bool]               = None
-    credito_tributario_iva:  Optional[bool]               = None
-    notas:                   Optional[str]                = None
-    impuestos_detalle:       Optional[list[ImpuestoDetalle]] = None
-    items_detalle:           Optional[list[dict]]         = None
-    estado_pago:             Optional[str]                = None
-    forma_pago:              Optional[str]                = None
-    numero_comprobante_pago: Optional[str]                = None
-    fecha_pago:              Optional[date]               = None
-    doc_origen_recibido_id:  Optional[str]                = None
-    doc_origen_emitido_id:   Optional[str]                = None
+    deducible_renta:         Optional[bool]       = None
+    credito_tributario_iva:  Optional[bool]       = None
+    notas:                   Optional[str]        = None
+    items_detalle:           Optional[list[dict]] = None
+    subtotal_base:           Optional[Decimal]    = None
+    valor_iva_total:         Optional[Decimal]    = None
+    estado_pago:             Optional[str]        = None
+    forma_pago:              Optional[str]        = None
+    numero_comprobante_pago: Optional[str]        = None
+    fecha_pago:              Optional[date]       = None
+    doc_origen_recibido_id:  Optional[str]        = None
+    doc_origen_emitido_id:   Optional[str]        = None
 
-class DocumentoFisicoCreate(BaseModel):
-    ruc_proveedor:          str
-    razon_social_proveedor: str
-    tipo_doc:               str     = "FAC"
-    cod_doc:                str     = "01"
-    numero_doc:             str
-    fecha_emision:          date
-    subtotal_0:             Decimal = Decimal("0.00")
-    subtotal_iva:           Decimal = Decimal("0.00")
-    tarifa_iva:             int     = 15
-    valor_iva:              Decimal = Decimal("0.00")
-    importe_total:          Decimal
-    deducible_renta:        bool    = True
-    credito_tributario_iva: bool    = False
-    notas:                  Optional[str] = None
+    @field_validator("notas")
+    @classmethod
+    def notas_max_length(cls, v):
+        if v and len(v) > 128:
+            raise ValueError("Las notas no pueden superar 128 caracteres.")
+        return v
+
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 def limpiar_detalle_item(det: dict) -> dict:
-    """Extraer solo campos útiles de cada ítem del comprobante."""
+    """Extrae solo los campos fiscalmente relevantes de cada ítem del XML."""
     return {
         "descripcion":            det.get("descripcion", ""),
         "cantidad":               det.get("cantidad", ""),
         "precioUnitario":         det.get("precioUnitario", ""),
         "precioTotalSinImpuesto": det.get("precioTotalSinImpuesto", ""),
-        "descuento":              det.get("descuento", "0.00"),
         "impuestos":              det.get("impuestos", {}),
     }
 
 def limpiar_datos_xml(datos_raw: dict) -> dict:
-    """
-    Extrae solo los datos necesarios para declaraciones y contabilidad.
-    Elimina firma digital, certificados, direcciones y datos irrelevantes.
-    """
-    info_tributaria = datos_raw.get("infoTributaria", {})
-    info_factura    = (
-        datos_raw.get("infoFactura") or
-        datos_raw.get("infoLiquidacionCompra") or
-        datos_raw.get("infoNotaCredito") or
-        datos_raw.get("infoNotaDebito") or
-        datos_raw.get("infoCompRetencion") or {}
-    )
-
-    # Determinar clave de la sección info según tipo
-    clave_info = next(
-        (k for k in ("infoFactura", "infoLiquidacionCompra", "infoNotaCredito",
-                     "infoNotaDebito", "infoCompRetencion")
-         if k in datos_raw), "infoFactura"
-    )
-
-    # Limpiar detalles
+    """Guarda solo el detalle crudo del XML — todo lo demás está desnormalizado."""
     detalles_raw   = datos_raw.get("detalles", {})
     detalles_items = detalles_raw.get("detalle", [])
     if isinstance(detalles_items, dict):
         detalles_items = [detalles_items]
-    detalles_limpios = [limpiar_detalle_item(d) for d in detalles_items]
-
     return {
-        "infoTributaria": {
-            "ruc":             info_tributaria.get("ruc", ""),
-            "razonSocial":     info_tributaria.get("razonSocial", ""),
-            "nombreComercial": info_tributaria.get("nombreComercial", ""),
-            "estab":           info_tributaria.get("estab", ""),
-            "ptoEmi":          info_tributaria.get("ptoEmi", ""),
-            "secuencial":      info_tributaria.get("secuencial", ""),
-            "claveAcceso":     info_tributaria.get("claveAcceso", ""),
-            "codDoc":          info_tributaria.get("codDoc", ""),
-        },
-        clave_info: {
-            "fechaEmision":        info_factura.get("fechaEmision", ""),
-            "importeTotal":        info_factura.get("importeTotal", ""),
-            "totalSinImpuestos":   info_factura.get("totalSinImpuestos", ""),
-            "totalDescuento":      info_factura.get("totalDescuento", "0.00"),
-            "totalConImpuestos":   info_factura.get("totalConImpuestos", {}),
-            "pagos":               info_factura.get("pagos", {}),
-            "obligadoContabilidad": info_factura.get("obligadoContabilidad", ""),
-            "moneda":              info_factura.get("moneda", "DOLAR"),
-        },
-        "detalles": detalles_limpios,
+        "detalles": [limpiar_detalle_item(d) for d in detalles_items]
     }
 
+def _calcular_totales_desde_items(items: list[dict]) -> tuple[Decimal, Decimal]:
+    """Calcula subtotal_base y valor_iva_total desde items_detalle."""
+    subtotal_base   = sum(Decimal(str(i.get("subtotal",   0))) for i in items)
+    valor_iva_total = sum(Decimal(str(i.get("valor_iva",  0))) for i in items)
+    return subtotal_base, valor_iva_total
+
+
 # =============================================================================
-# POST / — Registrar documento recibido (manual/SRI TXT)
+# POST / — Registrar documento recibido (manual/API)
 # =============================================================================
 @router.post("", summary="Registrar documento recibido", status_code=201)
 async def registrar_documento_recibido(
@@ -160,8 +119,7 @@ async def registrar_documento_recibido(
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
 
-    tipos_validos = ("FAC", "LIQ", "NCR", "NDB", "RET")
-    if data.tipo_doc.upper() not in tipos_validos:
+    if data.tipo_doc.upper() not in ("FAC", "LIQ", "NCR", "NDB", "RET"):
         raise HTTPException(status_code=400, detail="tipo_doc inválido.")
 
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
@@ -201,43 +159,45 @@ async def registrar_documento_recibido(
             INSERT INTO documentos_recibidos (
                 emisor_id, ruc_proveedor, razon_social_proveedor,
                 tipo_doc, cod_doc, clave_acceso, numero_doc,
-                fecha_emision, fecha_autorizacion, importe_total,
-                impuestos_detalle, deducible_renta, credito_tributario_iva, notas,
+                fecha_emision, fecha_autorizacion,
+                subtotal_base, valor_iva_total, importe_total,
+                deducible_renta, credito_tributario_iva, notas,
                 estado_pago, forma_pago, numero_comprobante_pago, fecha_pago,
-                datos, xml_path, fuente, procesado
+                datos, xml_path, fuente
             ) VALUES (
                 :eid, :ruc_prov, :razon_prov,
                 :tipo_doc, :cod_doc, :clave, :numero_doc,
-                :fecha_emision, :fecha_auth, :total,
-                CAST(:impuestos AS jsonb), :ded_renta, :cred_iva, :notas,
+                :fecha_emision, :fecha_auth,
+                :subtotal_base, :valor_iva_total, :total,
+                :ded_renta, :cred_iva, :notas,
                 :estado_pago, :forma_pago, :num_comp, :fecha_pago,
-                CAST(:datos AS jsonb), :xml_path, :fuente, false
+                CAST(:datos AS jsonb), :xml_path, :fuente
             ) RETURNING id
         """), {
-            "eid":         emisor_id,
-            "ruc_prov":    data.ruc_proveedor,
-            "razon_prov":  data.razon_social_proveedor,
-            "tipo_doc":    data.tipo_doc.upper(),
-            "cod_doc":     data.cod_doc,
-            "clave":       data.clave_acceso,
-            "numero_doc":  data.numero_doc,
-            "fecha_emision": data.fecha_emision,
-            "fecha_auth":  fecha_auth_parsed,
-            "total":       data.importe_total,
-            "impuestos":   json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str),
-            "ded_renta":   data.deducible_renta,
-            "cred_iva":    data.credito_tributario_iva,
-            "notas":       data.notas,
-            "estado_pago": data.estado_pago,
-            "forma_pago":  data.forma_pago,
-            "num_comp":    data.numero_comprobante_pago,
-            "fecha_pago":  data.fecha_pago,
-            "datos":       json.dumps(data.datos, default=str),
-            "xml_path":    xml_path,
-            "fuente":      data.fuente,
+            "eid":            emisor_id,
+            "ruc_prov":       data.ruc_proveedor,
+            "razon_prov":     data.razon_social_proveedor,
+            "tipo_doc":       data.tipo_doc.upper(),
+            "cod_doc":        data.cod_doc,
+            "clave":          data.clave_acceso,
+            "numero_doc":     data.numero_doc,
+            "fecha_emision":  data.fecha_emision,
+            "fecha_auth":     fecha_auth_parsed,
+            "subtotal_base":  data.subtotal_base,
+            "valor_iva_total": data.valor_iva_total,
+            "total":          data.importe_total,
+            "ded_renta":      data.deducible_renta,
+            "cred_iva":       data.credito_tributario_iva,
+            "notas":          data.notas,
+            "estado_pago":    data.estado_pago,
+            "forma_pago":     data.forma_pago,
+            "num_comp":       data.numero_comprobante_pago,
+            "fecha_pago":     data.fecha_pago,
+            "datos":          json.dumps(data.datos, default=str),
+            "xml_path":       xml_path,
+            "fuente":         data.fuente,
         })
         doc_id = res.scalar()
-
         await audit_log(
             db         = db,
             auth_data  = auth_data,
@@ -254,7 +214,6 @@ async def registrar_documento_recibido(
             request    = request,
         )
         await db.commit()
-
     except HTTPException:
         raise
     except Exception as e:
@@ -264,40 +223,43 @@ async def registrar_documento_recibido(
 
     return {"ok": True, "id": str(doc_id), "mensaje": "Documento recibido registrado correctamente."}
 
+
 # =============================================================================
 # POST /fisico
 # =============================================================================
 @router.post("/fisico", summary="Registrar documento físico (sin XML)", status_code=201)
 async def registrar_documento_fisico(
-    ruc_proveedor:          str          = Form(...),
-    razon_social_proveedor: str          = Form(...),
-    tipo_doc:               str          = Form("FAC"),
-    numero_doc:             str          = Form(...),
-    fecha_emision:          date         = Form(...),
-    subtotal_0:             Decimal      = Form(Decimal("0.00")),
-    subtotal_iva:           Decimal      = Form(Decimal("0.00")),
-    tarifa_iva:             int          = Form(15),
-    valor_iva:              Decimal      = Form(Decimal("0.00")),
-    importe_total:          Decimal      = Form(...),
-    deducible_renta:        bool         = Form(True),
-    credito_tributario_iva: bool         = Form(False),
+    ruc_proveedor:          str                  = Form(...),
+    razon_social_proveedor: str                  = Form(...),
+    tipo_doc:               str                  = Form("FAC"),
+    numero_doc:             str                  = Form(...),
+    fecha_emision:          date                 = Form(...),
+    subtotal_0:             Decimal              = Form(Decimal("0.00")),
+    subtotal_iva:           Decimal              = Form(Decimal("0.00")),
+    tarifa_iva:             int                  = Form(15),
+    valor_iva:              Decimal              = Form(Decimal("0.00")),
+    importe_total:          Decimal              = Form(...),
+    deducible_renta:        bool                 = Form(True),
+    credito_tributario_iva: bool                 = Form(False),
     notas:                  Optional[str]        = Form(None),
     imagen:                 Optional[UploadFile] = File(None),
-    request:                Request      = None,
-    auth_data:              dict         = Depends(verify_firebase_token),
-    db:                     AsyncSession = Depends(get_db),
+    request:                Request              = None,
+    auth_data:              dict                 = Depends(verify_firebase_token),
+    db:                     AsyncSession         = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "documentos")
+
+    if notas and len(notas) > 128:
+        raise HTTPException(status_code=400, detail="Las notas no pueden superar 128 caracteres.")
 
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
 
-    tipos_validos = ("FAC", "LIQ", "NCR", "NDB", "RET")
     tipo_doc = tipo_doc.upper()
-    if tipo_doc not in tipos_validos:
+    if tipo_doc not in ("FAC", "LIQ", "NCR", "NDB", "RET"):
         raise HTTPException(status_code=400, detail="tipo_doc inválido.")
 
     cod_map = {"FAC": "01", "LIQ": "03", "NCR": "04", "NDB": "05", "RET": "07"}
@@ -334,23 +296,8 @@ async def registrar_documento_fisico(
             print(f"⚠️ Error subiendo imagen: {e}")
             imagen_path = None
 
-    impuestos_detalle = []
-    if valor_iva > 0 and subtotal_iva > 0:
-        impuestos_detalle.append({
-            "codigoPorcentaje": str(tarifa_iva),
-            "tarifa":           str(tarifa_iva),
-            "baseImponible":    float(subtotal_iva),
-            "valor":            float(valor_iva),
-            "aplicaCredito":    credito_tributario_iva,
-        })
-    if subtotal_0 > 0:
-        impuestos_detalle.append({
-            "codigoPorcentaje": "0",
-            "tarifa":           "0",
-            "baseImponible":    float(subtotal_0),
-            "valor":            0.0,
-            "aplicaCredito":    False,
-        })
+    # subtotal_base = subtotal_0 + subtotal_iva (base gravada)
+    subtotal_base_calc = subtotal_0 + subtotal_iva
 
     datos = {
         "fuente":        "FISICO",
@@ -367,35 +314,35 @@ async def registrar_documento_fisico(
             INSERT INTO documentos_recibidos (
                 emisor_id, ruc_proveedor, razon_social_proveedor,
                 tipo_doc, cod_doc, clave_acceso, numero_doc, fecha_emision,
-                importe_total, impuestos_detalle,
+                subtotal_base, valor_iva_total, importe_total,
                 deducible_renta, credito_tributario_iva, notas,
-                estado_pago, datos, xml_path, fuente, procesado
+                estado_pago, datos, xml_path, fuente
             ) VALUES (
                 :eid, :ruc_prov, :razon_prov,
                 :tipo_doc, :cod_doc, :clave, :numero_doc, :fecha_emision,
-                :total, CAST(:impuestos AS jsonb),
+                :subtotal_base, :valor_iva_total, :total,
                 :ded_renta, :cred_iva, :notas,
-                'PENDIENTE', CAST(:datos AS jsonb), :xml_path, 'FISICO', false
+                'PENDIENTE', CAST(:datos AS jsonb), :xml_path, 'FISICO'
             ) RETURNING id
         """), {
-            "eid":         emisor_id,
-            "ruc_prov":    ruc_proveedor.strip().upper(),
-            "razon_prov":  razon_social_proveedor.strip().upper(),
-            "tipo_doc":    tipo_doc,
-            "cod_doc":     cod_doc,
-            "clave":       clave_sintetica,
-            "numero_doc":  numero_doc.strip(),
-            "fecha_emision": fecha_emision,
-            "total":       importe_total,
-            "impuestos":   json.dumps(impuestos_detalle, default=str),
-            "ded_renta":   deducible_renta,
-            "cred_iva":    credito_tributario_iva,
-            "notas":       notas,
-            "datos":       json.dumps(datos, default=str),
-            "xml_path":    imagen_path,
+            "eid":             emisor_id,
+            "ruc_prov":        ruc_proveedor.strip().upper(),
+            "razon_prov":      razon_social_proveedor.strip().upper(),
+            "tipo_doc":        tipo_doc,
+            "cod_doc":         cod_doc,
+            "clave":           clave_sintetica,
+            "numero_doc":      numero_doc.strip(),
+            "fecha_emision":   fecha_emision,
+            "subtotal_base":   subtotal_base_calc,
+            "valor_iva_total": valor_iva,
+            "total":           importe_total,
+            "ded_renta":       deducible_renta,
+            "cred_iva":        credito_tributario_iva,
+            "notas":           notas,
+            "datos":           json.dumps(datos, default=str),
+            "xml_path":        imagen_path,
         })
         doc_id = res.scalar()
-
         await audit_log(
             db         = db,
             auth_data  = auth_data,
@@ -412,7 +359,6 @@ async def registrar_documento_fisico(
             request    = request,
         )
         await db.commit()
-
     except HTTPException:
         raise
     except Exception as e:
@@ -420,6 +366,7 @@ async def registrar_documento_fisico(
         raise HTTPException(status_code=500, detail=f"Error al registrar: {str(e)}")
 
     return {"ok": True, "id": str(doc_id), "fuente": "FISICO", "mensaje": "Documento físico registrado correctamente."}
+
 
 # =============================================================================
 # POST /xml
@@ -455,12 +402,14 @@ async def registrar_desde_xml(
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
 
+    # Validar RUC comprador
     datos_raw     = parsed.get("datos", {})
     info          = datos_raw.get("infoFactura") or datos_raw.get("infoLiquidacionCompra") or {}
     ruc_comprador = info.get("identificacionComprador") or info.get("identificacionProveedor") or ""
     if ruc_comprador and ruc_comprador != emisor.ruc:
         raise HTTPException(status_code=400, detail=f"Este documento no está dirigido a tu RUC ({emisor.ruc}).")
 
+    # Verificar duplicado
     clave = parsed.get("clave_acceso", "")
     if clave:
         res_dup = await db.execute(text("""
@@ -469,6 +418,7 @@ async def registrar_desde_xml(
         if res_dup.fetchone():
             raise HTTPException(status_code=409, detail="Este documento ya fue registrado.")
 
+    # Subir XML crudo a R2 — fuente de verdad para auditoría
     xml_path = None
     try:
         xml_path = f"{emisor.ruc}/recibidas/{clave}.xml"
@@ -476,7 +426,7 @@ async def registrar_desde_xml(
     except Exception as e:
         print(f"⚠️ Error guardando XML en R2: {e}")
 
-    # Convertir fechas
+    # Parsear fechas
     fecha_emision_parsed = parsed["fecha_emision"]
     if isinstance(fecha_emision_parsed, str):
         fecha_emision_parsed = date.fromisoformat(fecha_emision_parsed[:10])
@@ -488,46 +438,48 @@ async def registrar_desde_xml(
         except Exception:
             fecha_auth_parsed = None
 
-    # Limpiar datos — solo lo necesario para declaraciones
-    datos_limpios = limpiar_datos_xml(datos_raw)
+    # Totales desde ítems parseados
+    items = parsed["items_detalle"]
+    subtotal_base, valor_iva_total = _calcular_totales_desde_items(items)
 
     try:
         res = await db.execute(text("""
             INSERT INTO documentos_recibidos (
                 emisor_id, ruc_proveedor, razon_social_proveedor,
                 tipo_doc, cod_doc, clave_acceso, numero_doc,
-                fecha_emision, fecha_autorizacion, importe_total,
-                items_detalle, impuestos_detalle,
+                fecha_emision, fecha_autorizacion,
+                subtotal_base, valor_iva_total, importe_total,
+                items_detalle,
                 deducible_renta, credito_tributario_iva,
-                datos, xml_path, fuente, procesado
+                xml_path, fuente
             ) VALUES (
                 :eid, :ruc_prov, :razon_prov,
                 :tipo_doc, :cod_doc, :clave, :numero_doc,
-                :fecha_emision, :fecha_auth, :total,
-                CAST(:items AS jsonb), CAST(:impuestos AS jsonb),
+                :fecha_emision, :fecha_auth,
+                :subtotal_base, :valor_iva_total, :total,
+                CAST(:items AS jsonb),
                 :ded_renta, :cred_iva,
-                CAST(:datos AS jsonb), :xml_path, 'XML', false
+                :xml_path, 'XML'
             ) RETURNING id
         """), {
-            "eid":           emisor_id,
-            "ruc_prov":      parsed["ruc_proveedor"],
-            "razon_prov":    parsed["razon_social_proveedor"],
-            "tipo_doc":      parsed["tipo_doc"],
-            "cod_doc":       parsed["cod_doc"],
-            "clave":         clave,
-            "numero_doc":    parsed["numero_doc"],
-            "fecha_emision": fecha_emision_parsed,
-            "fecha_auth":    fecha_auth_parsed,
-            "total":         parsed["importe_total"],
-            "items":         json.dumps(parsed["items_detalle"], default=str),
-            "impuestos":     json.dumps(parsed["impuestos_detalle"], default=str),
-            "ded_renta":     parsed["deducible_renta"],
-            "cred_iva":      parsed["credito_tributario_iva"],
-            "datos":         json.dumps(datos_limpios, default=str),
-            "xml_path":      xml_path,
+            "eid":             emisor_id,
+            "ruc_prov":        parsed["ruc_proveedor"],
+            "razon_prov":      parsed["razon_social_proveedor"],
+            "tipo_doc":        parsed["tipo_doc"],
+            "cod_doc":         parsed["cod_doc"],
+            "clave":           clave,
+            "numero_doc":      parsed["numero_doc"],
+            "fecha_emision":   fecha_emision_parsed,
+            "fecha_auth":      fecha_auth_parsed,
+            "subtotal_base":   subtotal_base,
+            "valor_iva_total": valor_iva_total,
+            "total":           parsed["importe_total"],
+            "items":           json.dumps(items, default=str),
+            "ded_renta":       parsed["deducible_renta"],
+            "cred_iva":        parsed["credito_tributario_iva"],
+            "xml_path":        xml_path,
         })
         doc_id = res.scalar()
-
         await audit_log(
             db         = db,
             auth_data  = auth_data,
@@ -544,7 +496,6 @@ async def registrar_desde_xml(
             request    = request,
         )
         await db.commit()
-
     except HTTPException:
         raise
     except Exception as e:
@@ -559,7 +510,7 @@ async def registrar_desde_xml(
         "numero":    parsed["numero_doc"],
         "proveedor": parsed["razon_social_proveedor"],
         "total":     parsed["importe_total"],
-        "items":     len(parsed["items_detalle"]),
+        "items":     len(items),
         "errores":   parsed["errores"],
         "mensaje":   "Documento registrado correctamente.",
     }
@@ -582,32 +533,32 @@ async def historial_recibidos(
     verificar_permiso(auth_data, "documentos")
 
     hoy = date.today()
-    fi  = date.fromisoformat(fecha_inicio) if fecha_inicio else hoy - timedelta(days=45)
+    fi  = date.fromisoformat(fecha_inicio) if fecha_inicio else hoy
     ff  = date.fromisoformat(fecha_fin)    if fecha_fin    else hoy
+
     if (ff - fi).days > 45:
         raise HTTPException(status_code=400, detail="El rango máximo es 45 días.")
 
     filtros = "WHERE emisor_id = :eid AND fecha_emision BETWEEN :fi AND :ff"
     params  = {"eid": emisor_id, "fi": fi, "ff": ff}
+
     if tipo_doc:
         filtros += " AND tipo_doc = :tipo_doc"
         params["tipo_doc"] = tipo_doc.upper()
     if estado_pago:
         filtros += " AND estado_pago = :estado_pago"
         params["estado_pago"] = estado_pago.upper()
+
     params["limit"]  = limit
     params["offset"] = offset
 
     res = await db.execute(text(f"""
         SELECT
-            id, ruc_proveedor, razon_social_proveedor,
-            tipo_doc, cod_doc, numero_doc,
-            fecha_emision, fecha_autorizacion,
-            importe_total, impuestos_detalle, items_detalle,
+            id, razon_social_proveedor, tipo_doc,
+            numero_doc, fecha_emision,
+            subtotal_base, valor_iva_total, importe_total,
             deducible_renta, credito_tributario_iva,
-            estado_pago, forma_pago,
-            numero_comprobante_pago, fecha_pago,
-            notas, fuente, created_at
+            estado_pago, notas, fuente
         FROM documentos_recibidos
         {filtros}
         ORDER BY fecha_emision DESC, created_at DESC
@@ -624,76 +575,12 @@ async def historial_recibidos(
 
     res_resumen = await db.execute(text(f"""
         SELECT
-            COUNT(*) AS total,
-            COALESCE(SUM(importe_total), 0) AS importe_total,
-
-            -- Deducible: suma subtotales de ítems con deducible_renta=true
-            -- Si no hay items_detalle, fallback al flag global × importe_total
-            COALESCE((
-                SELECT SUM((item->>'subtotal')::numeric)
-                FROM documentos_recibidos dr2,
-                     jsonb_array_elements(dr2.items_detalle) AS item
-                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
-                AND (item->>'deducible_renta')::boolean = true
-            ), 0)
-            +
-            COALESCE((
-                SELECT SUM(dr2.importe_total)
-                FROM documentos_recibidos dr2
-                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) = 0
-                AND dr2.deducible_renta = true
-            ), 0) AS total_deducible,
-
-            -- CT IVA: suma valor_iva de ítems con credito_tributario_iva=true
-            -- Si no hay items_detalle, fallback a impuestos_detalle con aplicaCredito=true
-            COALESCE((
-                SELECT SUM((item->>'valor_iva')::numeric)
-                FROM documentos_recibidos dr2,
-                     jsonb_array_elements(dr2.items_detalle) AS item
-                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
-                AND (item->>'credito_tributario_iva')::boolean = true
-            ), 0)
-            +
-            COALESCE((
-                SELECT SUM((imp->>'valor')::numeric)
-                FROM documentos_recibidos dr2,
-                     jsonb_array_elements(dr2.impuestos_detalle) AS imp
-                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) = 0
-                AND (imp->>'aplicaCredito')::boolean = true
-            ), 0) AS iva_credito_tributario,
-
-            -- Desglose IVA: desde items_detalle agrupado por tarifa
-            COALESCE((
-                SELECT json_agg(json_build_object(
-                    'tarifa',      tarifa,
-                    'subtotal',    subtotal,
-                    'iva',         iva,
-                    'con_credito', con_credito
-                ) ORDER BY tarifa::numeric)
-                FROM (
-                    SELECT
-                        (item->>'tarifa_iva')                              AS tarifa,
-                        SUM((item->>'subtotal')::numeric)                  AS subtotal,
-                        SUM((item->>'valor_iva')::numeric)                 AS iva,
-                        SUM(CASE
-                            WHEN (item->>'credito_tributario_iva')::boolean = true
-                            THEN (item->>'valor_iva')::numeric ELSE 0
-                        END)                                               AS con_credito
-                    FROM documentos_recibidos dr2,
-                         jsonb_array_elements(dr2.items_detalle) AS item
-                    WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                    AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
-                    GROUP BY (item->>'tarifa_iva')
-                ) t
-            ), '[]'::json) AS desglose_iva
-
+            COUNT(*)                                                                           AS total,
+            COALESCE(SUM(importe_total), 0)                                                    AS importe_total,
+            COALESCE(SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END), 0) AS total_deducible,
+            COALESCE(SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END), 0) AS iva_credito_tributario
         FROM documentos_recibidos {filtros_resumen}
     """), params_resumen)
-    
     resumen_row = res_resumen.fetchone()
 
     return {
@@ -703,33 +590,28 @@ async def historial_recibidos(
             "importe_total":          float(resumen_row.importe_total or 0),
             "total_deducible":        float(resumen_row.total_deducible or 0),
             "iva_credito_tributario": float(resumen_row.iva_credito_tributario or 0),
-            "desglose_iva":           resumen_row.desglose_iva or [],
         },
         "data": [
             {
-                "id":                      str(r.id),
-                "ruc_proveedor":           r.ruc_proveedor,
-                "razon_social_proveedor":  r.razon_social_proveedor,
-                "tipo_doc":                r.tipo_doc,
-                "numero_doc":              r.numero_doc,
-                "fecha_emision":           str(r.fecha_emision),
-                "importe_total":           float(r.importe_total),
-                "impuestos_detalle":       r.impuestos_detalle or [],
-                "items_detalle":           r.items_detalle or [],
-                "deducible_renta":         r.deducible_renta,
-                "credito_tributario_iva":  r.credito_tributario_iva,
-                "estado_pago":             r.estado_pago,
-                "forma_pago":              r.forma_pago,
-                "numero_comprobante_pago": r.numero_comprobante_pago,
-                "fecha_pago":              str(r.fecha_pago) if r.fecha_pago else None,
-                "notas":                   r.notas,
-                "fuente":                  r.fuente,
-                "created_at":              str(r.created_at),
+                "id":                     str(r.id),
+                "razon_social_proveedor": r.razon_social_proveedor,
+                "tipo_doc":               r.tipo_doc,
+                "numero_doc":             r.numero_doc,
+                "fecha_emision":          str(r.fecha_emision),
+                "subtotal_base":          float(r.subtotal_base),
+                "valor_iva_total":        float(r.valor_iva_total),
+                "importe_total":          float(r.importe_total),
+                "deducible_renta":        r.deducible_renta,
+                "credito_tributario_iva": r.credito_tributario_iva,
+                "estado_pago":            r.estado_pago,
+                "notas":                  r.notas,
+                "fuente":                 r.fuente,
             }
             for r in rows
         ],
         "periodo": {"desde": str(fi), "hasta": str(ff)},
     }
+
 
 # =============================================================================
 # GET /{id} — Detalle
@@ -752,7 +634,8 @@ async def detalle_recibido(
                 )
                 FROM documentos_emitidos de
                 WHERE de.doc_origen_recibido_id = d.id
-                AND de.tipo_doc = 'RET' AND d.tipo_doc IN ('FAC', 'LIQ')
+                  AND de.tipo_doc = 'RET'
+                  AND d.tipo_doc IN ('FAC', 'LIQ')
                 LIMIT 1
             ) AS retencion_emitida
         FROM documentos_recibidos d
@@ -774,8 +657,9 @@ async def detalle_recibido(
             "numero_doc":              doc.numero_doc,
             "fecha_emision":           str(doc.fecha_emision),
             "fecha_autorizacion":      str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
+            "subtotal_base":           float(doc.subtotal_base),
+            "valor_iva_total":         float(doc.valor_iva_total),
             "importe_total":           float(doc.importe_total),
-            "impuestos_detalle":       doc.impuestos_detalle or [],
             "items_detalle":           doc.items_detalle or [],
             "deducible_renta":         doc.deducible_renta,
             "credito_tributario_iva":  doc.credito_tributario_iva,
@@ -791,6 +675,7 @@ async def detalle_recibido(
             "retencion_emitida":       doc.retencion_emitida,
         }
     }
+
 
 # =============================================================================
 # PATCH /{id}
@@ -827,24 +712,25 @@ async def actualizar_recibido(
         campos.append("notas = :notas")
         params["notas"] = data.notas
 
-    if data.impuestos_detalle is not None:
-        campos.append("impuestos_detalle = CAST(:impuestos AS jsonb)")
-        params["impuestos"] = json.dumps([i.model_dump() for i in data.impuestos_detalle], default=str)
-
     if data.items_detalle is not None:
         campos.append("items_detalle = CAST(:items AS jsonb)")
         params["items"] = json.dumps(data.items_detalle, default=str)
-        # Solo agregar si no vienen explícitamente en el request
+        # Recalcular totales desnormalizados desde los ítems actualizados
+        subtotal_base, valor_iva_total = _calcular_totales_desde_items(data.items_detalle)
+        campos.append("subtotal_base = :subtotal_base")
+        campos.append("valor_iva_total = :valor_iva_total")
+        params["subtotal_base"]   = subtotal_base
+        params["valor_iva_total"] = valor_iva_total
+        # Flags globales desde ítems si no vienen explícitos
         if data.deducible_renta is None:
-            params["ded_renta_calc"] = any(i.get("deducible_renta", False) for i in data.items_detalle)
-            campos.append("deducible_renta = :ded_renta_calc")
+            params["ded_renta"] = any(i.get("deducible_renta", False) for i in data.items_detalle)
+            campos.append("deducible_renta = :ded_renta")
         if data.credito_tributario_iva is None:
-            params["cred_iva_calc"] = any(i.get("credito_tributario_iva", False) for i in data.items_detalle)
-            campos.append("credito_tributario_iva = :cred_iva_calc")
+            params["cred_iva"] = any(i.get("credito_tributario_iva", False) for i in data.items_detalle)
+            campos.append("credito_tributario_iva = :cred_iva")
 
     if data.estado_pago is not None:
-        estados_validos = ("PENDIENTE", "PAGADO", "PARCIAL", "ANULADO")
-        if data.estado_pago not in estados_validos:
+        if data.estado_pago not in ("PENDIENTE", "PAGADO", "PARCIAL", "ANULADO"):
             raise HTTPException(status_code=400, detail="estado_pago inválido.")
         campos.append("estado_pago = :estado_pago")
         params["estado_pago"] = data.estado_pago
@@ -879,7 +765,6 @@ async def actualizar_recibido(
             UPDATE documentos_recibidos SET {', '.join(campos)}
             WHERE id = :did AND emisor_id = :eid
         """), params)
-
         await audit_log(
             db         = db,
             auth_data  = auth_data,
@@ -890,7 +775,6 @@ async def actualizar_recibido(
             request    = request,
         )
         await db.commit()
-
     except HTTPException:
         raise
     except Exception as e:

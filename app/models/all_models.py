@@ -457,11 +457,9 @@ class DocumentoEmitido(Base):
 class DocumentoRecibido(Base):
     """
     Comprobantes recibidos de proveedores.
-
     tipo_doc: FAC | LIQ | NCR | NDB | RET
     estado_pago: PENDIENTE | PAGADO | PARCIAL | ANULADO
     fuente: MANUAL | XML | API
-
     Vínculos:
     - doc_origen_recibido_id: NCR/NDB recibida → FAC/LIQ recibida que modifica
     - doc_origen_emitido_id:  RET recibida → FAC/LIQ que nosotros emitimos
@@ -471,43 +469,44 @@ class DocumentoRecibido(Base):
     id                      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     emisor_id               = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
 
-    # Proveedor desnormalizado
+    # ── Proveedor desnormalizado ───────────────────────────────────────────────
     ruc_proveedor           = Column(String(13), nullable=False)
-    razon_social_proveedor  = Column(Text, nullable=False)
+    razon_social_proveedor  = Column(Text,       nullable=False)
 
-    # Tipo e identificación
-    tipo_doc                = Column(String(5), nullable=False)  # FAC | LIQ | NCR | NDB | RET
-    cod_doc                 = Column(String(2), nullable=False)
+    # ── Identificación del comprobante ────────────────────────────────────────
+    tipo_doc                = Column(String(5),  nullable=False)   # FAC | LIQ | NCR | NDB | RET
+    cod_doc                 = Column(String(2),  nullable=False)   # 01 | 03 | 04 | 05 | 07
     clave_acceso            = Column(String(49), unique=True)
     numero_doc              = Column(String(17))
-    fecha_emision           = Column(Date, nullable=False)
-    fecha_autorizacion      = Column(TIMESTAMP(timezone=True))
+    fecha_emision           = Column(Date,                nullable=False)
+    fecha_autorizacion      = Column(TIMESTAMP(timezone=True))     # Fecha de autorización SRI
 
-    # Total desnormalizado
-    importe_total           = Column(Numeric(12, 2), nullable=False)
+    # ── Totales desnormalizados ────────────────────────────────────────────────
+    # Guardamos los tres para evitar tocar JSONB en queries de resumen
+    subtotal_base           = Column(Numeric(12, 2), nullable=False, default=0)  # Base sin IVA
+    valor_iva_total         = Column(Numeric(12, 2), nullable=False, default=0)  # IVA total
+    importe_total           = Column(Numeric(12, 2), nullable=False)             # Total con IVA
 
-    # ── Vínculos con otros documentos ─────────────────────────────────────────
+    # ── Vínculos entre documentos ─────────────────────────────────────────────
     # NCR/NDB recibida → FAC/LIQ recibida que modifica
     doc_origen_recibido_id  = Column(
         UUID(as_uuid=True),
         ForeignKey("documentos_recibidos.id", ondelete="SET NULL"),
-        nullable=True
+        nullable=True,
     )
     # RET recibida → FAC/LIQ que nosotros emitimos (nos retuvieron)
     doc_origen_emitido_id   = Column(
         UUID(as_uuid=True),
         ForeignKey("documentos_emitidos.id", ondelete="SET NULL"),
-        nullable=True
+        nullable=True,
     )
 
-    # ── Clasificación fiscal global ───────────────────────────────────────────
-    deducible_renta         = Column(Boolean, default=True)
-    credito_tributario_iva  = Column(Boolean, default=False)
-    notas                   = Column(Text)
-
-    # ── Impuestos por tarifa (para resumen de declaración) ────────────────────
-    # [{"tarifa":"15","baseImponible":80.59,"valor":12.09,"aplicaCredito":true}]
-    impuestos_detalle       = Column(JSONB)
+    # ── Clasificación fiscal ──────────────────────────────────────────────────
+    # Flags globales — índice rápido para filtros y resumen del listado
+    # El detalle exacto por línea está en items_detalle
+    deducible_renta         = Column(Boolean, nullable=False, default=True)
+    credito_tributario_iva  = Column(Boolean, nullable=False, default=False)
+    notas                   = Column(String(128))                  # Máx 128 chars
 
     # ── Ítems con clasificación fiscal por línea ──────────────────────────────
     # [{"descripcion":"...","cantidad":1,"precio_unitario":100,"subtotal":100,
@@ -521,41 +520,35 @@ class DocumentoRecibido(Base):
     numero_comprobante_pago = Column(String(100), nullable=True)
     fecha_pago              = Column(Date, nullable=True)
 
-    # ── Datos completos del comprobante ───────────────────────────────────────
-    datos                   = Column(JSONB)
-    xml_path                = Column(Text)
+    # ── Almacenamiento ────────────────────────────────────────────────────────
+    datos                   = Column(JSONB)   # Datos completos del XML limpio
+    xml_path                = Column(Text)    # Path en R2
 
-    fuente                  = Column(String(10), default="MANUAL")  # MANUAL | XML | API
-    procesado               = Column(Boolean, default=False)
-
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    fuente                  = Column(String(10), nullable=False, default="MANUAL")  # MANUAL | XML | API
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at              = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
     # ── Relaciones ────────────────────────────────────────────────────────────
     emisor                  = relationship("Emisor", back_populates="documentos_recibidos")
 
-    # Doc recibido origen (self-referential: NCR/NDB → FAC recibida)
     doc_origen_recibido     = relationship(
                                 "DocumentoRecibido",
                                 foreign_keys=[doc_origen_recibido_id],
                                 remote_side="DocumentoRecibido.id",
-                                backref="documentos_derivados_recibidos"
+                                backref="documentos_derivados_recibidos",
                               )
-
-    # Doc emitido origen (RET recibida → FAC/LIQ emitida)
     doc_origen_emitido      = relationship(
                                 "DocumentoEmitido",
                                 foreign_keys=[doc_origen_emitido_id],
-                                backref="retenciones_recibidas"
+                                backref="retenciones_recibidas",
                               )
-
-    # RET que nosotros emitimos sobre este doc recibido
     retencion_emitida       = relationship(
                                 "DocumentoEmitido",
                                 back_populates="doc_origen_recibido",
-                                foreign_keys="DocumentoEmitido.doc_origen_recibido_id"
+                                foreign_keys="DocumentoEmitido.doc_origen_recibido_id",
                               )
-
+    
 # =============================================================================
 # DECLARACIONES SRI
 # =============================================================================
