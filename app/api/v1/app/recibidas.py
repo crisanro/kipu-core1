@@ -626,33 +626,74 @@ async def historial_recibidos(
         SELECT
             COUNT(*) AS total,
             COALESCE(SUM(importe_total), 0) AS importe_total,
-            COALESCE(SUM(CASE WHEN deducible_renta THEN importe_total ELSE 0 END), 0) AS total_deducible,
+
+            -- Deducible: suma subtotales de ítems con deducible_renta=true
+            -- Si no hay items_detalle, fallback al flag global × importe_total
+            COALESCE((
+                SELECT SUM((item->>'subtotal')::numeric)
+                FROM documentos_recibidos dr2,
+                     jsonb_array_elements(dr2.items_detalle) AS item
+                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
+                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
+                AND (item->>'deducible_renta')::boolean = true
+            ), 0)
+            +
+            COALESCE((
+                SELECT SUM(dr2.importe_total)
+                FROM documentos_recibidos dr2
+                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
+                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) = 0
+                AND dr2.deducible_renta = true
+            ), 0) AS total_deducible,
+
+            -- CT IVA: suma valor_iva de ítems con credito_tributario_iva=true
+            -- Si no hay items_detalle, fallback a impuestos_detalle con aplicaCredito=true
+            COALESCE((
+                SELECT SUM((item->>'valor_iva')::numeric)
+                FROM documentos_recibidos dr2,
+                     jsonb_array_elements(dr2.items_detalle) AS item
+                WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
+                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
+                AND (item->>'credito_tributario_iva')::boolean = true
+            ), 0)
+            +
             COALESCE((
                 SELECT SUM((imp->>'valor')::numeric)
                 FROM documentos_recibidos dr2,
                      jsonb_array_elements(dr2.impuestos_detalle) AS imp
                 WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
+                AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) = 0
                 AND (imp->>'aplicaCredito')::boolean = true
             ), 0) AS iva_credito_tributario,
+
+            -- Desglose IVA: desde items_detalle agrupado por tarifa
             COALESCE((
                 SELECT json_agg(json_build_object(
-                    'tarifa', tarifa, 'subtotal', subtotal, 'iva', iva, 'con_credito', con_credito
+                    'tarifa',      tarifa,
+                    'subtotal',    subtotal,
+                    'iva',         iva,
+                    'con_credito', con_credito
                 ) ORDER BY tarifa::numeric)
                 FROM (
                     SELECT
-                        (imp->>'tarifa') AS tarifa,
-                        SUM((imp->>'baseImponible')::numeric) AS subtotal,
-                        SUM((imp->>'valor')::numeric) AS iva,
-                        SUM(CASE WHEN (imp->>'aplicaCredito')::boolean = true
-                            THEN (imp->>'valor')::numeric ELSE 0 END) AS con_credito
+                        (item->>'tarifa_iva')                              AS tarifa,
+                        SUM((item->>'subtotal')::numeric)                  AS subtotal,
+                        SUM((item->>'valor_iva')::numeric)                 AS iva,
+                        SUM(CASE
+                            WHEN (item->>'credito_tributario_iva')::boolean = true
+                            THEN (item->>'valor_iva')::numeric ELSE 0
+                        END)                                               AS con_credito
                     FROM documentos_recibidos dr2,
-                         jsonb_array_elements(dr2.impuestos_detalle) AS imp
+                         jsonb_array_elements(dr2.items_detalle) AS item
                     WHERE dr2.emisor_id = :eid AND dr2.fecha_emision BETWEEN :fi AND :ff
-                    GROUP BY (imp->>'tarifa')
+                    AND jsonb_array_length(COALESCE(dr2.items_detalle, '[]'::jsonb)) > 0
+                    GROUP BY (item->>'tarifa_iva')
                 ) t
             ), '[]'::json) AS desglose_iva
+
         FROM documentos_recibidos {filtros_resumen}
     """), params_resumen)
+    
     resumen_row = res_resumen.fetchone()
 
     return {
