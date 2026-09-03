@@ -670,9 +670,6 @@ class AuditLog(Base):
 
 
 
-# =============================================================================
-# REPORTES TRIBUTARIOS
-# =============================================================================
 class ReporteTributario(Base):
     """
     Reportes fiscales generados — IVA (104) | Renta (102) | ATS.
@@ -686,6 +683,10 @@ class ReporteTributario(Base):
     Trazabilidad para auditoría SRI:
     - doc_emitidos_ids:   UUIDs de todos los documentos emitidos incluidos
     - doc_recibidos_ids:  UUIDs de todos los documentos recibidos incluidos
+
+    campos_manuales_valores: valores ingresados por el usuario para casilleros
+    que no se pueden calcular automáticamente (605, 606, 402, etc.).
+    Columna separada del resumen calculado — sobrevive regeneraciones.
     """
     __tablename__ = "reportes_tributarios"
     __table_args__ = (
@@ -703,15 +704,19 @@ class ReporteTributario(Base):
     tipo_periodo    = Column(String(10), nullable=False)   # MENSUAL | SEMESTRAL | ANUAL
     periodo         = Column(Date, nullable=False)          # 2026-08-01
 
-    # Datos calculados
+    # Datos calculados por el backend — se sobreescriben al regenerar
     casilleros      = Column(JSONB, nullable=False, server_default='{}')
     preguntas       = Column(JSONB, nullable=False, server_default='{}')
     desglose        = Column(JSONB, nullable=False, server_default='{}')
     resumen         = Column(JSONB, nullable=False, server_default='{}')
 
+    # Ingresado por el usuario — sobrevive regeneraciones
+    campos_manuales_valores = Column(JSONB, nullable=False, server_default='{}')
+    # Ejemplo: {"605": 150.00, "606": 0.00, "402": 500.00}
+
     # Trazabilidad — auditoría SRI
-    doc_emitidos_ids    = Column(JSONB, nullable=False, server_default='[]')  # lista de UUIDs
-    doc_recibidos_ids   = Column(JSONB, nullable=False, server_default='[]')  # lista de UUIDs
+    doc_emitidos_ids    = Column(JSONB, nullable=False, server_default='[]')
+    doc_recibidos_ids   = Column(JSONB, nullable=False, server_default='[]')
     total_doc_emitidos  = Column(Integer, nullable=False, default=0)
     total_doc_recibidos = Column(Integer, nullable=False, default=0)
 

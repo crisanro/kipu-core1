@@ -7,7 +7,7 @@
 # La declaración real la hace el usuario en el SRI en Línea.
 import json
 from datetime import date, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
@@ -415,11 +415,11 @@ async def marcar_declarado(
 # =============================================================================
 @router.get("/iva", summary="Casilleros formulario 104 — Declaración IVA mensual")
 async def casilleros_iva(
-    periodo:        str          = Query(..., description="Período YYYY-MM, ej: 2026-08"),
-    tipo_periodo:   str          = Query("MENSUAL", description="MENSUAL | SEMESTRAL"),
-    regenerar:      bool         = Query(False, description="Forzar recálculo aunque esté guardado"),
-    auth_data:      dict         = Depends(verify_firebase_token),
-    db:             AsyncSession = Depends(get_db),
+    periodo:             str          = Query(..., description="Período YYYY-MM, ej: 2026-08"),
+    tipo_periodo:        str          = Query("MENSUAL", description="MENSUAL | SEMESTRAL"),
+    regenerar:           bool         = Query(False, description="Forzar recálculo aunque esté guardado"),
+    auth_data:           dict         = Depends(verify_firebase_token),
+    db:                  AsyncSession = Depends(get_db),
 ):
     emisor_id  = auth_data.get("emisor_id")
     profile_id = auth_data.get("profile_id")
@@ -462,6 +462,7 @@ async def casilleros_iva(
     if not es_mes_actual and not regenerar:
         res_cached = await db.execute(text("""
             SELECT id, casilleros, preguntas, desglose, resumen,
+                   campos_manuales_valores,
                    total_doc_emitidos, total_doc_recibidos,
                    generado_at, regenerado_at
             FROM reportes_tributarios
@@ -472,10 +473,11 @@ async def casilleros_iva(
         cached = res_cached.fetchone()
         if cached:
             return {
-                "ok":          True,
-                "cached":      True,
+                "ok":            True,
+                "cached":        True,
                 "generado_at":   str(cached.generado_at),
                 "regenerado_at": str(cached.regenerado_at) if cached.regenerado_at else None,
+                "campos_manuales_valores": cached.campos_manuales_valores or {},
                 "total_doc_emitidos":  cached.total_doc_emitidos,
                 "total_doc_recibidos": cached.total_doc_recibidos,
                 "data": {
@@ -500,7 +502,7 @@ async def casilleros_iva(
     res_ventas = await db.execute(text("""
         SELECT
             d.id,
-            (imp->>'tarifa')::numeric                 AS tarifa,
+            (imp->>'tarifa')::numeric                    AS tarifa,
             SUM((imp->>'baseImponible')::numeric)     AS subtotal,
             SUM((imp->>'valor')::numeric)             AS iva,
             COUNT(DISTINCT d.id)                      AS num_docs
@@ -536,7 +538,7 @@ async def casilleros_iva(
     res_ncr_e = await db.execute(text("""
         SELECT
             d.id,
-            (imp->>'tarifa')::numeric             AS tarifa,
+            (imp->>'tarifa')::numeric              AS tarifa,
             SUM((imp->>'baseImponible')::numeric) AS subtotal,
             SUM((imp->>'valor')::numeric)         AS iva
         FROM documentos_emitidos d,
@@ -579,7 +581,7 @@ async def casilleros_iva(
     res_compras = await db.execute(text("""
         SELECT
             d.id,
-            (item->>'tarifa_iva')::numeric                 AS tarifa,
+            (item->>'tarifa_iva')::numeric                     AS tarifa,
             (item->>'credito_tributario_iva')::boolean     AS aplica_credito,
             SUM((item->>'subtotal')::numeric)              AS subtotal,
             SUM((item->>'valor_iva')::numeric)             AS iva
@@ -590,7 +592,7 @@ async def casilleros_iva(
           AND d.tipo_doc      IN ('FAC', 'LIQ')
           AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
         GROUP BY d.id, (item->>'tarifa_iva')::numeric,
-                 (item->>'credito_tributario_iva')::boolean
+                       (item->>'credito_tributario_iva')::boolean
         ORDER BY tarifa, aplica_credito
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
     cc = {}
@@ -698,7 +700,7 @@ async def casilleros_iva(
     res_cnt_r = await db.execute(text("""
         SELECT
             COUNT(*) FILTER (WHERE tipo_doc IN ('FAC','NCR','NDB','RET')) AS recibidos,
-            COUNT(*) FILTER (WHERE tipo_doc = 'LIQ')                      AS liq
+            COUNT(*) FILTER (WHERE tipo_doc = 'LIQ')                     AS liq
         FROM documentos_recibidos
         WHERE emisor_id     = :eid
           AND fecha_emision BETWEEN :fi AND :ff
@@ -775,47 +777,47 @@ async def casilleros_iva(
     c499 = c429
     c564 = c520
     dif  = round(c499 - c564, 2)
-    c601 = round(dif,       2) if dif > 0 else 0.0
-    c602 = round(abs(dif),  2) if dif < 0 else 0.0
+    c601 = round(dif,        2) if dif > 0 else 0.0
+    c602 = round(abs(dif),   2) if dif < 0 else 0.0
     c620 = round(max(c601 - c609, 0), 2)
     c699 = c620
     c859 = round(c699 + c801, 2)
 
     preguntas = {
-        "requiere_informar":        c409 > 0 or c509 > 0,
+        "requiere_informar":         c409 > 0 or c509 > 0,
         "credito_tributario_renta": c520 > 0,
-        "comercio_exterior":        False,
-        "notas_credito":            ncr_e_nz_sub > 0 or ncr_r_nz_sub > 0,
-        "tarifa_turismo":           any(t == 8.0 for t in ventas_por_tarifa),
-        "ha_realizado_ventas":      c409 > 0,
-        "ventas_tarifa_0":          c403 > 0,
-        "ventas_activos_fijos":     False,
-        "ventas_tarifa_nz":         c401 > 0,
-        "ha_realizado_compras":     c509 > 0,
-        "importaciones":            False,
-        "compras_activos_fijos":    False,
+        "comercio_exterior":         False,
+        "notas_credito":             ncr_e_nz_sub > 0 or ncr_r_nz_sub > 0,
+        "tarifa_turismo":            any(t == 8.0 for t in ventas_por_tarifa),
+        "ha_realizado_ventas":       c409 > 0,
+        "ventas_tarifa_0":           c403 > 0,
+        "ventas_activos_fijos":      False,
+        "ventas_tarifa_nz":          c401 > 0,
+        "ha_realizado_compras":      c509 > 0,
+        "importaciones":             False,
+        "compras_activos_fijos":     False,
         "ha_realizado_retenciones": c799 > 0 or c609 > 0,
-        "materiales_construccion":  any(t == 5.0 for t in ventas_por_tarifa),
+        "materiales_construccion":   any(t == 5.0 for t in ventas_por_tarifa),
     }
 
     # Armar estructuras para guardar
     casilleros_completos = {
-        "ventas":   {"401": c401, "411": c411, "421": c421, "403": c403,
-                     "413": c413, "409": c409, "419": c419, "429": c429,
-                     "111": int(cnt_e.emitidos or 0), "113": int(cnt_e.anulados or 0)},
+        "ventas":    {"401": c401, "411": c411, "421": c421, "403": c403,
+                      "413": c413, "409": c409, "419": c419, "429": c429,
+                      "111": int(cnt_e.emitidos or 0), "113": int(cnt_e.anulados or 0)},
         "compras":  {"500": c500, "510": c510, "520": c520, "502": c502,
-                     "512": c512, "522": c522, "507": c507, "517": c517,
-                     "509": c509, "519": c519, "529": c529,
-                     "115": int(cnt_r.recibidos or 0), "119": int(cnt_r.liq or 0)},
+                      "512": c512, "522": c522, "507": c507, "517": c517,
+                      "509": c509, "519": c519, "529": c529,
+                      "115": int(cnt_r.recibidos or 0), "119": int(cnt_r.liq or 0)},
         "ret_emit": {**{str(k): v for k, v in cas_ret.items()}, "799": c799, "801": c801},
         "ret_recib": {"609": c609},
         "resumen":  {"499": c499, "564": c564, "601": c601, "602": c602,
-                     "609": c609, "620": c620, "699": c699, "799": c799,
-                     "801": c801, "859": c859},
+                      "609": c609, "620": c620, "699": c699, "799": c799,
+                      "801": c801, "859": c859},
     }
     desglose_completo = {
-        "ventas":                {"desglose": ventas_desglose,  "casilleros": casilleros_completos["ventas"]},
-        "compras":               {"desglose": compras_desglose, "casilleros": casilleros_completos["compras"]},
+        "ventas":                    {"desglose": ventas_desglose,  "casilleros": casilleros_completos["ventas"]},
+        "compras":                   {"desglose": compras_desglose, "casilleros": casilleros_completos["compras"]},
         "retenciones_emitidas": {"desglose": ret_e_desglose,  "casilleros": casilleros_completos["ret_emit"]},
         "retenciones_recibidas":{"casilleros": casilleros_completos["ret_recib"]},
     }
@@ -838,10 +840,10 @@ async def casilleros_iva(
                     UPDATE reportes_tributarios SET
                         casilleros          = CAST(:casilleros AS jsonb),
                         preguntas           = CAST(:preguntas  AS jsonb),
-                        desglose            = CAST(:desglose   AS jsonb),
-                        resumen             = CAST(:resumen    AS jsonb),
-                        doc_emitidos_ids    = CAST(:doc_e      AS jsonb),
-                        doc_recibidos_ids   = CAST(:doc_r      AS jsonb),
+                        desglose            = CAST(:desglose    AS jsonb),
+                        resumen             = CAST(:resumen     AS jsonb),
+                        doc_emitidos_ids    = CAST(:doc_e       AS jsonb),
+                        doc_recibidos_ids   = CAST(:doc_r       AS jsonb),
                         total_doc_emitidos  = :total_e,
                         total_doc_recibidos = :total_r,
                         regenerado_at       = NOW(),
@@ -871,7 +873,7 @@ async def casilleros_iva(
                     ) VALUES (
                         :eid, 'IVA', :tipo_periodo, :periodo,
                         CAST(:casilleros AS jsonb), CAST(:preguntas AS jsonb),
-                        CAST(:desglose AS jsonb),   CAST(:resumen AS jsonb),
+                        CAST(:desglose AS jsonb),    CAST(:resumen AS jsonb),
                         CAST(:doc_e AS jsonb), CAST(:doc_r AS jsonb),
                         :total_e, :total_r, :pid
                     )
@@ -906,6 +908,7 @@ async def casilleros_iva(
             "preguntas": preguntas,
             **desglose_completo,
             "resumen":   resumen_completo,
+            "campos_manuales_valores": await _leer_campos_manuales(emisor_id, periodo_db, db),
             "notas": [
                 "Los casilleros 605/606 (saldo mes anterior) deben ingresarse manualmente.",
                 "Activos fijos e importaciones requieren clasificación manual.",
@@ -913,6 +916,89 @@ async def casilleros_iva(
             ] + (["⚠️ Período en curso — los valores pueden cambiar."] if es_mes_actual else []),
         }
     }
+
+
+async def _leer_campos_manuales(emisor_id: int, periodo_db: date, db: AsyncSession) -> dict:
+    """Lee los campos manuales guardados para un período, si existen."""
+    try:
+        res = await db.execute(text("""
+            SELECT campos_manuales_valores
+            FROM reportes_tributarios
+            WHERE emisor_id = :eid AND tipo = 'IVA' AND periodo = :periodo
+        """), {"eid": emisor_id, "periodo": periodo_db})
+        row = res.fetchone()
+        return row.campos_manuales_valores or {} if row else {}
+    except Exception:
+        return {}
+
+# =============================================================================
+# PATCH /iva/campos-manuales — Guardar valores manuales del formulario 104
+# =============================================================================
+@router.patch("/iva/campos-manuales", summary="Guardar casilleros manuales del formulario 104")
+async def guardar_campos_manuales_iva(
+    periodo:   str          = Query(..., description="Período YYYY-MM, ej: 2026-08"),
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+    body:      dict         = Body(..., example={"605": 150.00, "606": 0.00}),
+):
+    emisor_id  = auth_data.get("emisor_id")
+    profile_id = auth_data.get("profile_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "declaraciones")
+
+    try:
+        año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
+        if not (1 <= mes <= 12):
+            raise ValueError()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Formato inválido. Use YYYY-MM.")
+
+    # Validar que solo vengan casilleros permitidos y valores numéricos
+    CASILLEROS_PERMITIDOS = {"605", "606", "402", "501", "504"}
+    valores_limpios = {}
+    for cas, val in body.items():
+        if cas not in CASILLEROS_PERMITIDOS:
+            raise HTTPException(status_code=400, detail=f"Casillero {cas} no permitido.")
+        try:
+            valores_limpios[cas] = round(float(val), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Valor inválido para casillero {cas}.")
+
+    periodo_db = date(año, mes, 1)
+
+    # Upsert — si no existe el reporte todavía, lo crea vacío con los campos manuales
+    await db.execute(text("""
+        INSERT INTO reportes_tributarios (
+            emisor_id, tipo, tipo_periodo, periodo,
+            casilleros, preguntas, desglose, resumen,
+            campos_manuales_valores,
+            doc_emitidos_ids, doc_recibidos_ids,
+            total_doc_emitidos, total_doc_recibidos,
+            generado_por
+        ) VALUES (
+            :eid, 'IVA', 'MENSUAL', :periodo,
+            '{}', '{}', '{}', '{}',
+            CAST(:valores AS jsonb),
+            '[]', '[]', 0, 0, :pid
+        )
+        ON CONFLICT (emisor_id, tipo, periodo) DO UPDATE SET
+            campos_manuales_valores = CAST(:valores AS jsonb)
+    """), {
+        "eid":     emisor_id,
+        "periodo": periodo_db,
+        "valores": json.dumps(valores_limpios),
+        "pid":     str(profile_id) if profile_id else None,
+    })
+    await db.commit()
+
+    return {
+        "ok":      True,
+        "periodo": periodo,
+        "valores": valores_limpios,
+        "mensaje": "Valores guardados correctamente.",
+    }
+
 
 # =============================================================================
 # GET /renta — Formulario 102 — Impuesto a la Renta anual
