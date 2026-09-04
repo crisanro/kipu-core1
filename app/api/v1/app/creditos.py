@@ -124,7 +124,6 @@ async def crear_checkout_creditos(
                     },
                 },
                 "quantity":  1,
-                "tax_rates": [settings.STRIPE_TAX_RATE_ID],
             }],
             success_url      = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=creditos&cantidad={plan.cantidad}&plan={plan.nombre}",
             cancel_url       = f"{settings.FRONTEND_URL}/planes?pago=cancelado",

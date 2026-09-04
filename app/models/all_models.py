@@ -74,6 +74,7 @@ class Emisor(Base):
     declaraciones           = relationship("DeclaracionSRI", back_populates="emisor")
     reportes_tributarios = relationship("ReporteTributario", back_populates="emisor")
     notificaciones = relationship("Notificacion", back_populates="emisor")
+    proformas = relationship("Proforma")
     audit_logs = relationship("AuditLog", foreign_keys="AuditLog.emisor_id", backref="emisor_audit")
 
 
@@ -451,6 +452,44 @@ class DocumentoEmitido(Base):
     doc_origen_emitido      = relationship("DocumentoEmitido", remote_side="DocumentoEmitido.id", foreign_keys=[doc_origen_emitido_id])
     doc_origen_recibido     = relationship("DocumentoRecibido", back_populates="retencion_emitida", foreign_keys=[doc_origen_recibido_id])
     documentos_derivados    = relationship("DocumentoEmitido", foreign_keys=[doc_origen_emitido_id])
+
+
+# =============================================================================
+# PROFORMAS
+# =============================================================================
+class Proforma(Base):
+    """
+    Proformas comerciales — no son comprobantes SRI.
+    El número se genera en el service: PRO-2026-000000001
+    estado: VIGENTE | FACTURADA
+    Si fecha_validez < hoy y estado = VIGENTE → vencida en la UI (no en DB)
+    """
+    __tablename__ = "proformas"
+
+    id                   = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id            = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    cliente_id           = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="SET NULL"), nullable=True)
+    numero               = Column(String(20), nullable=False)
+    fecha_emision        = Column(Date, nullable=False, server_default=func.current_date())
+    fecha_validez        = Column(Date, nullable=True)
+    items                = Column(JSONB, nullable=False, server_default="[]")
+    subtotal             = Column(Numeric(12, 2), nullable=False, default=0)
+    total_iva            = Column(Numeric(12, 2), nullable=False, default=0)
+    total                = Column(Numeric(12, 2), nullable=False, default=0)
+    notas                = Column(Text, nullable=True)
+    estado               = Column(String(10), nullable=False, default="VIGENTE")
+    documento_emitido_id = Column(UUID(as_uuid=True), ForeignKey("documentos_emitidos.id", ondelete="SET NULL"), nullable=True)
+    created_at           = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at           = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("emisor_id", "numero", name="uq_proforma_emisor_numero"),
+    )
+
+    # Relaciones
+    emisor            = relationship("Emisor")
+    cliente           = relationship("ClienteEmisor")
+    documento_emitido = relationship("DocumentoEmitido", foreign_keys=[documento_emitido_id])
 
 
 # =============================================================================

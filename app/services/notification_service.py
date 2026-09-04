@@ -1,14 +1,21 @@
 # app/services/notification_service.py
 import httpx
+import time
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 
 FCM_URL = f"https://fcm.googleapis.com/v1/projects/{settings.FIREBASE_PROJECT_ID}/messages:send"
 
+# ── Cache del access token Google ─────────────────────────────────────────────
+_token_cache: dict = {"token": None, "expires_at": 0}
 
-# ── Token de acceso Google ─────────────────────────────────────────────────────
+# ── Token de acceso Google ────────────────────────────────────────────────────
 async def _get_access_token() -> str:
+    # Reusar si quedan más de 5 minutos de vida
+    if _token_cache["token"] and time.time() < _token_cache["expires_at"] - 300:
+        return _token_cache["token"]
+
     import google.auth.transport.requests
     from google.oauth2 import service_account
 
@@ -24,16 +31,22 @@ async def _get_access_token() -> str:
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         "client_x509_cert_url":        f"https://www.googleapis.com/robot/v1/metadata/x509/{settings.FIREBASE_CLIENT_EMAIL}",
     }
+
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/firebase.messaging"],
     )
     request = google.auth.transport.requests.Request()
     credentials.refresh(request)
+
+    _token_cache["token"]      = credentials.token
+    _token_cache["expires_at"] = credentials.expiry.timestamp()
+
+    print(f"[FCM] 🔑 Token OAuth renovado — válido hasta {credentials.expiry.strftime('%H:%M:%S')}")
     return credentials.token
 
 
-# ── Borrar token inválido ──────────────────────────────────────────────────────
+# ── Borrar token inválido ─────────────────────────────────────────────────────
 async def _borrar_token(token: str, db: AsyncSession):
     try:
         await db.execute(
@@ -46,7 +59,7 @@ async def _borrar_token(token: str, db: AsyncSession):
         print(f"[FCM] ⚠️ Error eliminando token: {e}")
 
 
-# ── Enviar push a lista de tokens ──────────────────────────────────────────────
+# ── Enviar push a lista de tokens ─────────────────────────────────────────────
 async def _enviar_push(
     tokens:   list[str],
     titulo:   str,
@@ -58,7 +71,7 @@ async def _enviar_push(
         return
 
     try:
-        access_token = await _get_access_token()
+        access_token = await _get_access_token()  # ← cacheado, no regenera cada vez
         async with httpx.AsyncClient(timeout=10.0) as client:
             for token in tokens:
                 payload = {
@@ -92,11 +105,9 @@ async def _enviar_push(
                         "Content-Type":  "application/json",
                     },
                 )
-
                 if res.status_code == 200:
                     print(f"[FCM] ✅ Push enviado")
                 else:
-                    # Detectar tokens inválidos y limpiarlos
                     try:
                         error_body = res.json()
                         error_code = (
@@ -118,7 +129,7 @@ async def _enviar_push(
         print(f"[FCM] ❌ Error enviando push: {e}")
 
 
-# ── Función principal ──────────────────────────────────────────────────────────
+# ── Función principal ─────────────────────────────────────────────────────────
 async def crear_notificacion(
     db:         AsyncSession,
     emisor_id:  int,
@@ -137,11 +148,11 @@ async def crear_notificacion(
             INSERT INTO notificaciones (emisor_id, tipo, titulo, mensaje, referencia, leida)
             VALUES (:eid, :tipo, :titulo, :mensaje, :ref, false)
         """), {
-            "eid":    emisor_id,
-            "tipo":   tipo,
-            "titulo": titulo,
+            "eid":     emisor_id,
+            "tipo":    tipo,
+            "titulo":  titulo,
             "mensaje": mensaje,
-            "ref":    referencia,
+            "ref":     referencia,
         })
         await db.commit()
         print(f"[Notif] 📥 {tipo} → emisor {emisor_id}: {titulo}")
@@ -161,7 +172,7 @@ async def crear_notificacion(
         print(f"[Notif] ⚠️ Error buscando tokens: {e}")
         return
 
-    # 3. Enviar push — pasamos db para limpiar tokens inválidos
+    # 3. Enviar push
     await _enviar_push(tokens, titulo, mensaje, referencia, db=db)
 
 
@@ -184,9 +195,7 @@ async def notificar_todos_emisores(
         """))
         emisor_ids = [r.id for r in res.fetchall()]
         print(f"[Notif] 📢 Notificando {len(emisor_ids)} emisores: {titulo}")
-
         for emisor_id in emisor_ids:
             await crear_notificacion(db, emisor_id, tipo, titulo, mensaje, referencia)
-
     except Exception as e:
         print(f"[Notif] ❌ Error notificando todos: {e}")

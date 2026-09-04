@@ -26,6 +26,8 @@ class TTL:
     HISTORIAL         = 360
     CUENTAS_LISTA   = 120   # 2 min — lista global de cuentas
     CUENTAS_CLIENTE = 180   # 3 min — cuentas por cliente
+    PROFORMAS_LISTA  = 180   # 3 min
+    PROFORMA_DETALLE = 300   # 5 min
 
 # ── Prefijos de clave ──────────────────────────────────────────────────────────
 class CK:
@@ -41,6 +43,8 @@ class CK:
     HISTORIAL       = "historial:{eid}:{fi}:{ff}"
     CUENTAS_LISTA   = "cuentas:{eid}"
     CUENTAS_CLIENTE = "cuentas:{eid}:{cid}"
+    PROFORMAS_LISTA  = "proformas:{eid}"
+    PROFORMA_DETALLE = "proforma:{eid}:{pid}"
 
     @staticmethod
     def fmt(template: str, **kwargs) -> str:
@@ -135,3 +139,5 @@ async def invalidate_emisor(emisor_id: int):
     await cache_clear_prefix(f"factura:{emisor_id}")
     await cache_clear_prefix(f"historial:{emisor_id}")
     await cache_clear_prefix(f"cuentas:{emisor_id}")
+    await cache_clear_prefix(f"proformas:{emisor_id}")
+    await cache_clear_prefix(f"proforma:{emisor_id}")

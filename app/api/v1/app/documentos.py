@@ -67,6 +67,7 @@ class EmitirDocumentoRequest(BaseModel):
     periodo_fiscal:         Optional[str]        = None
     campos_adicionales:     Optional[list[CampoAdicional]] = None
     origen:                 Optional[str]                  = "web"
+    proforma_id: Optional[str] = None
 
 class ActualizarCobro(BaseModel):
     estado_cobro:            str
@@ -79,12 +80,12 @@ class ActualizarCobro(BaseModel):
 # =============================================================================
 @router.post("/emit/{tipo_doc}", summary="Emitir comprobante electrónico")
 async def emitir_documento(
-    tipo_doc:          str,
-    data:              EmitirDocumentoRequest,
-    request:           Request,
-    auth_data:         dict          = Depends(verify_firebase_token),
-    db:                AsyncSession  = Depends(get_db),
-    _rl:               None          = Depends(RateLimit(RateLimitScope.INVOICE)),
+    tipo_doc:            str,
+    data:                EmitirDocumentoRequest,
+    request:             Request,
+    auth_data:           dict          = Depends(verify_firebase_token),
+    db:                  AsyncSession  = Depends(get_db),
+    _rl:                 None          = Depends(RateLimit(RateLimitScope.INVOICE)),
     x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
     x_sandbox:         Optional[str] = Header(None, alias="X-Sandbox"),
 ):
@@ -132,6 +133,20 @@ async def emitir_documento(
             },
             request   = request,
         )
+        proforma_id = data.proforma_id
+        if proforma_id and result.get("id") and not es_sandbox:
+            try:
+                from app.services.proforma_service import facturar_proforma_core
+                await facturar_proforma_core(
+                    emisor_id    = emisor_id,
+                    proforma_id  = proforma_id,
+                    documento_id = result["id"],
+                    db           = db,
+                )
+                print(f"[Proforma] ✅ {proforma_id} marcada como FACTURADA")
+            except Exception as e:
+                print(f"[Proforma] ⚠️ No se pudo marcar como facturada: {e}")
+
         await db.commit()
 
     return result

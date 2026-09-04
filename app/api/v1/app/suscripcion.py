@@ -105,7 +105,7 @@ async def crear_checkout_suscripcion(
         session = stripe.checkout.Session.create(
             customer              = stripe_customer_id,
             mode                  = "subscription",
-            line_items            = [{"price": price_id, "quantity": 1, "tax_rates": [settings.STRIPE_TAX_RATE_ID]}],
+            line_items            = [{"price": price_id, "quantity": 1}],
             success_url           = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan={plan}&periodo={periodo}",
             cancel_url            = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
             allow_promotion_codes = True,
