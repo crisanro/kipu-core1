@@ -132,6 +132,7 @@ async def invalidate_emisor(emisor_id: int):
     """
     await cache_clear_prefix(f"emisor:{emisor_id}")
     await cache_clear_prefix(f"dashboard:{emisor_id}")
+    await cache_clear_prefix(f"dashboard_header:{emisor_id}")
     await cache_clear_prefix(f"clientes:{emisor_id}")
     await cache_clear_prefix(f"estructura:{emisor_id}")
     await cache_clear_prefix(f"apikeys:{emisor_id}")

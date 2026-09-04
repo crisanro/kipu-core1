@@ -389,6 +389,145 @@ async def resumen_documentos(
     }
 
 # =============================================================================
+# ANULAR — POST /{doc_id}/anular
+# =============================================================================
+MOTIVOS_ANULACION = [
+    "ERROR EN DATOS DEL CLIENTE",
+    "ERROR EN MONTO O ÍTEMS",
+    "DOCUMENTO DUPLICADO",
+    "OPERACIÓN NO REALIZADA",
+    "OTRO",
+]
+
+class AnulacionRequest(BaseModel):
+    motivo:      str
+    confirmado:  bool  # el usuario marcó el check "ya lo anulé en el SRI"
+
+@router.post("/{doc_id}/anular", summary="Anular comprobante autorizado")
+async def anular_documento(
+    doc_id:    str,
+    body:      AnulacionRequest,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
+
+    verificar_permiso(auth_data, "emitir")
+
+    if not body.confirmado:
+        raise HTTPException(
+            status_code=400,
+            detail="DEBES CONFIRMAR QUE YA ANULASTE EL COMPROBANTE EN EL PORTAL DEL SRI."
+        )
+    if body.motivo not in MOTIVOS_ANULACION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"MOTIVO INVÁLIDO. OPCIONES: {', '.join(MOTIVOS_ANULACION)}"
+        )
+
+    # Cargar documento
+    res = await db.execute(text("""
+        SELECT
+            id, estado_sri, es_sandbox, tipo_doc,
+            numero_doc, clave_acceso, fecha_autorizacion,
+            email_comprador, datos
+        FROM documentos_emitidos
+        WHERE id = :did AND emisor_id = :eid
+    """), {"did": doc_id, "eid": emisor_id})
+    doc = res.fetchone()
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="DOCUMENTO NO ENCONTRADO.")
+    if doc.es_sandbox:
+        raise HTTPException(status_code=400, detail="NO SE PUEDEN ANULAR DOCUMENTOS DE PRUEBA.")
+    if doc.estado_sri == "ANULADO":
+        raise HTTPException(status_code=400, detail="EL DOCUMENTO YA ESTÁ ANULADO.")
+    if doc.estado_sri != "AUTORIZADO":
+        raise HTTPException(
+            status_code=400,
+            detail=f"SOLO SE PUEDEN ANULAR DOCUMENTOS AUTORIZADOS. ESTADO ACTUAL: {doc.estado_sri}."
+        )
+
+    # Anular
+    await db.execute(text("""
+        UPDATE documentos_emitidos
+        SET estado_sri       = 'ANULADO',
+            motivo_anulacion = :motivo,
+            fecha_anulacion  = NOW(),
+            updated_at       = NOW()
+        WHERE id = :did AND emisor_id = :eid
+    """), {"motivo": body.motivo, "did": doc_id, "eid": emisor_id})
+
+    await audit_log(
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "ANULAR",
+        entidad    = "documento",
+        entidad_id = doc_id,
+        detalle    = {
+            "numero_doc":   doc.numero_doc,
+            "clave_acceso": doc.clave_acceso,
+            "motivo":       body.motivo,
+        },
+        request    = request,
+    )
+
+    await db.commit()
+
+    # Invalidar cache del dashboard y documentos
+    try:
+        from app.core.cache import get_redis
+        redis   = await get_redis()
+        pattern = f"dashboard:{emisor_id}*"
+        async for key in redis.scan_iter(pattern):
+            await redis.delete(key)
+    except Exception as e:
+        print(f"[Cache] ⚠️ No invalidado: {e}")
+
+    # Notificación interna
+    try:
+        from app.services.notification_service import crear_notificacion
+        await crear_notificacion(
+            db         = db,
+            emisor_id  = emisor_id,
+            tipo       = "DOCUMENTO",
+            titulo     = "🚫 Comprobante anulado",
+            mensaje    = f"{doc.numero_doc} fue marcado como anulado. Motivo: {body.motivo}.",
+            referencia = f"/documentos/{doc_id}",
+        )
+    except Exception as e:
+        print(f"[Notif] ⚠️ No se pudo notificar: {e}")
+
+    # Extraer datos del comprador para el response
+    datos    = doc.datos or {}
+    info_fac = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
+    id_comprador    = info_fac.get("identificacionComprador") or info_fac.get("identificacionProveedor") or ""
+    email_comprador = doc.email_comprador or ""
+
+    return {
+        "ok":      True,
+        "mensaje": "COMPROBANTE MARCADO COMO ANULADO CORRECTAMENTE.",
+        "data": {
+            "id":               doc_id,
+            "numero_doc":       doc.numero_doc,
+            "estado_sri":       "ANULADO",
+            "motivo_anulacion": body.motivo,
+            # Datos para que el usuario pueda ir al SRI
+            "sri": {
+                "tipo_comprobante":   doc.tipo_doc,
+                "fecha_autorizacion": str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
+                "clave_acceso":       doc.clave_acceso,
+                "numero_autorizacion": doc.clave_acceso,  # en Ecuador la clave acceso = número autorización
+                "identificacion_receptor": id_comprador,
+                "email_receptor":     email_comprador,
+            }
+        }
+    }
+
+# =============================================================================
 # DETALLE — GET /{doc_id}
 # =============================================================================
 @router.get("/{doc_id}", summary="Detalle de un documento emitido")

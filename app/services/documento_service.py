@@ -247,7 +247,6 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
             status_code=402,
             detail="Tu firma electrónica está vencida. Actualízala para continuar."
         )
-
     # ── Sandbox ───────────────────────────────────────────────────────────────
     if es_sandbox:
         res = await db.execute(text("""
@@ -277,7 +276,6 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
                 detail="Límite de 100 documentos de prueba por día alcanzado."
             )
         return emisor, {"tipo": "sandbox", "descontar_credito": False, "redis_key": key_sand, "redis_ttl": 1}
-
     # ── Producción ────────────────────────────────────────────────────────────
     res = await db.execute(text("""
         SELECT e.*,
@@ -293,17 +291,14 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
     emisor = res.fetchone()
     if not emisor:
         raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-
     sub_estado = getattr(emisor, "sub_estado", None)
     balance    = getattr(emisor, "balance", 0) or 0
     tiene_sub  = sub_estado in ("ACTIVO", "TRIAL")
-
     if not tiene_sub and balance <= 0:
         raise HTTPException(
             status_code=402,
             detail="Se requiere suscripción activa o créditos API para emitir."
         )
-
     # ── Suscriptor — verificar límite mensual ─────────────────────────────────
     if tiene_sub:
         limite   = getattr(emisor, "api_limit_mensual", 200) or 200
@@ -330,12 +325,12 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
             )
         tipo = "api" if api_key_id else "web"
         return emisor, {"tipo": tipo, "descontar_credito": False, "redis_key": key_prod, "redis_ttl": 35}
-
     # ── Sin suscripción — usa créditos ────────────────────────────────────────
     await db.execute(text("""
         SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
     """), {"eid": emisor_id})
-
+    tipo = "api" if api_key_id else "credito"
+    return emisor, {"tipo": tipo, "descontar_credito": True, "redis_key": None}
 
 # =============================================================================
 # BLOQUE 1 — CARGAR DOCUMENTO ORIGEN

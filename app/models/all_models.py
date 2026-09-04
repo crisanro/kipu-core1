@@ -416,6 +416,8 @@ class DocumentoEmitido(Base):
     mensajes_sri            = Column(JSONB)
     fecha_envio_sri         = Column(TIMESTAMP(timezone=True))
     fecha_autorizacion      = Column(TIMESTAMP(timezone=True))
+    fecha_anulacion         = Column(TIMESTAMP(timezone=True), nullable=True)   # ← añadir
+    motivo_anulacion        = Column(String(100), nullable=True)             
     retry_count             = Column(Integer, default=0)
     last_retry              = Column(TIMESTAMP(timezone=True))
 
