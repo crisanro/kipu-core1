@@ -73,6 +73,15 @@ async def verificar_cliente(
     verificar_permiso(auth_data, "clientes")
     return await verificar_existencia_cliente_core(auth_data["emisor_id"], identificacion, db)
 
+@router.get("/detalle/{cliente_id}")
+async def consultar_detalle_cliente(
+    cliente_id: str,
+    auth_data:  dict         = Depends(verify_firebase_token),
+    db:         AsyncSession = Depends(get_db)
+):
+    verificar_permiso(auth_data, "clientes")
+    return await consultar_detalle_cliente_core(auth_data["emisor_id"], cliente_id, db)
+
 @router.get("/{identificacion}")
 async def consultar_cliente(
     identificacion: str,
@@ -107,12 +116,3 @@ async def actualizar_cliente(
     )
     await db.commit()
     return result
-
-@router.get("/detalle/{cliente_id}")
-async def consultar_detalle_cliente(
-    cliente_id: str,
-    auth_data:  dict         = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db)
-):
-    verificar_permiso(auth_data, "clientes")
-    return await consultar_detalle_cliente_core(auth_data["emisor_id"], cliente_id, db)

@@ -24,6 +24,8 @@ class TTL:
     STATUS_INTEGRACION= 180   # 3 min  — estado del emisor vía API externa
     FACTURA_DETALLE   = 300
     HISTORIAL         = 360
+    CUENTAS_LISTA   = 120   # 2 min — lista global de cuentas
+    CUENTAS_CLIENTE = 180   # 3 min — cuentas por cliente
 
 # ── Prefijos de clave ──────────────────────────────────────────────────────────
 class CK:
@@ -37,6 +39,8 @@ class CK:
     STATUS          = "status:{eid}"
     FACTURA         = "factura:{eid}:{fid}"
     HISTORIAL       = "historial:{eid}:{fi}:{ff}"
+    CUENTAS_LISTA   = "cuentas:{eid}"
+    CUENTAS_CLIENTE = "cuentas:{eid}:{cid}"
 
     @staticmethod
     def fmt(template: str, **kwargs) -> str:
@@ -130,3 +134,4 @@ async def invalidate_emisor(emisor_id: int):
     await cache_clear_prefix(f"status:{emisor_id}")
     await cache_clear_prefix(f"factura:{emisor_id}")
     await cache_clear_prefix(f"historial:{emisor_id}")
+    await cache_clear_prefix(f"cuentas:{emisor_id}")

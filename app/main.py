@@ -41,7 +41,8 @@ from app.api.v1.app import (
     usuarios      as usuarios_app,
     creditos      as creditos_app,
     suscripcion   as suscripcion_app, 
-    audit
+    audit,
+    cuentas       as cuentas_app,
 )
 
 # ─── ROUTERS PUBLIC ───────────────────────────────────────────────────────────
@@ -355,6 +356,7 @@ app.include_router(emisor_app.router,        prefix="/api/v1/app/emisor",       
 app.include_router(estructura_app.router,    prefix="/api/v1/app/estructura",              tags=["📱 Estructura"])
 app.include_router(usuarios_app.router,      prefix="/api/v1/app/usuarios",                tags=["📱 Usuarios"])
 app.include_router(clientes_app.router,      prefix="/api/v1/app/clientes",                tags=["📱 Clientes"])
+app.include_router(cuentas_app.router,       prefix="/api/v1/app/cuentas",                   tags=["📱 Cuentas"])
 app.include_router(productos_app.router,     prefix="/api/v1/app/productos",               tags=["📱 Productos"])
 app.include_router(catalogo_app.router,      prefix="/api/v1/app/catalogo",                tags=["📱 Catálogo"])
 app.include_router(documentos_app.router,    prefix="/api/v1/app/documentos",              tags=["📱 Documentos Emitidos"])

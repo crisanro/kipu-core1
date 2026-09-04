@@ -70,6 +70,7 @@ class Emisor(Base):
     clientes                = relationship("ClienteEmisor", back_populates="emisor")
     documentos_emitidos     = relationship("DocumentoEmitido", back_populates="emisor")
     documentos_recibidos    = relationship("DocumentoRecibido", back_populates="emisor")
+    cuentas_movimientos = relationship("CuentaMovimiento")
     declaraciones           = relationship("DeclaracionSRI", back_populates="emisor")
     reportes_tributarios = relationship("ReporteTributario", back_populates="emisor")
     notificaciones = relationship("Notificacion", back_populates="emisor")
@@ -359,6 +360,7 @@ class ClienteEmisor(Base):
     sujeto_global           = relationship("SujetoGlobal", back_populates="clientes")
     emisor                  = relationship("Emisor", back_populates="clientes")
     documentos_emitidos     = relationship("DocumentoEmitido", back_populates="cliente")
+    cuentas = relationship("CuentaMovimiento", back_populates="cliente")
 
 
 # =============================================================================
@@ -548,7 +550,64 @@ class DocumentoRecibido(Base):
                                 back_populates="doc_origen_recibido",
                                 foreign_keys="DocumentoEmitido.doc_origen_recibido_id",
                               )
-    
+
+
+# =============================================================================
+# CUENTAS POR COBRAR / PAGAR
+# =============================================================================
+class CuentaMovimiento(Base):
+    """
+    Cuentas por cobrar y por pagar del emisor.
+    tipo: COBRAR | PAGAR
+    estado: PENDIENTE | PARCIAL | PAGADO | ANULADO
+    El cliente debe estar registrado en clientes_emisor (llamado "Personas" en la UI).
+    monto_pagado se recalcula automáticamente al registrar abonos.
+    """
+    __tablename__ = "cuentas_movimientos"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    cliente_id      = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="RESTRICT"), nullable=False)
+    tipo            = Column(String(6), nullable=False)             # COBRAR | PAGAR
+    concepto        = Column(Text, nullable=False)
+    monto_total     = Column(Numeric(12, 2), nullable=False)
+    monto_pagado    = Column(Numeric(12, 2), nullable=False, default=0)
+    fecha_emision   = Column(Date, nullable=False, server_default=func.current_date())
+    fecha_vencimiento = Column(Date, nullable=True)
+    estado          = Column(String(10), nullable=False, default="PENDIENTE")  # PENDIENTE | PARCIAL | PAGADO | ANULADO
+    documento_emitido_id  = Column(UUID(as_uuid=True), ForeignKey("documentos_emitidos.id",  ondelete="SET NULL"), nullable=True)
+    documento_recibido_id = Column(UUID(as_uuid=True), ForeignKey("documentos_recibidos.id", ondelete="SET NULL"), nullable=True)
+    notas           = Column(Text, nullable=True)
+    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relaciones
+    emisor          = relationship("Emisor")
+    cliente         = relationship("ClienteEmisor", back_populates="cuentas")
+    abonos          = relationship("CuentaAbono", back_populates="cuenta", cascade="all, delete-orphan")
+    documento_emitido  = relationship("DocumentoEmitido",  foreign_keys=[documento_emitido_id])
+    documento_recibido = relationship("DocumentoRecibido", foreign_keys=[documento_recibido_id])
+
+
+class CuentaAbono(Base):
+    """
+    Abonos/pagos parciales o totales a una cuenta.
+    Al registrar un abono el service recalcula monto_pagado y estado en CuentaMovimiento.
+    """
+    __tablename__ = "cuentas_abonos"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cuenta_id   = Column(UUID(as_uuid=True), ForeignKey("cuentas_movimientos.id", ondelete="CASCADE"), nullable=False)
+    monto       = Column(Numeric(12, 2), nullable=False)
+    fecha       = Column(Date, nullable=False, server_default=func.current_date())
+    forma_pago  = Column(String(30), nullable=True)   # EFECTIVO | TRANSFERENCIA | CHEQUE | TARJETA | OTRO
+    notas       = Column(Text, nullable=True)
+    created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+    # Relaciones
+    cuenta      = relationship("CuentaMovimiento", back_populates="abonos")
+
+
 # =============================================================================
 # DECLARACIONES SRI
 # =============================================================================

@@ -361,17 +361,20 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
             SELECT
                 c.id, c.tipo_identificacion_sri, c.identificacion, c.razon_social,
                 c.direccion, c.email, c.telefono,
-                i.id AS factura_id,
-                est.codigo || '-' || p.codigo || '-' || i.secuencial AS numero_factura,
-                i.importe_total,
-                i.fecha_emision,
-                i.estado
+                d.id        AS factura_id,
+                d.numero_doc,
+                d.importe_total,
+                d.fecha_emision,
+                d.estado_sri
             FROM clientes_emisor c
-            LEFT JOIN invoices_emitidas i   ON i.cliente_emisor_id = c.id AND i.emisor_id = :eid
-            LEFT JOIN puntos_emision p       ON i.punto_emision_id  = p.id
-            LEFT JOIN establecimientos est   ON p.establecimiento_id = est.id
-            WHERE c.id = :cid AND c.emisor_id = :eid
-            ORDER BY i.created_at DESC
+            LEFT JOIN documentos_emitidos d
+                   ON d.cliente_id = c.id
+                  AND d.emisor_id  = :eid
+                  AND d.tipo_doc   = 'FAC'
+                  AND d.es_sandbox = false
+            WHERE c.id        = :cid
+              AND c.emisor_id = :eid
+            ORDER BY d.created_at DESC
         """)
         res  = await db.execute(query, {"cid": cliente_id, "eid": emisor_id})
         rows = res.mappings().fetchall()
@@ -398,23 +401,23 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
                 continue
             monto = float(f["importe_total"]) if f["importe_total"] else 0.0
             lista_facturas.append({
-                "id":             str(f["factura_id"]),
-                "numero_factura": f["numero_factura"],
-                "importe_total":  monto,
-                "fecha_emision":  f["fecha_emision"].strftime('%Y-%m-%d') if f["fecha_emision"] else None,
-                "estado":         f["estado"]
+                "id":            str(f["factura_id"]),
+                "numero_doc":    f["numero_doc"],
+                "importe_total": monto,
+                "fecha_emision": f["fecha_emision"].strftime('%Y-%m-%d') if f["fecha_emision"] else None,
+                "estado_sri":    f["estado_sri"],
             })
-            if f["estado"] == "AUTORIZADO":
+            if f["estado_sri"] == "AUTORIZADO":
                 total_facturado += monto
 
         result = {
             "ok": True,
             "cliente": cliente,
             "resumen": {
-                "total_facturas": len(lista_facturas),
-                "suma_facturada": round(total_facturado, 2)
+                "total_documentos": len(lista_facturas),
+                "suma_facturada":   round(total_facturado, 2),
             },
-            "facturas": lista_facturas
+            "facturas": lista_facturas,
         }
 
         await cache_set(cache_key, result, TTL.CLIENTE_DETALLE)
@@ -425,7 +428,7 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL CONSULTAR HISTORIAL.")
-
+    
 
 async def verificar_cliente_existente_flexible(emisor_id: int, busqueda: str, db: AsyncSession):
     try:
