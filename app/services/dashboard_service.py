@@ -32,13 +32,13 @@ def _meses_en_rango(fecha_inicio: date, fecha_fin: date) -> list[tuple[int, int]
 
 
 async def obtener_dashboard_core(
-    emisor_id:        int | None,
-    email_usuario:    str,
+    emisor_id:         int | None,
+    email_usuario:     str,
     email_verificado: bool,
-    fecha_inicio:     date,
-    fecha_fin:        date,
-    db:               AsyncSession,
-    sandbox:            bool = False,
+    fecha_inicio:      date,
+    fecha_fin:         date,
+    db:                AsyncSession,
+    sandbox:           bool = False,
 ):
     try:
         # ═══════════════════════════════════════════════════════════
@@ -57,8 +57,8 @@ async def obtener_dashboard_core(
                     s.current_period_end,
                     p.whatsapp_number,
                     e.id AS emisor_db_id,
-                    (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = e.id)                  AS total_estab,
-                    (SELECT COUNT(*) FROM puntos_emision   WHERE emisor_id = e.id)                  AS total_puntos,
+                    (SELECT COUNT(*) FROM establecimientos WHERE emisor_id = e.id)                     AS total_estab,
+                    (SELECT COUNT(*) FROM puntos_emision   WHERE emisor_id = e.id)                     AS total_puntos,
                     (SELECT COUNT(*) FROM api_keys         WHERE emisor_id = e.id AND revoked = false) AS total_keys,
                     (SELECT EXISTS(
                         SELECT 1 FROM notificaciones WHERE emisor_id = e.id AND leida = false
@@ -153,16 +153,17 @@ async def obtener_dashboard_core(
                                     continue
                                 tarifa = str(i.get("tarifa", "0"))
                                 if tarifa not in impuestos_por_tarifa:
-                                    impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
+                                     impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
                                 impuestos_por_tarifa[tarifa]["base"] += float(i.get("baseImponible") or 0)
                                 impuestos_por_tarifa[tarifa]["iva"]  += float(i.get("valor") or 0)
 
-                        # Totales desde datos JSONB o legacy
+                        # Totales y bases calculados desde impuestos_por_tarifa
+                        subtotal_15   = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k != "0")
+                        subtotal_0    = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k == "0")
+                        iva_calculado = sum(v["iva"]  for v in impuestos_por_tarifa.values())
+
                         info_fac    = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
                         total       = float(d["importe_total"] or 0)
-                        subtotal_15 = float(info_fac.get("totalSinImpuestos") or datos.get("legacy_subtotal_iva") or 0)
-                        subtotal_0  = float(datos.get("legacy_subtotal_0") or 0)
-                        iva         = float(datos.get("legacy_valor_iva") or 0)
 
                         # Comprador
                         razon  = info_fac.get("razonSocialComprador") or datos.get("legacy_razon_comprador") or ""
@@ -177,7 +178,7 @@ async def obtener_dashboard_core(
                             "cliente_id":        id_com,
                             "subtotal_15":       subtotal_15,
                             "subtotal_0":        subtotal_0,
-                            "iva":               iva,
+                            "iva":               iva_calculado,
                             "total":             total,
                             "estado":            d["estado_sri"],
                             "estado_cobro":      d["estado_cobro"],
@@ -253,9 +254,9 @@ async def obtener_dashboard_core(
             "ok": True,
             "data": {
                 "health": {
-                    "email_verificado":              email_verificado,
-                    "ruc":                           bool(data_header.get("ruc")),
-                    "ambiente_produccion":           data_header.get("ambiente") == 2,
+                    "email_verificado":             email_verificado,
+                    "ruc":                          bool(data_header.get("ruc")),
+                    "ambiente_produccion":          data_header.get("ambiente") == 2,
                     "firma_configurada":             bool(data_header.get("p12_path")),
                     "firma_vigente":                 firma_vigente,
                     "firma_alerta":                  firma_alerta,
@@ -319,7 +320,7 @@ async def consultar_detalle_documento_core(
                 c.identificacion, c.razon_social,
                 c.direccion, c.email, c.telefono
             FROM documentos_emitidos d
-            LEFT JOIN clientes_emisor c    ON d.cliente_id          = c.id
+            LEFT JOIN clientes_emisor c    ON d.cliente_id            = c.id
             LEFT JOIN puntos_emision pe    ON d.punto_emision_id    = pe.id
             LEFT JOIN establecimientos est ON pe.establecimiento_id = est.id
             WHERE d.id = :did AND d.emisor_id = :eid
@@ -354,17 +355,17 @@ async def consultar_detalle_documento_core(
         return {
             "ok": True,
             "documento": {
-                "id":            str(row["id"]),
-                "tipo_doc":      row["tipo_doc"],
-                "numero_doc":    row["numero_doc"],
-                "secuencial":    row["secuencial"],
-                "clave_acceso":  row["clave_acceso"],
+                "id":             str(row["id"]),
+                "tipo_doc":       row["tipo_doc"],
+                "numero_doc":     row["numero_doc"],
+                "secuencial":     row["secuencial"],
+                "clave_acceso":   row["clave_acceso"],
                 "fecha_emision": row["fecha_emision"].strftime("%Y-%m-%d") if row["fecha_emision"] else None,
-                "estado_sri":    row["estado_sri"],
-                "estado_cobro":  row["estado_cobro"],
-                "forma_pago_cobro":        row["forma_pago_cobro"],
+                "estado_sri":     row["estado_sri"],
+                "estado_cobro":   row["estado_cobro"],
+                "forma_pago_cobro":         row["forma_pago_cobro"],
                 "numero_comprobante_pago": row["numero_comprobante_pago"],
-                "fecha_pago":              str(row["fecha_pago"]) if row["fecha_pago"] else None,
+                "fecha_pago":               str(row["fecha_pago"]) if row["fecha_pago"] else None,
                 "totales": {
                     "importe_total":   float(row["importe_total"] or 0),
                     "total_descuento": float(info_fac.get("totalDescuento") or 0),
@@ -380,12 +381,12 @@ async def consultar_detalle_documento_core(
                 "info_adicional": info_adicional,
             },
             "cliente": {
-                "uid":           str(row["cliente_uid"]) if row["cliente_uid"] else None,
+                "uid":            str(row["cliente_uid"]) if row["cliente_uid"] else None,
                 "identificacion": id_com,
-                "razon_social":  razon,
-                "direccion":     row.get("direccion"),
-                "email":         email,
-                "telefono":      row.get("telefono"),
+                "razon_social":   razon,
+                "direccion":      row.get("direccion"),
+                "email":          email,
+                "telefono":       row.get("telefono"),
             }
         }
 
