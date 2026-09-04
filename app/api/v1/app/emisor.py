@@ -2,8 +2,6 @@
 import time
 import httpx
 import base64
-import re
-import unicodedata
 from datetime import datetime, date
 from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException, Request
 from sqlalchemy import text
@@ -13,6 +11,8 @@ from app.core.security import verify_firebase_token, validar_y_quemar_pin
 from app.schemas.emisor import OnboardingRequest, EmisorUpdate
 from app.services.storage_service import upload_file, delete_folder
 from app.utils.crypto import encrypt_password
+from app.utils.texto import mayusculas
+from app.utils.validacion_sri import validar_ruc_ecuador
 from app.core.cache import cache_get, cache_set, invalidate_emisor, CK, TTL
 from app.core.rate_limit import RateLimit, RateLimitScope
 from app.core.config import settings
@@ -23,52 +23,6 @@ router = APIRouter()
 NODE_VALIDATOR_URL = f"{settings.NODE_SIGNER_URL}/api/validar-p12"
 
 # ── Helpers — sin cambios ──────────────────────────────────────────────────────
-def validar_ruc_ecuador(ruc: str):
-    ruc = ruc.strip()
-    if not ruc.isdigit() or len(ruc) != 13:
-        return False, "El RUC debe tener exactamente 13 dígitos numéricos."
-    if not ruc.endswith("001"):
-        return False, "El RUC debe terminar en 001."
-    provincia = int(ruc[0:2])
-    if provincia < 1 or provincia > 24:
-        return False, "Los dos primeros dígitos (provincia) son inválidos."
-    tercer_digito = int(ruc[2])
-    if tercer_digito < 6:
-        coeficientes = [2, 1, 2, 1, 2, 1, 2, 1, 2]
-        digitos      = [int(x) for x in ruc[:9]]
-        suma = 0
-        for i, d in enumerate(digitos):
-            p     = d * coeficientes[i]
-            suma += p if p < 10 else p - 9
-        verificador = 0 if suma % 10 == 0 else 10 - (suma % 10)
-        if verificador != int(ruc[9]):
-            return False, "El número de cédula base del RUC es incorrecto."
-    elif tercer_digito == 9:
-        coeficientes = [4, 3, 2, 7, 6, 5, 4, 3, 2]
-        digitos      = [int(x) for x in ruc[:9]]
-        suma         = sum(d * coeficientes[i] for i, d in enumerate(digitos))
-        verificador  = 0 if suma % 11 == 0 else 11 - (suma % 11)
-        if verificador != int(ruc[9]):
-            return False, "El RUC jurídico no supera la validación de módulo 11."
-    elif tercer_digito == 6:
-        coeficientes = [3, 2, 7, 6, 5, 4, 3, 2]
-        digitos      = [int(x) for x in ruc[:8]]
-        suma         = sum(d * coeficientes[i] for i, d in enumerate(digitos))
-        verificador  = 0 if suma % 11 == 0 else 11 - (suma % 11)
-        if verificador != int(ruc[8]):
-            return False, "El RUC público no supera la validación de módulo 11."
-    else:
-        return False, "El tercer dígito del RUC es inválido."
-    return True, ""
-
-def mayusculas(texto: str | None) -> str | None:
-    if not texto or not texto.strip():
-        return None
-    texto = unicodedata.normalize("NFD", texto.strip().upper())
-    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
-    texto = re.sub(r"[^A-Z0-9\s\.\,\-\/\#\&]", "", texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto if texto else None
 
 async def _vincular_usuario_invitado(data: OnboardingRequest, auth_data: dict, db: AsyncSession):
     uid = auth_data["uid"]

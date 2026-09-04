@@ -6,6 +6,8 @@ from fastapi import HTTPException
 from app.schemas.cliente import ClienteCreate, ClienteUpdate
 from datetime import date, datetime
 from app.core.cache import cache_get, cache_set, cache_delete, cache_clear_prefix, CK, TTL
+from app.utils.validacion_sri import validar_documento_ecuador
+from app.utils.texto import mayusculas
 
 
 # ── Helpers de invalidación ────────────────────────────────────────────────────
@@ -18,62 +20,6 @@ async def _invalidar_detalle_cliente(emisor_id: int, cliente_id: str):
     """Borra el detalle de un cliente específico."""
     await cache_delete(CK.fmt(CK.CLIENTE_DETALLE, eid=emisor_id, cid=cliente_id))
 
-
-# ── Validación Ecuador (sin cambios) ──────────────────────────────────────────
-
-def validar_documento_ecuador(documento: str):
-    documento = documento.replace("-", "").replace(".", "").replace(" ", "").strip()
-    if not documento.isdigit():
-        return False, "El documento debe contener solo números.", ""
-    if len(documento) not in [10, 13]:
-        return False, "Longitud no válida (debe ser 10 o 13 dígitos).", ""
-    provincia = int(documento[0:2])
-    if provincia < 1 or provincia > 24:
-        return False, f"Provincia '{documento[0:2]}' no existe.", ""
-    tercer_digito = int(documento[2])
-
-    def validar_modulo_10(id_str):
-        digitos = [int(x) for x in id_str[:9]]
-        verificador_recibido = int(id_str[9])
-        suma = 0
-        for i, val in enumerate(digitos):
-            prod = val * 2 if i % 2 == 0 else val * 1
-            if prod > 9: prod -= 9
-            suma += prod
-        residuo = suma % 10
-        verificador_calculado = 0 if residuo == 0 else 10 - residuo
-        return verificador_calculado == verificador_recibido
-
-    def validar_modulo_11(id_str):
-        coeficientes = [4, 3, 2, 7, 6, 5, 4, 3, 2]
-        digitos = [int(x) for x in id_str[:9]]
-        verificador_recibido = int(id_str[9])
-        suma = sum([val * coeficientes[i] for i, val in enumerate(digitos)])
-        residuo = suma % 11
-        verificador_calculado = 0 if residuo == 0 else 11 - residuo
-        return verificador_calculado == verificador_recibido
-
-    if len(documento) == 10:
-        if tercer_digito < 6:
-            if validar_modulo_10(documento):
-                return True, "", "05"
-            return False, "Número de cédula inválido.", ""
-        return False, "Cédula inválida (tercer dígito incorrecto).", ""
-    elif len(documento) == 13:
-        if not documento.endswith("001"):
-            return False, "El RUC debe terminar en 001.", ""
-        if tercer_digito < 6:
-            es_valido = validar_modulo_10(documento[:10])
-        elif tercer_digito == 9:
-            es_valido = validar_modulo_11(documento[:10])
-        elif tercer_digito == 6:
-            es_valido = True
-        else:
-            return False, "Tercer dígito de RUC inválido.", ""
-        if es_valido:
-            return True, "", "04"
-        return False, "El número de RUC no es válido.", ""
-    return False, "Documento no reconocido.", ""
 
 
 # ── 1. CREATE / UPDATE ─────────────────────────────────────────────────────────
@@ -91,7 +37,7 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
                 raise HTTPException(status_code=400, detail="EL CLIENTE YA EXISTE EN SU BASE DE DATOS.")
             return {"ok": True, "mensaje": "CLIENTE YA EXISTÍA", "uid": str(row_existente.id)}
 
-        razon_social_up = cliente.razon_social  # ya viene en mayúsculas del schema
+        razon_social_up = mayusculas(cliente.razon_social) or cliente.razon_social.strip().upper()
         direccion_up = cliente.direccion.strip().upper() if cliente.direccion and cliente.direccion.strip() else ""
         email_low    = cliente.email.strip().lower() if cliente.email and cliente.email.strip() else ""
         telefono     = cliente.telefono.strip() if cliente.telefono and cliente.telefono.strip() else ""
