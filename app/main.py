@@ -296,7 +296,7 @@ async def log_y_alertas(request: Request, call_next):
     print(f"   [{request.method}] {status} | {process_time_ms:.2f}ms | {data_log}", flush=True)
     response.headers["X-Process-Time-Ms"] = str(round(process_time_ms, 2))
 
-    if getattr(settings, "ALERT_EMAIL_ERRORS", False) and status >= 400:
+    if getattr(settings, "ALERT_EMAIL_ERRORS", False) and status >= 500:
         rutas_ignoradas = {"/", "/docs", "/openapi.json", "/api-docs", "/openapi-public.json", "/redoc", "/favicon.ico"}
         if path not in rutas_ignoradas and not path.startswith("/wp-"):
             if await _puede_alertar(path, status):

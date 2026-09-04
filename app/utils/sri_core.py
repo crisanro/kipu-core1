@@ -312,5 +312,15 @@ async def firmar_xml(xml_obj: dict, emisor) -> str:
 
         return data["xmlFirmado"]
 
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="SERVICIO_FIRMA_NO_DISPONIBLE: El microservicio de firma electrónica no responde. Intenta en unos segundos."
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=503,
+            detail="SERVICIO_FIRMA_TIMEOUT: El microservicio de firma tardó demasiado. Intenta de nuevo."
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Falla técnica en firma: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"FIRMA_ERROR: {str(e)}")
