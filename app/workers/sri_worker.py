@@ -270,7 +270,6 @@ async def procesar_emision(doc_id: str):
 # =============================================================================
 # PROCESADOR DE AUTORIZACIÓN
 # =============================================================================
-
 async def procesar_autorizacion(doc_id: str):
     async with _sri_semaphore:
         async with AsyncSessionLocal() as db:
@@ -280,6 +279,7 @@ async def procesar_autorizacion(doc_id: str):
                         d.id, d.clave_acceso, d.xml_path, d.numero_doc,
                         d.api_key_id, d.origen, d.datos,
                         d.tipo_doc, d.secuencial, d.es_sandbox,
+                        d.email_comprador,
                         e.ambiente, e.ruc, e.razon_social,
                         e.contribuyente_especial, e.id as emisor_id
                     FROM documentos_emitidos d
@@ -371,7 +371,7 @@ async def procesar_autorizacion(doc_id: str):
                                     pdf_bytes    = pdf_bytes,
                                 )
                         else:
-                            email_comprador = _email_desde_datos(doc.datos)
+                            email_comprador = doc.email_comprador
                             if email_comprador:
                                 await _enviar_email_comprobante(
                                     email        = email_comprador,
@@ -420,7 +420,7 @@ async def procesar_autorizacion(doc_id: str):
                 await asyncio.sleep(30)
                 redis = await get_redis()
                 await redis.lpush(QUEUE_AUTORIZACION, doc_id)
-
+                
 
 # =============================================================================
 # WEBHOOKS

@@ -396,6 +396,7 @@ class DocumentoEmitido(Base):
 
     id                      = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     emisor_id               = Column(Integer, ForeignKey("emisores.id"), nullable=False)
+    email_comprador = Column(String(150), nullable=True)
     punto_emision_id        = Column(Integer, ForeignKey("puntos_emision.id"), nullable=True)
     cliente_id              = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="SET NULL"), nullable=True)
     api_key_id  = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)

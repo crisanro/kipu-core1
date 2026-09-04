@@ -336,7 +336,7 @@ async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, d
         SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
     """), {"eid": emisor_id})
 
-    
+
 # =============================================================================
 # BLOQUE 1 — CARGAR DOCUMENTO ORIGEN
 # =============================================================================
@@ -919,7 +919,6 @@ async def _construir_xml(
 # =============================================================================
 # BLOQUE 5 — PERSISTIR
 # =============================================================================
-
 async def _persistir(
     tipo_doc, cod_doc, xml_firmado_str, xml_obj, xml_root,
     calculos, emisor, punto_emision, cliente_final, cliente_id,
@@ -952,6 +951,9 @@ async def _persistir(
     origen     = "api" if api_key_id else data.get("origen", "web")
     numero_doc = f"{punto_emision.estab_codigo}-{punto_emision.punto_codigo}-{secuencial}"
 
+    # Extraer email del comprador de forma segura
+    email_comprador = (cliente_final.get("email") or "").strip().lower() if cliente_final else ""
+
     res = await db.execute(text("""
         INSERT INTO documentos_emitidos (
             id,
@@ -960,6 +962,7 @@ async def _persistir(
             clave_acceso, numero_doc, secuencial, fecha_emision,
             estado_sri, importe_total,
             datos, xml_path, origen,
+            email_comprador,
             doc_origen_emitido_id, doc_origen_recibido_id,
             es_sandbox, created_by,
             created_at, updated_at
@@ -970,6 +973,7 @@ async def _persistir(
             :clave, :numero_doc, :sec, :fecha,
             'FIRMADO', :total,
             CAST(:datos AS jsonb), :xml_path, :origen,
+            :email_comprador,
             :doc_origen_emitido_id, :doc_origen_recibido_id,
             :es_sandbox, :created_by,
             NOW(), NOW()
@@ -989,10 +993,11 @@ async def _persistir(
         "datos":                  json.dumps(datos_json, default=str),
         "xml_path":               xml_path,
         "origen":                 origen,
+        "email_comprador":        email_comprador or None,
         "doc_origen_emitido_id":  str(doc_origen_emitido.id) if doc_origen_emitido and getattr(doc_origen_emitido, "id", None) else None,
         "doc_origen_recibido_id": str(doc_origen_recibido.id) if doc_origen_recibido and getattr(doc_origen_recibido, "id", None) else None,
         "es_sandbox":             es_sandbox,
-        "created_by":               str(created_by) if created_by else None,
+        "created_by":             str(created_by) if created_by else None,
     })
     doc_id = str(res.scalar())
 
@@ -1017,7 +1022,6 @@ async def _persistir(
         print(f"[Usage/Queue] ⚠️ Error Redis: {e}")
 
     return doc_id
-
 
 # =============================================================================
 # HELPERS
