@@ -33,10 +33,12 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
         )
         row_existente = res_check.fetchone()
         if row_existente:
-            if lanzar_error_si_existe:
-                raise HTTPException(status_code=400, detail="EL CLIENTE YA EXISTE EN SU BASE DE DATOS.")
-            return {"ok": True, "mensaje": "CLIENTE YA EXISTÍA", "uid": str(row_existente.id)}
-
+            return {
+                "ok": True,
+                "code": "CLIENTE_EXISTE",
+                "mensaje": "CLIENTE YA EXISTÍA",
+                "uid": str(row_existente.id)
+            }
         razon_social_up = mayusculas(cliente.razon_social) or cliente.razon_social.strip().upper()
         direccion_up = cliente.direccion.strip().upper() if cliente.direccion and cliente.direccion.strip() else ""
         email_low    = cliente.email.strip().lower() if cliente.email and cliente.email.strip() else ""
@@ -44,13 +46,11 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
         tipo_sri        = cliente.tipo_identificacion_sri
         sujeto_global_id = None
 
-        # Validación y sujeto_global solo para cédula y RUC
         if tipo_sri in ["04", "05"]:
             es_valido, error_msg, tipo_detectado = validar_documento_ecuador(cliente.identificacion)
             if not es_valido:
                 raise HTTPException(status_code=400, detail=f"VALIDACIÓN SRI: {error_msg.upper()}")
             tipo_sri = tipo_detectado
-
             res_sg = await db.execute(text("""
                 INSERT INTO sujetos_global (tipo_identificacion_sri, identificacion, codigo_pais, razon_social)
                 VALUES (:tipo, :ident, 'EC', :razon)
@@ -60,9 +60,6 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
                 RETURNING id
             """), {"tipo": tipo_sri, "ident": cliente.identificacion, "razon": razon_social_up})
             sujeto_global_id = res_sg.scalar()
-
-        # Pasaporte (06) y Exterior (08) — sin validación de formato ni sujeto_global
-        # elif tipo_sri in ["06", "08"]: pass  ← no hace falta, sigue con sujeto_global_id=None
 
         res_v = await db.execute(text("""
             INSERT INTO clientes_emisor (
@@ -79,8 +76,12 @@ async def crear_cliente_core(emisor_id: int, cliente: ClienteCreate, db: AsyncSe
         uid = res_v.scalar()
         await db.commit()
         await _invalidar_clientes(emisor_id)
-        return {"ok": True, "mensaje": "CLIENTE CREADO EXITOSAMENTE.", "uid": str(uid)}
-
+        return {
+            "ok": True,
+            "code": "CLIENTE_CREADO",
+            "mensaje": "CLIENTE CREADO EXITOSAMENTE.",
+            "uid": str(uid)
+        }
     except HTTPException:
         await db.rollback()
         raise
