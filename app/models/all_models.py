@@ -117,7 +117,7 @@ class EmisorUsuario(Base):
 class Subscription(Base):
     """
     Suscripción activa del emisor.
-    plan:    NATURAL | JURIDICO
+    plan:    PROFESIONAL | EMPRESARIAL
     periodo: MENSUAL | ANUAL
     estado:  TRIAL | ACTIVO | CANCELADO | VENCIDO
     Un emisor tiene máximo una suscripción a la vez.
@@ -329,6 +329,7 @@ class CatalogoItem(Base):
     tipo_iva    = Column(String(10), default="15")
     unidad      = Column(String(20), default="UNIDAD")
     stock       = Column(Integer, default=-1)                       # -1=sin control
+    stock_minimo = Column(Integer, default=0, nullable=False)  # 0 = sin alerta
     activo      = Column(Boolean, default=True)
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at  = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())

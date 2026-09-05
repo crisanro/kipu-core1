@@ -1,5 +1,6 @@
 # app/api/v1/app/proformas.py
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
@@ -7,6 +8,12 @@ from app.core.permisos import verificar_permiso
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date
+
+from app.services.proforma_service import listar_proformas_core
+from app.services.proforma_service import crear_proforma_core
+from app.services.proforma_service import detalle_proforma_core
+from app.services.proforma_service import facturar_proforma_core
+from app.services.proforma_service import eliminar_proforma_core
 
 router = APIRouter()
 
@@ -37,7 +44,19 @@ async def crear_proforma(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "emitir")
-    from app.services.proforma_service import crear_proforma_core
+
+    # ── Validar suscripción activa ────────────────────────────────────────────
+    res_sub = await db.execute(text("""
+        SELECT s.estado FROM subscriptions s
+        WHERE s.emisor_id = :eid AND s.estado IN ('ACTIVO', 'TRIAL')
+        LIMIT 1
+    """), {"eid": auth_data["emisor_id"]})
+    if not res_sub.fetchone():
+        raise HTTPException(
+            status_code=402,
+            detail="LAS PROFORMAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA."
+        )
+
     return await crear_proforma_core(
         auth_data["emisor_id"],
         datos.model_dump(),
@@ -51,7 +70,6 @@ async def listar_proformas(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "emitir")
-    from app.services.proforma_service import listar_proformas_core
     return await listar_proformas_core(auth_data["emisor_id"], db)
 
 
@@ -62,7 +80,6 @@ async def detalle_proforma(
     db:          AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "emitir")
-    from app.services.proforma_service import detalle_proforma_core
     return await detalle_proforma_core(auth_data["emisor_id"], proforma_id, db)
 
 
@@ -74,7 +91,6 @@ async def facturar_proforma(
     db:          AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "emitir")
-    from app.services.proforma_service import facturar_proforma_core
     return await facturar_proforma_core(
         auth_data["emisor_id"],
         proforma_id,
@@ -90,5 +106,4 @@ async def eliminar_proforma(
     db:          AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "emitir")
-    from app.services.proforma_service import eliminar_proforma_core
     return await eliminar_proforma_core(auth_data["emisor_id"], proforma_id, db)

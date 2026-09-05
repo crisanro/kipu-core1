@@ -99,9 +99,9 @@ async def cambiar_empresa(
     profile_id = auth_data.get("profile_id")
     if not profile_id:
         raise HTTPException(status_code=400, detail="Perfil no encontrado.")
-
     res = await db.execute(text("""
         SELECT eu.rol, eu.permisos, e.ruc, e.razon_social, e.ambiente, e.tipo_emisor,
+               e.p12_path,
                COALESCE(uc.balance, 0) AS balance_api,
                s.estado AS sub_estado, s.plan AS sub_plan
         FROM emisor_usuarios eu
@@ -114,6 +114,11 @@ async def cambiar_empresa(
     if not row:
         raise HTTPException(status_code=403, detail="No tienes acceso a esa empresa.")
 
+    # Invalidar cache de la empresa destino para forzar datos frescos
+    from app.core.cache import cache_clear_prefix
+    await cache_clear_prefix(f"dashboard:{data.emisor_id}:")
+    await cache_clear_prefix(f"dashboard_header:{data.emisor_id}")
+
     return {
         "ok":      True,
         "mensaje": "Empresa cambiada exitosamente.",
@@ -125,6 +130,7 @@ async def cambiar_empresa(
             "tipo_emisor":        row.tipo_emisor,
             "rol":                row.rol,
             "permisos":           row.permisos or {},
+            "firma_ok":           bool(row.p12_path),  # ← añadido
             "balance_api":        row.balance_api,
             "suscripcion_activa": row.sub_estado in ("ACTIVO", "TRIAL"),
             "suscripcion": {
@@ -337,7 +343,7 @@ async def actualizar_permisos_usuario(
 
     await db.execute(text("""
         UPDATE emisor_usuarios
-        SET permisos = :permisos, updated_at = NOW()
+        SET permisos = :permisos
         WHERE profile_id = :pid AND emisor_id = :eid
     """), {
         "permisos": json.dumps(data.permisos),

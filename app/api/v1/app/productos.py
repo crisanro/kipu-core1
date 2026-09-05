@@ -27,21 +27,23 @@ async def invalidar_cache_productos(emisor_id: int):
     await cache_clear_prefix(f"productos:{emisor_id}:")
 
 class ProductoCreate(BaseModel):
-    codigo:      Optional[str] = None
-    descripcion: str           = Field(..., min_length=2, max_length=300)
-    precio:      Decimal       = Field(..., ge=0)
-    tipo_iva:    str           = Field(default="15")
-    unidad:      str           = Field(default="UNIDAD")
-    stock:       int           = Field(default=-1)
+    codigo:       Optional[str] = None
+    descripcion:  str           = Field(..., min_length=2, max_length=300)
+    precio:       Decimal       = Field(..., ge=0)
+    tipo_iva:     str           = Field(default="15")
+    unidad:       str           = Field(default="UNIDAD")
+    stock:        int           = Field(default=-1)
+    stock_minimo: int           = Field(default=0, ge=0)
 
 class ProductoUpdate(BaseModel):
-    codigo:      Optional[str]     = None
-    descripcion: Optional[str]     = None
-    precio:      Optional[Decimal] = None
-    tipo_iva:    Optional[str]     = None
-    unidad:      Optional[str]     = None
-    activo:      Optional[bool]    = None
-    stock:       Optional[int]     = None
+    codigo:       Optional[str]     = None
+    descripcion:  Optional[str]     = None
+    precio:       Optional[Decimal] = None
+    tipo_iva:     Optional[str]     = None
+    unidad:       Optional[str]     = None
+    activo:       Optional[bool]    = None
+    stock:        Optional[int]     = None
+    stock_minimo: Optional[int]     = None
 
 class StockAjuste(BaseModel):
     cantidad: int = Field(..., description="Positivo=entrada, Negativo=salida")
@@ -67,7 +69,7 @@ async def listar_productos(
 
     filtro = "" if incluir_inactivos else "AND activo = true"
     res = await db.execute(text(f"""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, activo, created_at
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, activo, created_at
         FROM catalogo_items
         WHERE emisor_id = :eid {filtro}
         ORDER BY descripcion ASC
@@ -75,14 +77,15 @@ async def listar_productos(
     rows = res.fetchall()
     data = [
         {
-            "id":          str(r.id),
-            "codigo":      r.codigo or "",
-            "descripcion": r.descripcion,
-            "precio":      float(r.precio),
-            "tipo_iva":    r.tipo_iva,
-            "unidad":      r.unidad,
-            "stock":       r.stock,
-            "activo":      r.activo,
+            "id":           str(r.id),
+            "codigo":       r.codigo or "",
+            "descripcion":  r.descripcion,
+            "precio":       float(r.precio),
+            "tipo_iva":     r.tipo_iva,
+            "unidad":       r.unidad,
+            "stock":        r.stock,
+            "stock_minimo": r.stock_minimo,
+            "activo":       r.activo,
         }
         for r in rows
     ]
@@ -108,7 +111,7 @@ async def buscar_productos(
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo
         FROM catalogo_items
         WHERE emisor_id = :eid AND activo = true
           AND (LOWER(descripcion) LIKE LOWER(:q) OR LOWER(codigo) LIKE LOWER(:q))
@@ -118,13 +121,14 @@ async def buscar_productos(
     rows = res.fetchall()
     data = [
         {
-            "id":          str(r.id),
-            "codigo":      r.codigo or "",
-            "descripcion": r.descripcion,
-            "precio":      float(r.precio),
-            "tipo_iva":    r.tipo_iva,
-            "unidad":      r.unidad,
-            "stock":       r.stock,
+            "id":           str(r.id),
+            "codigo":       r.codigo or "",
+            "descripcion":  r.descripcion,
+            "precio":       float(r.precio),
+            "tipo_iva":     r.tipo_iva,
+            "unidad":       r.unidad,
+            "stock":        r.stock,
+            "stock_minimo": r.stock_minimo,
         }
         for r in rows
     ]
@@ -149,7 +153,7 @@ async def obtener_producto(
         return {"ok": True, "data": cached, "source": "cache"}
 
     res = await db.execute(text("""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, activo, created_at, updated_at
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, activo, created_at, updated_at
         FROM catalogo_items WHERE id = :id AND emisor_id = :eid
     """), {"id": producto_id, "eid": emisor_id})
     row = res.fetchone()
@@ -157,16 +161,17 @@ async def obtener_producto(
         raise HTTPException(status_code=404, detail="Producto no encontrado.")
 
     data = {
-        "id":          str(row.id),
-        "codigo":      row.codigo or "",
-        "descripcion": row.descripcion,
-        "precio":      float(row.precio),
-        "tipo_iva":    row.tipo_iva,
-        "unidad":      row.unidad,
-        "stock":       row.stock,
-        "activo":      row.activo,
-        "created_at":  str(row.created_at),
-        "updated_at":  str(row.updated_at),
+        "id":           str(row.id),
+        "codigo":       row.codigo or "",
+        "descripcion":  row.descripcion,
+        "precio":       float(row.precio),
+        "tipo_iva":     row.tipo_iva,
+        "unidad":       row.unidad,
+        "stock":        row.stock,
+        "stock_minimo": row.stock_minimo,
+        "activo":       row.activo,
+        "created_at":   str(row.created_at),
+        "updated_at":   str(row.updated_at),
     }
     await cache_set(cache_key, data, TTL_DETALLE)
     return {"ok": True, "data": data, "source": "db"}
@@ -187,33 +192,35 @@ async def crear_producto(
 
     try:
         res = await db.execute(text("""
-            INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad, stock)
-            VALUES (:eid, :codigo, :desc, :precio, :iva, :unidad, :stock)
-            RETURNING id, descripcion, precio, tipo_iva, unidad, stock, created_at
+            INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo)
+            VALUES (:eid, :codigo, :desc, :precio, :iva, :unidad, :stock, :stock_minimo)
+            RETURNING id, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, created_at
         """), {
-            "eid":    emisor_id,
-            "codigo": data.codigo,
-            "desc":   data.descripcion,
-            "precio": data.precio,
-            "iva":    data.tipo_iva,
-            "unidad": data.unidad,
-            "stock":  data.stock,
+            "eid":          emisor_id,
+            "codigo":       data.codigo,
+            "desc":         data.descripcion,
+            "precio":       data.precio,
+            "iva":          data.tipo_iva,
+            "unidad":       data.unidad,
+            "stock":        data.stock,
+            "stock_minimo": data.stock_minimo,
         })
         row = res.fetchone()
 
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "CREATE",
-            entidad   = "producto",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "CREATE",
+            entidad    = "producto",
             entidad_id = str(row.id),
-            detalle   = {
-                "descripcion": data.descripcion,
-                "precio":      float(data.precio),
-                "tipo_iva":    data.tipo_iva,
-                "codigo":      data.codigo,
+            detalle    = {
+                "descripcion":  data.descripcion,
+                "precio":       float(data.precio),
+                "tipo_iva":     data.tipo_iva,
+                "codigo":       data.codigo,
+                "stock_minimo": data.stock_minimo,
             },
-            request   = request,
+            request    = request,
         )
         await db.commit()
     except HTTPException:
@@ -229,13 +236,14 @@ async def crear_producto(
         "ok":      True,
         "mensaje": "Producto creado exitosamente.",
         "data": {
-            "id":          str(row.id),
-            "descripcion": row.descripcion,
-            "precio":      float(row.precio),
-            "tipo_iva":    row.tipo_iva,
-            "unidad":      row.unidad,
-            "stock":       row.stock,
-            "created_at":  str(row.created_at),
+            "id":           str(row.id),
+            "descripcion":  row.descripcion,
+            "precio":       float(row.precio),
+            "tipo_iva":     row.tipo_iva,
+            "unidad":       row.unidad,
+            "stock":        row.stock,
+            "stock_minimo": row.stock_minimo,
+            "created_at":   str(row.created_at),
         }
     }
 
@@ -262,13 +270,14 @@ async def actualizar_producto(
 
     campos = []
     params = {"id": producto_id, "eid": emisor_id}
-    if data.codigo      is not None: campos.append("codigo = :codigo");      params["codigo"]  = data.codigo
-    if data.descripcion is not None: campos.append("descripcion = :desc");   params["desc"]    = data.descripcion
-    if data.precio      is not None: campos.append("precio = :precio");      params["precio"]  = data.precio
-    if data.tipo_iva    is not None: campos.append("tipo_iva = :iva");       params["iva"]     = data.tipo_iva
-    if data.unidad      is not None: campos.append("unidad = :unidad");      params["unidad"]  = data.unidad
-    if data.activo      is not None: campos.append("activo = :activo");      params["activo"]  = data.activo
-    if data.stock       is not None: campos.append("stock = :stock");        params["stock"]   = data.stock
+    if data.codigo       is not None: campos.append("codigo = :codigo");       params["codigo"]       = data.codigo
+    if data.descripcion is not None: campos.append("descripcion = :desc");   params["desc"]         = data.descripcion
+    if data.precio       is not None: campos.append("precio = :precio");       params["precio"]       = data.precio
+    if data.tipo_iva     is not None: campos.append("tipo_iva = :iva");        params["iva"]          = data.tipo_iva
+    if data.unidad       is not None: campos.append("unidad = :unidad");       params["unidad"]       = data.unidad
+    if data.activo       is not None: campos.append("activo = :activo");       params["activo"]       = data.activo
+    if data.stock        is not None: campos.append("stock = :stock");         params["stock"]        = data.stock
+    if data.stock_minimo is not None: campos.append("stock_minimo = :stock_minimo"); params["stock_minimo"] = data.stock_minimo
 
     if not campos:
         raise HTTPException(status_code=400, detail="No hay campos para actualizar.")
@@ -282,13 +291,13 @@ async def actualizar_producto(
         """), params)
 
         await audit_log(
-            db        = db,
-            auth_data = auth_data,
-            accion    = "UPDATE",
-            entidad   = "producto",
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "UPDATE",
+            entidad    = "producto",
             entidad_id = producto_id,
-            detalle   = data.model_dump(exclude_none=True),
-            request   = request,
+            detalle    = data.model_dump(exclude_none=True),
+            request    = request,
         )
         await db.commit()
     except HTTPException:
@@ -323,18 +332,18 @@ async def ajustar_stock(
         raise HTTPException(status_code=404, detail="Producto no encontrado o no maneja stock.")
 
     await audit_log(
-        db        = db,
-        auth_data = auth_data,
-        accion    = "UPDATE",
-        entidad   = "producto",
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "UPDATE",
+        entidad    = "producto",
         entidad_id = producto_id,
-        detalle   = {
-            "accion":     "ajuste_stock",
-            "cantidad":   data.cantidad,
-            "motivo":     data.motivo,
+        detalle    = {
+            "accion":      "ajuste_stock",
+            "cantidad":    data.cantidad,
+            "motivo":      data.motivo,
             "stock_nuevo": row.stock,
         },
-        request   = request,
+        request    = request,
     )
     await db.commit()
     await invalidar_cache_productos(emisor_id)
@@ -365,13 +374,13 @@ async def desactivar_producto(
     """), {"id": producto_id, "eid": emisor_id})
 
     await audit_log(
-        db        = db,
-        auth_data = auth_data,
-        accion    = "DELETE",
-        entidad   = "producto",
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "DELETE",
+        entidad    = "producto",
         entidad_id = producto_id,
-        detalle   = {"descripcion": producto.descripcion},
-        request   = request,
+        detalle    = {"descripcion": producto.descripcion},
+        request    = request,
     )
     await db.commit()
     await invalidar_cache_productos(emisor_id)

@@ -1378,6 +1378,12 @@ async def casilleros_ats(
         return {"ok": True, "demo": True, "cached": False, "en_curso": False,
                 "total_doc_emitidos": 0, "total_doc_recibidos": 0,
                 "data": _datos_demo_ats()}
+
+    if not await _verificar_plan_empresarial(emisor_id, db):
+        return {"ok": True, "demo": True, "plan_requerido": "EMPRESARIAL",
+                "cached": False, "en_curso": False,
+                "total_doc_emitidos": 0, "total_doc_recibidos": 0,
+                "data": _datos_demo_ats()}
     
     # ── Verificar cache ────────────────────────────────────────────────────
     if not es_mes_actual and not regenerar:
@@ -1801,10 +1807,10 @@ async def generar_ats_xml(
 
     # ── Verificar suscripción ──────────────────────────────────────────────
     if not await _verificar_suscripcion(emisor_id, db):
-        raise HTTPException(
-            status_code=402,
-            detail="Se requiere suscripción activa para generar el ATS."
-        )
+        raise HTTPException(status_code=402, detail="Se requiere suscripción activa para generar el ATS.")
+
+    if not await _verificar_plan_empresarial(emisor_id, db):
+        raise HTTPException(status_code=403, detail="El ATS requiere el plan Empresarial.")
 
     # ── Compras del período (usa columnas desnormalizadas e items_detalle) ──
     res_compras = await db.execute(text("""
@@ -2101,34 +2107,30 @@ async def descargar_ats(
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "declaraciones")
 
+    if not await _verificar_plan_empresarial(emisor_id, db):
+        raise HTTPException(status_code=403, detail="El ATS requiere el plan Empresarial.")
+
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
     except Exception:
         raise HTTPException(status_code=400, detail="Formato inválido.")
-
     fi = date(año, mes, 1)
-
     res = await db.execute(text("""
         SELECT resumen FROM reportes_tributarios
         WHERE emisor_id = :eid AND tipo = 'ATS' AND periodo = :periodo
     """), {"eid": emisor_id, "periodo": fi})
     row = res.fetchone()
-
     if not row or not row.resumen or not row.resumen.get("xml_path"):
         raise HTTPException(
             status_code=404,
             detail="ATS no generado aún. Genera el archivo primero."
         )
-
     url = get_presigned_url(row.resumen["xml_path"])
-
     return {
         "ok":           True,
         "download_url": url,
         "nombre_zip":   row.resumen.get("nombre_zip"),
     }
-
-
 
 
 # =============================================================================
@@ -2307,3 +2309,11 @@ def _datos_demo_ats() -> dict:
         },
         "notas": ["⚠️ Estos son datos de ejemplo — suscríbete para ver tus datos reales."],
     }
+
+
+async def _verificar_plan_empresarial(emisor_id: int, db: AsyncSession) -> bool:
+    res = await db.execute(text("""
+        SELECT plan, estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    sub = res.fetchone()
+    return sub is not None and sub.estado in ("ACTIVO", "TRIAL") and sub.plan == "EMPRESARIAL"

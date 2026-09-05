@@ -249,7 +249,7 @@ async def forzar_suscripcion(
     """Para casos de soporte — activar trial, cancelar, etc."""
     emisor_id = data.get("emisor_id")
     estado    = data.get("estado")  # ACTIVO | TRIAL | CANCELADO | VENCIDO
-    plan      = data.get("plan", "NATURAL")
+    plan      = data.get("plan", "PROFESIONAL")
     periodo   = data.get("periodo", "MENSUAL")
 
     if not emisor_id or not estado:

@@ -1,5 +1,6 @@
 # app/api/v1/app/cuentas.py
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
@@ -7,6 +8,13 @@ from app.core.permisos import verificar_permiso
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date
+
+from app.services.cuentas_service import anular_cuenta_core
+from app.services.cuentas_service import crear_cuenta_core
+from app.services.cuentas_service import listar_cuentas_core
+from app.services.cuentas_service import listar_cuentas_cliente_core
+from app.services.cuentas_service import detalle_cuenta_core
+from app.services.cuentas_service import registrar_abono_core
 
 router = APIRouter()
 
@@ -38,7 +46,13 @@ async def crear_cuenta(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import crear_cuenta_core
+    # ── Validar suscripción ───────────────────────────────────────────────────
+    res_sub = await db.execute(text("""
+        SELECT estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": auth_data["emisor_id"]})
+    sub = res_sub.fetchone()
+    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
+        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
     return await crear_cuenta_core(auth_data["emisor_id"], datos.model_dump(), db)
 
 
@@ -50,7 +64,6 @@ async def listar_cuentas(
     db:        AsyncSession  = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import listar_cuentas_core
     return await listar_cuentas_core(auth_data["emisor_id"], tipo, estado, db)
 
 
@@ -61,7 +74,6 @@ async def cuentas_por_cliente(
     db:         AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import listar_cuentas_cliente_core
     return await listar_cuentas_cliente_core(auth_data["emisor_id"], cliente_id, db)
 
 
@@ -72,7 +84,6 @@ async def detalle_cuenta(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import detalle_cuenta_core
     return await detalle_cuenta_core(auth_data["emisor_id"], cuenta_id, db)
 
 
@@ -84,7 +95,13 @@ async def registrar_abono(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import registrar_abono_core
+    # ── Validar suscripción ───────────────────────────────────────────────────
+    res_sub = await db.execute(text("""
+        SELECT estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": auth_data["emisor_id"]})
+    sub = res_sub.fetchone()
+    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
+        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
     return await registrar_abono_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
 
 
@@ -95,5 +112,11 @@ async def anular_cuenta(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    from app.services.cuentas_service import anular_cuenta_core
+    # ── Validar suscripción ───────────────────────────────────────────────────
+    res_sub = await db.execute(text("""
+        SELECT estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": auth_data["emisor_id"]})
+    sub = res_sub.fetchone()
+    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
+        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
     return await anular_cuenta_core(auth_data["emisor_id"], cuenta_id, db)

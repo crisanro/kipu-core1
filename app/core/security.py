@@ -1,6 +1,6 @@
 import hashlib
 from fastapi import Header, HTTPException, Depends, Request, status
-from sqlalchemy import text
+from sqlalchemy import text, String, Integer, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.config import settings
@@ -66,19 +66,39 @@ async def verify_firebase_token(
             raise HTTPException(status_code=401, detail="La sesión ha expirado")
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    query = text("""
-        SELECT p.id, p.email, p.role,
-               eu.emisor_id, eu.rol as emisor_rol,
-               eu.permisos
-        FROM profiles p
-        LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
-        WHERE p.firebase_uid = :uid
-        ORDER BY eu.created_at ASC
-        LIMIT 1
-    """)
-    result = await db.execute(query, {"uid": decoded_token["uid"]})
-    profile = result.fetchone()
+    # Leer emisor_id del header si viene
+    emisor_id_header = request.headers.get("X-Emisor-ID")
+    emisor_id_int    = int(emisor_id_header) if emisor_id_header else None
 
+    # Si hay emisor_id, filtrar por él; si no, traer el primero
+    if emisor_id_int:
+        query = text("""
+            SELECT p.id, p.email, p.role,
+                   eu.emisor_id, eu.rol as emisor_rol, eu.permisos
+            FROM profiles p
+            LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+            WHERE p.firebase_uid = :uid
+              AND eu.emisor_id = :emisor_id
+            ORDER BY eu.created_at ASC
+            LIMIT 1
+        """)
+        result = await db.execute(query, {
+            "uid":       decoded_token["uid"],
+            "emisor_id": emisor_id_int,
+        })
+    else:
+        query = text("""
+            SELECT p.id, p.email, p.role,
+                   eu.emisor_id, eu.rol as emisor_rol, eu.permisos
+            FROM profiles p
+            LEFT JOIN emisor_usuarios eu ON eu.profile_id = p.id
+            WHERE p.firebase_uid = :uid
+            ORDER BY eu.created_at ASC
+            LIMIT 1
+        """)
+        result = await db.execute(query, {"uid": decoded_token["uid"]})
+
+    profile = result.fetchone()
     if not profile:
         return {
             "uid":               decoded_token["uid"],
@@ -86,7 +106,6 @@ async def verify_firebase_token(
             "email_verified":    decoded_token.get("email_verified", False),
             "pending_provision": True
         }
-
     return {
         "uid":            decoded_token["uid"],
         "profile_id":     profile.id,
@@ -97,6 +116,7 @@ async def verify_firebase_token(
         "emisor_rol":     profile.emisor_rol,
         "permisos":       profile.permisos or {},
     }
+
 
 # ─── 3. PUBLIC AUTH (Sitio Web Kipu) ──────────────────────────────────────────
 async def verify_public_origin(request: Request):

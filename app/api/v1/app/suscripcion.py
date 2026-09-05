@@ -17,8 +17,8 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter()
 
 STRIPE_PRICES = {
-    "NATURAL":  {"MENSUAL": settings.STRIPE_PRICE_NATURAL_MENSUAL,  "ANUAL": settings.STRIPE_PRICE_NATURAL_ANUAL},
-    "JURIDICO": {"MENSUAL": settings.STRIPE_PRICE_JURIDICO_MENSUAL, "ANUAL": settings.STRIPE_PRICE_JURIDICO_ANUAL},
+    "PROFESIONAL":  {"MENSUAL": settings.STRIPE_PRICE_PROFESIONAL_MENSUAL,  "ANUAL": settings.STRIPE_PRICE_PROFESIONAL_ANUAL},
+    "EMPRESARIAL": {"MENSUAL": settings.STRIPE_PRICE_EMPRESARIAL_MENSUAL, "ANUAL": settings.STRIPE_PRICE_EMPRESARIAL_ANUAL},
 }
 
 class CheckoutSuscripcionRequest(BaseModel):
@@ -83,8 +83,8 @@ async def crear_checkout_suscripcion(
 
     plan    = data.plan.upper()
     periodo = data.periodo.upper()
-    if plan not in ("NATURAL", "JURIDICO"):
-        raise HTTPException(status_code=400, detail="Plan inválido. Usa NATURAL o JURIDICO.")
+    if plan not in ("PROFESIONAL", "EMPRESARIAL"):
+        raise HTTPException(status_code=400, detail="Plan inválido. Usa PROFESIONAL o EMPRESARIAL.")
     if periodo not in ("MENSUAL", "ANUAL"):
         raise HTTPException(status_code=400, detail="Período inválido. Usa MENSUAL o ANUAL.")
 

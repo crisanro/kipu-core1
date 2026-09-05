@@ -36,6 +36,8 @@ from app.utils.sri_core import (
 )
 from app.services.storage_service import upload_file
 from app.core.cache import get_redis
+from app.services.notification_service import crear_notificacion
+
 
 TZ_EC = pytz.timezone("America/Guayaquil")
 
@@ -1066,22 +1068,43 @@ def _adaptar_detalles_nc(detalles_xml: list) -> list:
         resultado.append(det_nc)
     return resultado
 
-
 async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
     try:
         detalles = datos_json.get("detalles", {}).get("detalle", [])
         if not isinstance(detalles, list):
             detalles = [detalles]
+
         for det in detalles:
-            codigo   = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
+            codigo  = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
             if not codigo or codigo == "S/C":
                 continue
             cantidad = float(det.get("cantidad", 0))
-            await db.execute(text("""
+
+            res = await db.execute(text("""
                 UPDATE catalogo_items
                 SET stock = GREATEST(0, stock - :qty), updated_at = NOW()
                 WHERE emisor_id = :eid AND stock > 0 AND codigo = :cod
+                RETURNING id, descripcion, stock, stock_minimo
             """), {"qty": int(cantidad), "eid": emisor_id, "cod": codigo})
+            item = res.fetchone()
+
+            if not item:
+                continue
+
+            # Notificar stock bajo
+            if item.stock_minimo > 0 and item.stock <= item.stock_minimo:
+                try:
+                    await crear_notificacion(
+                        db        = db,
+                        emisor_id = emisor_id,
+                        tipo      = "SISTEMA",
+                        titulo    = f"⚠️ Stock bajo: {item.descripcion}",
+                        mensaje   = f"Quedan {item.stock} unidades. Stock mínimo configurado: {item.stock_minimo}.",
+                        referencia = f"/productos/{str(item.id)}",
+                    )
+                except Exception as e:
+                    print(f"[Stock] ⚠️ Error notificando stock bajo: {e}")
+
     except Exception as e:
         print(f"[Stock] ⚠️ Error descontando stock: {e}")
 

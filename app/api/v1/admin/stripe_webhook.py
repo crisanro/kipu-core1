@@ -281,7 +281,7 @@ async def _handle_invoice_payment_failed(invoice: dict, db: AsyncSession):
 # =============================================================================
 async def _activar_suscripcion(session: dict, emisor_id: int, metadata: dict, db: AsyncSession):
     stripe_sub_id = session.get("subscription")
-    plan          = metadata.get("plan", "NATURAL")
+    plan          = metadata.get("plan", "PROFESIONAL")
     periodo       = metadata.get("periodo", "MENSUAL")
 
     if not stripe_sub_id:
