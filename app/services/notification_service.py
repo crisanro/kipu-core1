@@ -106,7 +106,7 @@ async def _enviar_push(
                     },
                 )
                 if res.status_code == 200:
-                    print(f"[FCM] ✅ Push enviado")
+                    pass #print(f"[FCM] ✅ Push enviado")
                 else:
                     try:
                         error_body = res.json()
