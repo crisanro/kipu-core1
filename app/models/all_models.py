@@ -117,8 +117,8 @@ class EmisorUsuario(Base):
 class Subscription(Base):
     """
     Suscripción activa del emisor.
-    plan:    PROFESIONAL | EMPRESARIAL
-    periodo: MENSUAL | ANUAL
+    plan:    PRO
+    periodo: ANUAL
     estado:  TRIAL | ACTIVO | CANCELADO | VENCIDO
     Un emisor tiene máximo una suscripción a la vez.
     """

@@ -148,13 +148,9 @@ async def onboarding(
             {"eid": new_emisor_id, "pid": str(profile_id)}
         )
         await db.execute(
-            text("INSERT INTO user_credits (emisor_id, balance) VALUES (:eid, 10)"),
+            text("INSERT INTO user_credits (emisor_id, balance) VALUES (:eid, 0)"),
             {"eid": new_emisor_id}
         )
-        await db.execute(text("""
-            INSERT INTO credit_transactions (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
-            VALUES (:eid, 'BONO', 10, 0.00, 'SISTEMA', 'REGALO POR APERTURA DE CUENTA')
-        """), {"eid": new_emisor_id})
         await db.commit()
 
         try:
