@@ -112,8 +112,21 @@ async def registrar_documento_recibido(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
-
+    if emisor_id == auth_data["emisor_id"]:
+        verificar_permiso(auth_data, "documentos")
+    else:
+        # Empresa distinta via extensión — verificar rol directamente en DB
+        profile_id = auth_data.get("profile_id")
+        res_rol = await db.execute(text("""
+            SELECT rol FROM emisor_usuarios
+            WHERE emisor_id = :eid AND profile_id = :pid
+        """), {"eid": emisor_id, "pid": str(profile_id)})
+        rol_row = res_rol.fetchone()
+        if not rol_row:
+            raise HTTPException(status_code=403, detail="Sin acceso a esta empresa.")
+        # Admin siempre puede, otros necesitan permiso documentos_recibidos
+        if rol_row.rol != "admin":
+            raise HTTPException(status_code=403, detail="Se requiere rol admin para importar desde la extensión.")
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
