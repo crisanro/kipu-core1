@@ -5,20 +5,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional
 from datetime import date
-
-from app.services.cuentas_service import anular_cuenta_core
-from app.services.cuentas_service import crear_cuenta_core
-from app.services.cuentas_service import listar_cuentas_core
-from app.services.cuentas_service import listar_cuentas_cliente_core
-from app.services.cuentas_service import detalle_cuenta_core
-from app.services.cuentas_service import registrar_abono_core
+from app.services.cuentas_service import (
+    anular_cuenta_core,
+    crear_cuenta_core,
+    listar_cuentas_core,
+    listar_cuentas_cliente_core,
+    detalle_cuenta_core,
+    registrar_abono_core,
+    registrar_ajuste_core,
+)
 
 router = APIRouter()
 
-# ── Schemas inline (simples, no ameritan archivo separado) ─────────────────────
+# ── Schemas ────────────────────────────────────────────────────────────────────
 class CuentaCreate(BaseModel):
     cliente_id:            str
     tipo:                  str                    # COBRAR | PAGAR
@@ -36,9 +38,21 @@ class AbonoCreate(BaseModel):
     forma_pago: Optional[str]  = None   # EFECTIVO | TRANSFERENCIA | CHEQUE | TARJETA | OTRO
     notas:      Optional[str]  = None
 
+class AjusteCreate(BaseModel):
+    monto:  float
+    motivo: Optional[str] = None   # Ej: "Intereses mes de enero", "Cargo adicional"
+    fecha:  Optional[date] = None
+
+# ── Helper suscripción ─────────────────────────────────────────────────────────
+async def _verificar_suscripcion(emisor_id: int, db: AsyncSession):
+    res = await db.execute(text("""
+        SELECT estado FROM subscriptions WHERE emisor_id = :eid
+    """), {"eid": emisor_id})
+    sub = res.fetchone()
+    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
+        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
-
 @router.post("")
 async def crear_cuenta(
     datos:     CuentaCreate,
@@ -46,15 +60,8 @@ async def crear_cuenta(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    # ── Validar suscripción ───────────────────────────────────────────────────
-    res_sub = await db.execute(text("""
-        SELECT estado FROM subscriptions WHERE emisor_id = :eid
-    """), {"eid": auth_data["emisor_id"]})
-    sub = res_sub.fetchone()
-    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
-        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
+    await _verificar_suscripcion(auth_data["emisor_id"], db)
     return await crear_cuenta_core(auth_data["emisor_id"], datos.model_dump(), db)
-
 
 @router.get("")
 async def listar_cuentas(
@@ -66,7 +73,6 @@ async def listar_cuentas(
     verificar_permiso(auth_data, "clientes")
     return await listar_cuentas_core(auth_data["emisor_id"], tipo, estado, db)
 
-
 @router.get("/cliente/{cliente_id}")
 async def cuentas_por_cliente(
     cliente_id: str,
@@ -75,7 +81,6 @@ async def cuentas_por_cliente(
 ):
     verificar_permiso(auth_data, "clientes")
     return await listar_cuentas_cliente_core(auth_data["emisor_id"], cliente_id, db)
-
 
 @router.get("/{cuenta_id}")
 async def detalle_cuenta(
@@ -86,7 +91,6 @@ async def detalle_cuenta(
     verificar_permiso(auth_data, "clientes")
     return await detalle_cuenta_core(auth_data["emisor_id"], cuenta_id, db)
 
-
 @router.post("/{cuenta_id}/abonos")
 async def registrar_abono(
     cuenta_id: str,
@@ -95,15 +99,23 @@ async def registrar_abono(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    # ── Validar suscripción ───────────────────────────────────────────────────
-    res_sub = await db.execute(text("""
-        SELECT estado FROM subscriptions WHERE emisor_id = :eid
-    """), {"eid": auth_data["emisor_id"]})
-    sub = res_sub.fetchone()
-    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
-        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
+    await _verificar_suscripcion(auth_data["emisor_id"], db)
     return await registrar_abono_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
 
+@router.post("/{cuenta_id}/ajustes")
+async def registrar_ajuste(
+    cuenta_id: str,
+    datos:     AjusteCreate,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """
+    Registra un ajuste que incrementa el monto total de la cuenta.
+    Casos de uso: intereses, cargos adicionales, préstamo extra encima del saldo.
+    """
+    verificar_permiso(auth_data, "clientes")
+    await _verificar_suscripcion(auth_data["emisor_id"], db)
+    return await registrar_ajuste_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
 
 @router.patch("/{cuenta_id}/anular")
 async def anular_cuenta(
@@ -112,11 +124,5 @@ async def anular_cuenta(
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
-    # ── Validar suscripción ───────────────────────────────────────────────────
-    res_sub = await db.execute(text("""
-        SELECT estado FROM subscriptions WHERE emisor_id = :eid
-    """), {"eid": auth_data["emisor_id"]})
-    sub = res_sub.fetchone()
-    if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
-        raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
+    await _verificar_suscripcion(auth_data["emisor_id"], db)
     return await anular_cuenta_core(auth_data["emisor_id"], cuenta_id, db)

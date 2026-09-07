@@ -633,21 +633,15 @@ class CuentaMovimiento(Base):
 
 
 class CuentaAbono(Base):
-    """
-    Abonos/pagos parciales o totales a una cuenta.
-    Al registrar un abono el service recalcula monto_pagado y estado en CuentaMovimiento.
-    """
     __tablename__ = "cuentas_abonos"
-
     id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     cuenta_id   = Column(UUID(as_uuid=True), ForeignKey("cuentas_movimientos.id", ondelete="CASCADE"), nullable=False)
     monto       = Column(Numeric(12, 2), nullable=False)
     fecha       = Column(Date, nullable=False, server_default=func.current_date())
-    forma_pago  = Column(String(30), nullable=True)   # EFECTIVO | TRANSFERENCIA | CHEQUE | TARJETA | OTRO
+    forma_pago  = Column(String(30), nullable=True)
     notas       = Column(Text, nullable=True)
+    tipo        = Column(String(10), nullable=False, server_default="ABONO")  # ← agregar esta línea
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
-
-    # Relaciones
     cuenta      = relationship("CuentaMovimiento", back_populates="abonos")
 
 
