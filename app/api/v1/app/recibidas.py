@@ -397,7 +397,7 @@ async def registrar_desde_xml(
             emisor_id = emisor_id_token
     else:
         emisor_id = emisor_id_token
-
+        print(f"[XML] emisor_id_header={request.headers.get('X-Emisor-ID')} emisor_id_token={auth_data['emisor_id']} emisor_id_usado={emisor_id}")
     verificar_permiso(auth_data, "documentos")
 
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
