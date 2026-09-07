@@ -1374,12 +1374,13 @@ async def casilleros_ats(
         raise HTTPException(status_code=404, detail="Emisor no encontrado.")
 
     # ── Verificar suscripción ──────────────────────────────────────────────
-    if not await _verificar_suscripcion(emisor_id, db):
-        return {"ok": True, "demo": True, "cached": False, "en_curso": False,
+    if not await _verificar_obligado_contabilidad(emisor_id, db):
+        return {"ok": True, "demo": True, "motivo": "no_obligado",
+                "cached": False, "en_curso": False,
                 "total_doc_emitidos": 0, "total_doc_recibidos": 0,
                 "data": _datos_demo_ats()}
 
-    if not await _verificar_plan_empresarial(emisor_id, db):
+    if not await _verificar_obligado_contabilidad(emisor_id, db):
         return {"ok": True, "demo": True, "plan_requerido": "EMPRESARIAL",
                 "cached": False, "en_curso": False,
                 "total_doc_emitidos": 0, "total_doc_recibidos": 0,
@@ -1809,8 +1810,8 @@ async def generar_ats_xml(
     if not await _verificar_suscripcion(emisor_id, db):
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa para generar el ATS.")
 
-    if not await _verificar_plan_empresarial(emisor_id, db):
-        raise HTTPException(status_code=403, detail="El ATS requiere el plan Empresarial.")
+    if not await _verificar_obligado_contabilidad(emisor_id, db):
+        raise HTTPException(status_code=403, detail="El ATS es solo para contribuyentes obligados a llevar contabilidad.")
 
     # ── Compras del período (usa columnas desnormalizadas e items_detalle) ──
     res_compras = await db.execute(text("""
@@ -2107,8 +2108,10 @@ async def descargar_ats(
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "declaraciones")
 
-    if not await _verificar_plan_empresarial(emisor_id, db):
-        raise HTTPException(status_code=403, detail="El ATS requiere el plan Empresarial.")
+    if not await _verificar_suscripcion(emisor_id, db):
+        raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
+    if not await _verificar_obligado_contabilidad(emisor_id, db):
+        raise HTTPException(status_code=403, detail="El ATS es solo para contribuyentes obligados a llevar contabilidad.")
 
     try:
         año, mes = int(periodo.split("-")[0]), int(periodo.split("-")[1])
@@ -2311,9 +2314,16 @@ def _datos_demo_ats() -> dict:
     }
 
 
-async def _verificar_plan_empresarial(emisor_id: int, db: AsyncSession) -> bool:
+async def _verificar_obligado_contabilidad(emisor_id: int, db: AsyncSession) -> bool:
+    """ATS solo para obligados a llevar contabilidad con suscripción activa."""
     res = await db.execute(text("""
-        SELECT plan, estado FROM subscriptions WHERE emisor_id = :eid
+        SELECT e.obligado_contabilidad, s.estado
+        FROM emisores e
+        LEFT JOIN subscriptions s ON s.emisor_id = e.id
+        WHERE e.id = :eid
     """), {"eid": emisor_id})
-    sub = res.fetchone()
-    return sub is not None and sub.estado in ("ACTIVO", "TRIAL") and sub.plan == "EMPRESARIAL"
+    row = res.fetchone()
+    if not row:
+        return False
+    tiene_sub = row.estado in ("ACTIVO", "TRIAL") if row.estado else False
+    return tiene_sub and row.obligado_contabilidad == "SI"

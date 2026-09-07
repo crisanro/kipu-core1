@@ -3,31 +3,17 @@ import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime, timezone
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.config import settings
 from app.core.rate_limit import RateLimit, RateLimitScope
-from app.core.permisos import verificar_admin
 from app.services.audit_service import audit_log
+from datetime import datetime, timezone
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter()
 
-STRIPE_PRICES = {
-    "PROFESIONAL":  {"MENSUAL": settings.STRIPE_PRICE_PROFESIONAL_MENSUAL,  "ANUAL": settings.STRIPE_PRICE_PROFESIONAL_ANUAL},
-    "EMPRESARIAL": {"MENSUAL": settings.STRIPE_PRICE_EMPRESARIAL_MENSUAL, "ANUAL": settings.STRIPE_PRICE_EMPRESARIAL_ANUAL},
-}
-
-class CheckoutSuscripcionRequest(BaseModel):
-    plan:    str
-    periodo: str
-
-class CambiarPlanRequest(BaseModel):
-    plan:    str
-    periodo: str
+STRIPE_PRICE_PRO_ANUAL = settings.STRIPE_PRICE_PRO_ANUAL
 
 # ── GET /estado ────────────────────────────────────────────────────────────────
 @router.get("/estado", summary="Estado actual de la suscripción")
@@ -47,31 +33,32 @@ async def estado_suscripcion(
         FROM subscriptions s WHERE s.emisor_id = :eid
     """), {"eid": emisor_id})
     sub = res.fetchone()
+
     if not sub:
         return {"ok": True, "tiene_suscripcion": False, "data": None}
 
     ahora  = datetime.now(timezone.utc)
     activa = sub.estado in ("ACTIVO", "TRIAL")
+
     return {
         "ok":                True,
         "tiene_suscripcion": activa,
         "data": {
-            "plan":               sub.plan,
-            "periodo":            sub.periodo,
-            "estado":             sub.estado,
-            "activa":             activa,
-            "period_start":       str(sub.current_period_start) if sub.current_period_start else None,
-            "period_end":         str(sub.current_period_end) if sub.current_period_end else None,
-            "trial_end":          str(sub.trial_end) if sub.trial_end else None,
+            "plan":                 sub.plan,
+            "periodo":              sub.periodo,
+            "estado":               sub.estado,
+            "activa":               activa,
+            "period_start":         str(sub.current_period_start) if sub.current_period_start else None,
+            "period_end":           str(sub.current_period_end)   if sub.current_period_end   else None,
+            "trial_end":            str(sub.trial_end)            if sub.trial_end             else None,
             "cancel_at_period_end": sub.cancel_at_period_end,
-            "dias_restantes":     (sub.current_period_end - ahora).days if sub.current_period_end else None,
+            "dias_restantes":       (sub.current_period_end - ahora).days if sub.current_period_end else None,
         }
     }
 
 # ── POST /checkout ─────────────────────────────────────────────────────────────
-@router.post("/checkout", summary="Crear sesión de checkout para suscripción")
+@router.post("/checkout", summary="Crear sesión de checkout para plan Pro Anual")
 async def crear_checkout_suscripcion(
-    data:      CheckoutSuscripcionRequest,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
     _rl:       None         = Depends(RateLimit(RateLimitScope.GENERAL)),
@@ -79,23 +66,17 @@ async def crear_checkout_suscripcion(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
     verificar_admin(auth_data)
 
-    plan    = data.plan.upper()
-    periodo = data.periodo.upper()
-    if plan not in ("PROFESIONAL", "EMPRESARIAL"):
-        raise HTTPException(status_code=400, detail="Plan inválido. Usa PROFESIONAL o EMPRESARIAL.")
-    if periodo not in ("MENSUAL", "ANUAL"):
-        raise HTTPException(status_code=400, detail="Período inválido. Usa MENSUAL o ANUAL.")
-
-    price_id = STRIPE_PRICES.get(plan, {}).get(periodo)
-    if not price_id:
-        raise HTTPException(status_code=400, detail=f"Precio no configurado para {plan} {periodo}.")
+    if not STRIPE_PRICE_PRO_ANUAL:
+        raise HTTPException(status_code=500, detail="Precio Pro no configurado en el servidor.")
 
     res_sub = await db.execute(text("""
         SELECT estado FROM subscriptions WHERE emisor_id = :eid
     """), {"eid": emisor_id})
     sub_actual = res_sub.fetchone()
+
     if sub_actual and sub_actual.estado in ("ACTIVO", "TRIAL"):
         raise HTTPException(status_code=400, detail="Ya tienes una suscripción activa.")
 
@@ -105,13 +86,12 @@ async def crear_checkout_suscripcion(
         session = stripe.checkout.Session.create(
             customer              = stripe_customer_id,
             mode                  = "subscription",
-            line_items            = [{"price": price_id, "quantity": 1}],
-            success_url           = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan={plan}&periodo={periodo}",
+            line_items            = [{"price": STRIPE_PRICE_PRO_ANUAL, "quantity": 1}],
+            success_url           = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan=PRO&periodo=ANUAL",
             cancel_url            = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
             allow_promotion_codes = True,
-            metadata              = {"emisor_id": str(emisor_id), "tipo": "SUSCRIPCION", "plan": plan, "periodo": periodo},
-            subscription_data     = {"metadata": {"emisor_id": str(emisor_id), "plan": plan, "periodo": periodo}},
-            invoice_creation      = None,
+            metadata              = {"emisor_id": str(emisor_id), "tipo": "SUSCRIPCION", "plan": "PRO", "periodo": "ANUAL"},
+            subscription_data     = {"metadata": {"emisor_id": str(emisor_id), "plan": "PRO", "periodo": "ANUAL"}},
         )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
@@ -127,12 +107,14 @@ async def portal_cliente(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
     verificar_admin(auth_data)
 
     res = await db.execute(text("""
         SELECT stripe_customer_id FROM emisores WHERE id = :eid
     """), {"eid": emisor_id})
     emisor = res.fetchone()
+
     if not emisor or not emisor.stripe_customer_id:
         raise HTTPException(status_code=404, detail="No tienes una cuenta de facturación configurada.")
 
@@ -156,6 +138,7 @@ async def cancelar_suscripcion(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
     verificar_admin(auth_data)
 
     res = await db.execute(text("""
@@ -163,6 +146,7 @@ async def cancelar_suscripcion(
         WHERE emisor_id = :eid
     """), {"eid": emisor_id})
     sub = res.fetchone()
+
     if not sub or not sub.stripe_subscription_id:
         raise HTTPException(status_code=404, detail="No tienes una suscripción activa.")
     if sub.estado not in ("ACTIVO", "TRIAL"):
@@ -179,17 +163,13 @@ async def cancelar_suscripcion(
     """), {"eid": emisor_id})
 
     await audit_log(
-        db        = db,
-        auth_data = auth_data,
-        accion    = "UPDATE",
-        entidad   = "suscripcion",
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "UPDATE",
+        entidad    = "suscripcion",
         entidad_id = str(emisor_id),
-        detalle   = {
-            "accion":  "cancelar_al_vencer",
-            "plan":    sub.plan,
-            "periodo": sub.periodo,
-        },
-        request   = request,
+        detalle    = {"accion": "cancelar_al_vencer", "plan": sub.plan, "periodo": sub.periodo},
+        request    = request,
     )
     await db.commit()
 
@@ -205,6 +185,7 @@ async def reactivar_suscripcion(
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+
     verificar_admin(auth_data)
 
     res = await db.execute(text("""
@@ -212,6 +193,7 @@ async def reactivar_suscripcion(
         WHERE emisor_id = :eid AND estado = 'ACTIVO'
     """), {"eid": emisor_id})
     sub = res.fetchone()
+
     if not sub:
         raise HTTPException(status_code=404, detail="No tienes una suscripción activa.")
     if not sub.cancel_at_period_end:
@@ -228,17 +210,13 @@ async def reactivar_suscripcion(
     """), {"eid": emisor_id})
 
     await audit_log(
-        db        = db,
-        auth_data = auth_data,
-        accion    = "UPDATE",
-        entidad   = "suscripcion",
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "UPDATE",
+        entidad    = "suscripcion",
         entidad_id = str(emisor_id),
-        detalle   = {
-            "accion":  "reactivar",
-            "plan":    sub.plan,
-            "periodo": sub.periodo,
-        },
-        request   = request,
+        detalle    = {"accion": "reactivar", "plan": sub.plan, "periodo": sub.periodo},
+        request    = request,
     )
     await db.commit()
 
@@ -255,6 +233,7 @@ async def _obtener_o_crear_customer(emisor_id: int, db: AsyncSession) -> str:
         ORDER BY eu.created_at ASC LIMIT 1
     """), {"eid": emisor_id})
     emisor = res.fetchone()
+
     if not emisor:
         raise HTTPException(status_code=404, detail="Emisor no encontrado.")
     if emisor.stripe_customer_id:
@@ -265,8 +244,13 @@ async def _obtener_o_crear_customer(emisor_id: int, db: AsyncSession) -> str:
         name     = emisor.razon_social,
         metadata = {"emisor_id": str(emisor_id), "ruc": emisor.ruc}
     )
+
     await db.execute(text("""
         UPDATE emisores SET stripe_customer_id = :cid WHERE id = :eid
     """), {"cid": customer.id, "eid": emisor_id})
     await db.commit()
+
     return customer.id
+
+# ── Import faltante (estaba en el original) ────────────────────────────────────
+from app.core.permisos import verificar_admin

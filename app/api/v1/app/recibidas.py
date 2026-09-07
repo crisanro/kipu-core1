@@ -378,7 +378,26 @@ async def registrar_desde_xml(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    emisor_id = auth_data["emisor_id"]
+    # Leer emisor del header X-Emisor-ID si viene (extensión de Chrome)
+    # Si no, usar el del token (panel web)
+    emisor_id_header = request.headers.get("X-Emisor-ID")
+    emisor_id_token  = auth_data["emisor_id"]
+
+    if emisor_id_header and emisor_id_header.isdigit():
+        emisor_id_candidato = int(emisor_id_header)
+        # Verificar que el usuario tenga acceso a ese emisor
+        profile_id = auth_data.get("profile_id")
+        res_acceso = await db.execute(text("""
+            SELECT emisor_id FROM emisor_usuarios
+            WHERE emisor_id = :eid AND profile_id = :pid
+        """), {"eid": emisor_id_candidato, "pid": str(profile_id)})
+        if res_acceso.fetchone():
+            emisor_id = emisor_id_candidato
+        else:
+            emisor_id = emisor_id_token
+    else:
+        emisor_id = emisor_id_token
+
     verificar_permiso(auth_data, "documentos")
 
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
