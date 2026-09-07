@@ -106,35 +106,14 @@ def _calcular_totales_desde_items(items: list[dict]) -> tuple[Decimal, Decimal]:
 # =============================================================================
 @router.post("", summary="Registrar documento recibido", status_code=201)
 async def registrar_documento_recibido(
-    data:       DocumentoRecibidoCreate,
-    request:    Request,
-    auth_data: dict          = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db),
+    data:      DocumentoRecibidoCreate,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
 ):
-    emisor_id_token = auth_data["emisor_id"]
-    
-    # Obtener emisor_id del header si la extensión lo envía para otra empresa
-    emisor_id_header = request.headers.get("x-emisor-id")
-    emisor_id = int(emisor_id_header) if emisor_id_header else emisor_id_token
+    emisor_id = auth_data["emisor_id"]
+    verificar_permiso(auth_data, "documentos")
 
-    print(f"[XML] header={emisor_id_header} token={emisor_id_token} usado={emisor_id}")
-
-    if emisor_id == emisor_id_token:
-        verificar_permiso(auth_data, "documentos")
-    else:
-        # Empresa distinta via extensión — verificar rol directamente en DB
-        profile_id = auth_data.get("profile_id")
-        res_rol = await db.execute(text("""
-            SELECT rol FROM emisor_usuarios
-            WHERE emisor_id = :eid AND profile_id = :pid
-        """), {"eid": emisor_id, "pid": str(profile_id)})
-        rol_row = res_rol.fetchone()
-        if not rol_row:
-            raise HTTPException(status_code=403, detail="Sin acceso a esta empresa.")
-        # Admin siempre puede, otros necesitan permiso documentos_recibidos
-        if rol_row.rol != "admin":
-            raise HTTPException(status_code=403, detail="Se requiere rol admin para importar desde la extensión.")
-            
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
@@ -195,28 +174,28 @@ async def registrar_documento_recibido(
                 CAST(:datos AS jsonb), :xml_path, :fuente
             ) RETURNING id
         """), {
-            "eid":              emisor_id,
-            "ruc_prov":        data.ruc_proveedor,
-            "razon_prov":      data.razon_social_proveedor,
-            "tipo_doc":        data.tipo_doc.upper(),
-            "cod_doc":         data.cod_doc,
-            "clave":           data.clave_acceso,
-            "numero_doc":      data.numero_doc,
-            "fecha_emision":   data.fecha_emision,
-            "fecha_auth":      fecha_auth_parsed,
-            "subtotal_base":   data.subtotal_base,
+            "eid":            emisor_id,
+            "ruc_prov":       data.ruc_proveedor,
+            "razon_prov":     data.razon_social_proveedor,
+            "tipo_doc":       data.tipo_doc.upper(),
+            "cod_doc":        data.cod_doc,
+            "clave":          data.clave_acceso,
+            "numero_doc":     data.numero_doc,
+            "fecha_emision":  data.fecha_emision,
+            "fecha_auth":     fecha_auth_parsed,
+            "subtotal_base":  data.subtotal_base,
             "valor_iva_total": data.valor_iva_total,
-            "total":           data.importe_total,
-            "ded_renta":       data.deducible_renta,
-            "cred_iva":        data.credito_tributario_iva,
-            "notas":           data.notas,
-            "estado_pago":     data.estado_pago,
-            "forma_pago":      data.forma_pago,
-            "num_comp":        data.numero_comprobante_pago,
-            "fecha_pago":      data.fecha_pago,
-            "datos":           json.dumps(data.datos, default=str),
-            "xml_path":        xml_path,
-            "fuente":          data.fuente,
+            "total":          data.importe_total,
+            "ded_renta":      data.deducible_renta,
+            "cred_iva":       data.credito_tributario_iva,
+            "notas":          data.notas,
+            "estado_pago":    data.estado_pago,
+            "forma_pago":     data.forma_pago,
+            "num_comp":       data.numero_comprobante_pago,
+            "fecha_pago":     data.fecha_pago,
+            "datos":          json.dumps(data.datos, default=str),
+            "xml_path":       xml_path,
+            "fuente":         data.fuente,
         })
         doc_id = res.scalar()
         await audit_log(
@@ -418,8 +397,11 @@ async def registrar_desde_xml(
             emisor_id = emisor_id_token
     else:
         emisor_id = emisor_id_token
-        print(f"[XML] emisor_id_header={request.headers.get('X-Emisor-ID')} emisor_id_token={auth_data['emisor_id']} emisor_id_usado={emisor_id}")
-    verificar_permiso(auth_data, "documentos")
+
+    print(f"[XML] header={emisor_id_header} token={emisor_id_token} usado={emisor_id}")
+
+    if emisor_id == emisor_id_token:
+        verificar_permiso(auth_data, "documentos")
 
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
