@@ -112,7 +112,7 @@ async def registrar_documento_recibido(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
+    verificar_permiso(auth_data, "documentos_recibidos")
 
     res_sub = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res_sub.fetchone()
@@ -248,7 +248,7 @@ async def registrar_documento_fisico(
     db:                     AsyncSession         = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
+    verificar_permiso(auth_data, "documentos_recibidos")
 
     if notas and len(notas) > 128:
         raise HTTPException(status_code=400, detail="Las notas no pueden superar 128 caracteres.")
@@ -550,7 +550,7 @@ async def historial_recibidos(
     offset:       int           = Query(0),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
+    verificar_permiso(auth_data, "documentos_recibidos")
 
     hoy = date.today()
     fi  = date.fromisoformat(fecha_inicio) if fecha_inicio else hoy
@@ -643,7 +643,7 @@ async def detalle_recibido(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
+    verificar_permiso(auth_data, "documentos_recibidos")
 
     res = await db.execute(text("""
         SELECT d.*,
@@ -709,7 +709,7 @@ async def actualizar_recibido(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "documentos")
+    verificar_permiso(auth_data, "documentos_recibidos")
 
     res = await db.execute(text("""
         SELECT id FROM documentos_recibidos WHERE id = :did AND emisor_id = :eid
