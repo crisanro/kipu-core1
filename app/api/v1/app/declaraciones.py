@@ -375,11 +375,20 @@ async def marcar_declarado(
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "declaraciones")
 
+    # AGREGAR — leer periodo_iva del emisor
+    res_emisor = await db.execute(
+        text("SELECT ruc, periodo_iva FROM emisores WHERE id = :eid"),
+        {"eid": emisor_id}
+    )
+    emisor = res_emisor.fetchone()
+    if not emisor:
+        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
+
     if tipo not in TIPOS_VALIDOS:
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {', '.join(TIPOS_VALIDOS)}")
 
     hoy     = date.today()
-    periodo = _periodo_actual(tipo, hoy)
+    periodo = _periodo_actual(tipo, hoy, emisor.periodo_iva)
 
     res = await db.execute(text("""
         UPDATE declaraciones_sri SET
@@ -1380,11 +1389,6 @@ async def casilleros_ats(
                 "total_doc_emitidos": 0, "total_doc_recibidos": 0,
                 "data": _datos_demo_ats()}
 
-    if not await _verificar_obligado_contabilidad(emisor_id, db):
-        return {"ok": True, "demo": True, "plan_requerido": "EMPRESARIAL",
-                "cached": False, "en_curso": False,
-                "total_doc_emitidos": 0, "total_doc_recibidos": 0,
-                "data": _datos_demo_ats()}
     
     # ── Verificar cache ────────────────────────────────────────────────────
     if not es_mes_actual and not regenerar:
