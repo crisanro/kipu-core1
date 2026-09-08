@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.rate_limit import RateLimit, RateLimitScope
 from app.services.audit_service import audit_log
 from datetime import datetime, timezone
+from app.core.permisos import verificar_admin
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 router = APIRouter()
@@ -252,5 +253,3 @@ async def _obtener_o_crear_customer(emisor_id: int, db: AsyncSession) -> str:
 
     return customer.id
 
-# ── Import faltante (estaba en el original) ────────────────────────────────────
-from app.core.permisos import verificar_admin

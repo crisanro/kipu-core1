@@ -176,14 +176,12 @@ async def procesar_emision(doc_id: str):
                 xml_base64 = base64.b64encode(xml_bytes).decode("utf-8")
                 ambiente_efectivo = "1" if doc.es_sandbox else str(doc.ambiente)
                 urls = URLS_SRI[ambiente_efectivo]
-
                 soap_body = (
                     f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
                     f'xmlns:ec="http://ec.gob.sri.ws.recepcion">'
                     f'<soapenv:Body><ec:validarComprobante><xml>{xml_base64}</xml>'
                     f'</ec:validarComprobante></soapenv:Body></soapenv:Envelope>'
                 )
-
                 res_sri  = await httpx_with_retry(urls["recepcion"], soap_body, {"Content-Type": "text/xml"})
                 json_res = xmltodict.parse(res_sri.text)
                 body     = json_res.get("soap:Envelope", {}).get("soap:Body", {})
@@ -194,7 +192,7 @@ async def procesar_emision(doc_id: str):
                     await asyncio.sleep(30)
                     raise Exception(f"SRI Fault: {fault_msg}")
 
-                resp = body.get("ns2:validarComprobanteResponse", {}).get("RespuestaRecepcionComprobante")
+                resp     = body.get("ns2:validarComprobanteResponse", {}).get("RespuestaRecepcionComprobante")
                 doc_dict = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in doc._mapping.items()}
 
                 if resp and resp.get("estado") == "RECIBIDA":
@@ -204,37 +202,51 @@ async def procesar_emision(doc_id: str):
                         WHERE id = :id
                     """), {"id": doc.id})
                     await db.commit()
-
                     redis = await get_redis()
                     await redis.lpush(QUEUE_AUTORIZACION, str(doc.id))
 
                 else:
+                    # ── Extraer identificadores de error ──────────────────────
+                    msg_raw = (resp or {}).get("comprobantes", {}) \
+                                         .get("comprobante", {}) \
+                                         .get("mensajes", {}) \
+                                         .get("mensaje", {})
+                    ids_error = (
+                        [m.get("identificador") for m in msg_raw]
+                        if isinstance(msg_raw, list)
+                        else [msg_raw.get("identificador")]
+                    )
+
+                    if "70" in ids_error:
+                        # SRI ocupado / clave en procesamiento — reintentar indefinidamente
+                        print(f"[Emisión] ⏳ Código 70 (SRI en procesamiento) — reintentando en 20s: {doc.clave_acceso}")
+                        await asyncio.sleep(20)
+                        redis = await get_redis()
+                        await redis.lpush(QUEUE_EMISION, str(doc.id))
+                        return
+
+                    # Cualquier otro código → DEVUELTA definitiva
                     await db.execute(text("""
                         UPDATE documentos_emitidos
                         SET estado_sri = 'DEVUELTA',
                             mensajes_sri = CAST(:msg AS jsonb)
                         WHERE id = :id
                     """), {"msg": json.dumps(resp), "id": doc.id})
-
                     if _es_origen_api(doc.origen):
                         await db.execute(text("""
                             UPDATE user_credits
                             SET balance = balance + 1, last_updated = NOW()
                             WHERE emisor_id = :eid
                         """), {"eid": doc.emisor_id})
-
                     await db.commit()
-
                     await _devolver_stock_si_aplica(doc, db)
                     await _invalidar_cache(doc.emisor_id)
                     await notificar_cambio_estado(doc_dict, "DEVUELTA", resp)
-
                     tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
                     numero     = doc.numero_doc or doc.clave_acceso[-10:]
                     prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
-
                     await crear_notificacion(
-                        db         = db,
+                        db        = db,
                         emisor_id = doc.emisor_id,
                         tipo      = "DOCUMENTO",
                         titulo    = f"{prefijo}⚠️ {tipo_label} devuelto por el SRI",
@@ -258,11 +270,9 @@ async def procesar_emision(doc_id: str):
                     """), {"id": doc_id})
                     nuevo_retry = res2.scalar()
                     await db2.commit()
-
                 espera = min(2 ** nuevo_retry * 10, 300)
                 print(f"[Emisión] ❌ Error ({doc_id}): {str(err)} — retry #{nuevo_retry}, esperando {espera}s")
                 await asyncio.sleep(espera)
-
                 redis = await get_redis()
                 await redis.lpush(QUEUE_EMISION, doc_id)
 
