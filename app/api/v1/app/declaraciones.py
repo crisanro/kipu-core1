@@ -50,7 +50,7 @@ async def obtener_declaracion_actual(
         raise HTTPException(status_code=400, detail=f"Tipo inválido. Válidos: {', '.join(TIPOS_VALIDOS)}")
 
     res_emisor = await db.execute(
-        text("SELECT ruc, ambiente FROM emisores WHERE id = :eid"),
+        text("SELECT ruc, ambiente, periodo_iva FROM emisores WHERE id = :eid"),
         {"eid": emisor_id}
     )
     emisor = res_emisor.fetchone()
@@ -61,7 +61,7 @@ async def obtener_declaracion_actual(
         return {"ok": True, "aplica": False, "motivo": "Solo aplica en ambiente producción."}
 
     hoy     = date.today()
-    periodo = _periodo_actual(tipo, hoy)
+    periodo = _periodo_actual(tipo, hoy, emisor.periodo_iva)
 
     # Crear si no existe
     await db.execute(text("""
@@ -72,7 +72,7 @@ async def obtener_declaracion_actual(
         "eid":        emisor_id,
         "tipo":       tipo,
         "periodo":    periodo,
-        "vencimiento": calcular_vencimiento(emisor.ruc, periodo),
+        "vencimiento": calcular_vencimiento(emisor.ruc, periodo, emisor.periodo_iva),
     })
     await db.commit()
 
@@ -2140,13 +2140,15 @@ async def descargar_ats(
 # HELPERS
 # =============================================================================
 
-def _periodo_actual(tipo: str, hoy: date) -> date:
-    """Retorna el primer día del período actual según el tipo de declaración."""
+def _periodo_actual(tipo: str, hoy: date, periodo_iva: str = "MENSUAL") -> date:
     if tipo == "102":
-        # Renta — período anual, año anterior
         return date(hoy.year - 1, 1, 1)
+    if periodo_iva == "SEMESTRAL":
+        if hoy.month <= 6:
+            return date(hoy.year - 1, 7, 1)  # S2 año anterior
+        else:
+            return date(hoy.year, 1, 1)       # S1 año actual
     else:
-        # 104 y ATS — mensual, mes anterior
         if hoy.month == 1:
             return date(hoy.year - 1, 12, 1)
         return date(hoy.year, hoy.month - 1, 1)

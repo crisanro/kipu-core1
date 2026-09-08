@@ -360,7 +360,7 @@ async def get_config(
         SELECT
             e.ruc, e.razon_social, e.nombre_comercial, e.direccion_matriz,
             e.contribuyente_especial, e.obligado_contabilidad, e.ambiente,
-            e.p12_path, e.p12_expiration, e.created_at,
+            e.p12_path, e.p12_expiration, e.created_at, e.periodo_iva,
             COALESCE(uc.balance, 0) AS balance_api,
             s.estado                AS sub_estado,
             s.plan                  AS sub_plan,

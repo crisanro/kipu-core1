@@ -52,6 +52,7 @@ class Emisor(Base):
     tipo_emisor = Column(String(10), nullable=False, server_default="NATURAL")
     contribuyente_especial  = Column(String(13))
     obligado_contabilidad   = Column(String(2), default="NO")
+    periodo_iva             = Column(String(10), nullable=False, server_default="MENSUAL")
     ambiente                = Column(SmallInteger, default=1)       # 1=Pruebas 2=Producción
     p12_path                = Column(Text)
     p12_pass                = Column(Text)                          # Encriptado con ENCRYPTION_KEY

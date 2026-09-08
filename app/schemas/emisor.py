@@ -24,3 +24,4 @@ class EmisorUpdate(BaseModel):
     contribuyente_especial: Optional[str] = Field(None, max_length=5)
     obligado_contabilidad:  Optional[str] = Field(None, max_length=2)
     tipo_emisor:            Optional[str] = Field(None, pattern="^(NATURAL|JURIDICO)$")
+    periodo_iva:            Optional[str] = Field(None, pattern="^(MENSUAL|SEMESTRAL)$") 
