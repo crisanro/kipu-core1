@@ -2,15 +2,6 @@
 #
 # Worker de emisión y autorización de comprobantes electrónicos.
 # Cola: kipu:queue:emision → SRI recepción → kipu:queue:autorizacion → SRI autorización
-#
-# Cambios vs versión anterior:
-#   - Tabla: invoices_emitidas → documentos_emitidos
-#   - Campo: estado → estado_sri
-#   - Campo: datos_factura → datos
-#   - Campo: email_comprador → datos JSONB (legacy_email_comprador)
-#   - Eliminado: ak.unlimited → lógica por origen (web=suscripción, api=créditos)
-#   - Evento webhook: factura.* → documento.*
-#   - Notificaciones con soporte para etiquetas Sandbox.
 
 import hmac
 import hashlib
@@ -133,17 +124,6 @@ async def _invalidar_cache(emisor_id: int):
         print(f"[Cache] ⚠️ No invalidado: {e}")
 
 
-def _email_desde_datos(datos: dict) -> str | None:
-    """Extrae el email del comprador desde el JSONB datos."""
-    if not datos:
-        return None
-    email = datos.get("legacy_email_comprador")
-    if email:
-        return email
-    info = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
-    return info.get("emailComprador") or info.get("email")
-
-
 def _es_origen_api(origen: str) -> bool:
     return origen == "api"
 
@@ -206,7 +186,6 @@ async def procesar_emision(doc_id: str):
                     await redis.lpush(QUEUE_AUTORIZACION, str(doc.id))
 
                 else:
-                    # ── Extraer identificadores de error ──────────────────────
                     msg_raw = (resp or {}).get("comprobantes", {}) \
                                          .get("comprobante", {}) \
                                          .get("mensajes", {}) \
@@ -218,14 +197,12 @@ async def procesar_emision(doc_id: str):
                     )
 
                     if "70" in ids_error:
-                        # SRI ocupado / clave en procesamiento — reintentar indefinidamente
                         print(f"[Emisión] ⏳ Código 70 (SRI en procesamiento) — reintentando en 20s: {doc.clave_acceso}")
                         await asyncio.sleep(20)
                         redis = await get_redis()
                         await redis.lpush(QUEUE_EMISION, str(doc.id))
                         return
 
-                    # Cualquier otro código → DEVUELTA definitiva
                     await db.execute(text("""
                         UPDATE documentos_emitidos
                         SET estado_sri = 'DEVUELTA',
@@ -242,15 +219,16 @@ async def procesar_emision(doc_id: str):
                     await _devolver_stock_si_aplica(doc, db)
                     await _invalidar_cache(doc.emisor_id)
                     await notificar_cambio_estado(doc_dict, "DEVUELTA", resp)
+
                     tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
                     numero     = doc.numero_doc or doc.clave_acceso[-10:]
                     prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
                     await crear_notificacion(
-                        db        = db,
-                        emisor_id = doc.emisor_id,
-                        tipo      = "DOCUMENTO",
-                        titulo    = f"{prefijo}⚠️ {tipo_label} devuelto por el SRI",
-                        mensaje   = f"{prefijo}{tipo_label} {numero} fue devuelto. Revisa los errores en el detalle.",
+                        db         = db,
+                        emisor_id  = doc.emisor_id,
+                        tipo       = "DOCUMENTO",
+                        titulo     = f"{prefijo}⚠️ {tipo_label} devuelto por el SRI",
+                        mensaje    = f"{prefijo}{tipo_label} {numero} fue devuelto. Revisa los errores en el detalle.",
                         referencia = f"/documentos/{doc.id}",
                     )
                     print(f"[Emisión] ⚠️ DEVUELTA: {doc.clave_acceso}")
@@ -280,6 +258,7 @@ async def procesar_emision(doc_id: str):
 # =============================================================================
 # PROCESADOR DE AUTORIZACIÓN
 # =============================================================================
+
 async def procesar_autorizacion(doc_id: str):
     async with _sri_semaphore:
         async with AsyncSessionLocal() as db:
@@ -354,10 +333,10 @@ async def procesar_autorizacion(doc_id: str):
 
                     await crear_notificacion(
                         db         = db,
-                        emisor_id = doc.emisor_id,
-                        tipo      = "DOCUMENTO",
-                        titulo    = f"{prefijo}✅ {tipo_label} autorizado",
-                        mensaje   = f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
+                        emisor_id  = doc.emisor_id,
+                        tipo       = "DOCUMENTO",
+                        titulo     = f"{prefijo}✅ {tipo_label} autorizado",
+                        mensaje    = f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
                         referencia = f"/documentos/{doc.id}",
                     )
 
@@ -373,23 +352,30 @@ async def procesar_autorizacion(doc_id: str):
                             owner = res_owner.fetchone()
                             if owner:
                                 await _enviar_email_comprobante(
-                                    email        = owner.email,
-                                    razon_social = f"[SANDBOX] {doc.razon_social}",
-                                    secuencial   = doc.secuencial,
-                                    clave_acceso = doc.clave_acceso,
-                                    xml_str      = xml_autorizado,
-                                    pdf_bytes    = pdf_bytes,
+                                    email              = owner.email,
+                                    razon_social       = doc.razon_social,
+                                    ruc                = doc.ruc,
+                                    tipo_doc           = doc.tipo_doc,
+                                    secuencial         = doc.secuencial,
+                                    clave_acceso       = doc.clave_acceso,
+                                    fecha_autorizacion = fecha_auth_str,
+                                    xml_str            = xml_autorizado,
+                                    pdf_bytes          = pdf_bytes,
+                                    es_sandbox         = True,
                                 )
                         else:
-                            email_comprador = doc.email_comprador
-                            if email_comprador:
+                            if doc.email_comprador:
                                 await _enviar_email_comprobante(
-                                    email        = email_comprador,
-                                    razon_social = doc.razon_social,
-                                    secuencial   = doc.secuencial,
-                                    clave_acceso = doc.clave_acceso,
-                                    xml_str      = xml_autorizado,
-                                    pdf_bytes    = pdf_bytes,
+                                    email              = doc.email_comprador,
+                                    razon_social       = doc.razon_social,
+                                    ruc                = doc.ruc,
+                                    tipo_doc           = doc.tipo_doc,
+                                    secuencial         = doc.secuencial,
+                                    clave_acceso       = doc.clave_acceso,
+                                    fecha_autorizacion = fecha_auth_str,
+                                    xml_str            = xml_autorizado,
+                                    pdf_bytes          = pdf_bytes,
+                                    es_sandbox         = False,
                                 )
 
                 elif autorizacion.get("estado") in ("RECHAZADO", "NO AUTORIZADO"):
@@ -408,17 +394,16 @@ async def procesar_autorizacion(doc_id: str):
                         """), {"eid": doc.emisor_id})
 
                     await db.commit()
-
                     await _devolver_stock_si_aplica(doc, db)
                     await _invalidar_cache(doc.emisor_id)
                     await notificar_cambio_estado(doc_dict, "RECHAZADO", autorizacion.get("mensajes"))
-                    
+
                     await crear_notificacion(
                         db         = db,
-                        emisor_id = doc.emisor_id,
-                        tipo      = "DOCUMENTO",
-                        titulo    = f"{prefijo}❌ {tipo_label} rechazado por el SRI",
-                        mensaje   = f"{prefijo}{tipo_label} {numero} fue rechazado. Revisa los errores en el detalle.",
+                        emisor_id  = doc.emisor_id,
+                        tipo       = "DOCUMENTO",
+                        titulo     = f"{prefijo}❌ {tipo_label} rechazado por el SRI",
+                        mensaje    = f"{prefijo}{tipo_label} {numero} fue rechazado. Revisa los errores en el detalle.",
                         referencia = f"/documentos/{doc.id}",
                     )
                     await disparar_webhooks(doc.id, doc.emisor_id, "documento.rechazado", doc_dict)
@@ -430,7 +415,7 @@ async def procesar_autorizacion(doc_id: str):
                 await asyncio.sleep(30)
                 redis = await get_redis()
                 await redis.lpush(QUEUE_AUTORIZACION, doc_id)
-                
+
 
 # =============================================================================
 # WEBHOOKS
@@ -450,10 +435,10 @@ async def disparar_webhooks(doc_id, emisor_id: int, evento: str, payload: dict):
                 return
 
             body = json.dumps({
-                "evento":     evento,
-                "doc_id":     str(doc_id),
-                "timestamp":  datetime.utcnow().isoformat(),
-                "data":       payload,
+                "evento":    evento,
+                "doc_id":    str(doc_id),
+                "timestamp": datetime.utcnow().isoformat(),
+                "data":      payload,
             }, default=str)
 
             async with httpx.AsyncClient(timeout=10.0) as client:
@@ -490,28 +475,29 @@ async def _generar_pdf(xml_autorizado: str, doc, fecha_auth_str: str) -> bytes |
 
 
 async def _enviar_email_comprobante(
-    email: str, razon_social: str, secuencial: str,
-    clave_acceso: str, xml_str: str, pdf_bytes: bytes | None,
+    email: str,
+    razon_social: str,
+    ruc: str,
+    tipo_doc: str,
+    secuencial: str,
+    clave_acceso: str,
+    fecha_autorizacion: str,
+    xml_str: str,
+    pdf_bytes: bytes | None,
+    es_sandbox: bool = False,
 ):
     try:
-        attachments = [{
-            "filename": f"{clave_acceso}.xml",
-            "content":  xml_str.encode("utf-8"),
-            "maintype": "text",
-            "subtype":  "xml",
-        }]
-        if pdf_bytes:
-            attachments.append({
-                "filename": f"{clave_acceso}.pdf",
-                "content":  pdf_bytes,
-                "maintype": "application",
-                "subtype":  "pdf",
-            })
-        await mail_service.send_mail(
-            to           = email,
-            subject      = f"Comprobante Electrónico — {razon_social} — {secuencial}",
-            html_content = f"Adjuntamos su comprobante {secuencial} autorizado por el SRI.",
-            attachments  = attachments,
+        await mail_service.send_comprobante(
+            email              = email,
+            razon_social       = razon_social,
+            ruc                = ruc,
+            tipo_doc           = tipo_doc,
+            secuencial         = secuencial,
+            clave_acceso       = clave_acceso,
+            fecha_autorizacion = fecha_autorizacion,
+            xml_str            = xml_str,
+            pdf_bytes          = pdf_bytes,
+            es_sandbox         = es_sandbox,
         )
     except Exception as e:
         print(f"[Auth] ⚠️ Error enviando email: {e}")
