@@ -2,13 +2,14 @@ import smtplib
 import asyncio
 import xmltodict
 from email.message import EmailMessage
+from email.utils import formataddr
 from app.core.config import settings
 
 # =============================================================================
 # MARCA — ajusta cuando tengas logo y colores definidos
 # =============================================================================
 KIPU_LOGO_URL   = "https://tudominio.com/logo-kipu.png"  # ← reemplazar
-KIPU_COLOR_MAIN = "#0052CC"   # ← reemplazar con tu color principal
+KIPU_COLOR_MAIN = "#0052CC"                               # ← reemplazar
 KIPU_WEBSITE    = "https://kipu.ec"
 
 TIPO_DOC_LABEL = {
@@ -62,7 +63,8 @@ def _build_html_comprobante(
         sandbox_banner = """
         <tr>
           <td style="background-color:#F59E0B;padding:10px 30px;text-align:center;">
-            <span style="color:#ffffff;font-family:Arial,sans-serif;font-size:13px;font-weight:bold;">
+            <span style="color:#ffffff;font-family:Arial,sans-serif;
+                         font-size:13px;font-weight:bold;">
               🧪 AMBIENTE DE PRUEBAS — Este comprobante no tiene validez tributaria
             </span>
           </td>
@@ -78,7 +80,8 @@ def _build_html_comprobante(
 </head>
 <body style="margin:0;padding:0;background-color:#F3F4F6;font-family:Arial,sans-serif;">
 
-  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#F3F4F6;padding:30px 0;">
+  <table width="100%" cellpadding="0" cellspacing="0"
+         style="background-color:#F3F4F6;padding:30px 0;">
     <tr>
       <td align="center">
         <table width="600" cellpadding="0" cellspacing="0"
@@ -91,7 +94,8 @@ def _build_html_comprobante(
 
           <!-- HEADER -->
           <tr>
-            <td style="background-color:{KIPU_COLOR_MAIN};padding:28px 30px;text-align:center;">
+            <td style="background-color:{KIPU_COLOR_MAIN};
+                       padding:28px 30px;text-align:center;">
               <img src="{KIPU_LOGO_URL}" alt="Kipu" width="130"
                    style="display:block;margin:0 auto;">
             </td>
@@ -126,7 +130,8 @@ def _build_html_comprobante(
                               text-transform:uppercase;letter-spacing:0.5px;">
                       Emisor
                     </p>
-                    <p style="margin:4px 0 0;font-size:15px;font-weight:bold;color:#111827;">
+                    <p style="margin:4px 0 0;font-size:15px;
+                              font-weight:bold;color:#111827;">
                       {razon_social}
                     </p>
                     <p style="margin:2px 0 0;font-size:13px;color:#6B7280;">
@@ -142,7 +147,8 @@ def _build_html_comprobante(
                               text-transform:uppercase;letter-spacing:0.5px;">
                       Receptor
                     </p>
-                    <p style="margin:4px 0 0;font-size:15px;font-weight:bold;color:#111827;">
+                    <p style="margin:4px 0 0;font-size:15px;
+                              font-weight:bold;color:#111827;">
                       {nombre_comprador}
                     </p>
                   </td>
@@ -188,7 +194,8 @@ def _build_html_comprobante(
                               text-transform:uppercase;letter-spacing:1px;">
                       Total del comprobante
                     </p>
-                    <p style="margin:0;font-size:36px;font-weight:bold;color:#ffffff;">
+                    <p style="margin:0;font-size:36px;
+                              font-weight:bold;color:#ffffff;">
                       ${total}
                     </p>
                   </td>
@@ -196,7 +203,8 @@ def _build_html_comprobante(
               </table>
 
               <!-- Nota adjuntos -->
-              <p style="margin:0 0 6px;font-size:14px;color:#374151;text-align:center;">
+              <p style="margin:0 0 6px;font-size:14px;
+                        color:#374151;text-align:center;">
                 Adjuntamos el comprobante en formato
                 <strong>PDF</strong> y <strong>XML</strong> para sus registros.
               </p>
@@ -215,7 +223,8 @@ def _build_html_comprobante(
               <p style="margin:0;font-size:12px;color:#9CA3AF;">
                 Comprobante emitido mediante
                 <a href="{KIPU_WEBSITE}"
-                   style="color:{KIPU_COLOR_MAIN};text-decoration:none;font-weight:bold;">
+                   style="color:{KIPU_COLOR_MAIN};text-decoration:none;
+                          font-weight:bold;">
                   kipu.ec
                 </a>
                 — Facturación Electrónica Ecuador
@@ -249,12 +258,12 @@ class EmailService:
             if settings.SMTP_PORT == 465:
                 server = smtplib.SMTP_SSL(
                     settings.SMTP_HOST, settings.SMTP_PORT,
-                    timeout=timeout_sec
+                    timeout=timeout_sec,
                 )
             else:
                 server = smtplib.SMTP(
                     settings.SMTP_HOST, settings.SMTP_PORT,
-                    timeout=timeout_sec
+                    timeout=timeout_sec,
                 )
                 server.starttls()
 
@@ -272,14 +281,22 @@ class EmailService:
         subject: str,
         html_content: str,
         attachments: list = None,
+        from_name: str = None,  # ← NUEVO: nombre del emisor en el From
     ) -> dict:
         if not self.enabled:
             return {"exito": False, "mensaje": "SMTP no configurado"}
 
+        smtp_address = settings.SMTP_FROM or settings.SMTP_USER
+
         msg = EmailMessage()
         msg["Subject"] = subject
-        msg["From"]    = settings.SMTP_FROM or settings.SMTP_USER
         msg["To"]      = to
+
+        # ── From con nombre personalizado ─────────────────────────────────────
+        # formataddr genera: "Nombre del Emisor <no-reply@kipu.ec>"
+        # Si no viene from_name, usa "Kipu" como fallback
+        display_name   = from_name or "Kipu"
+        msg["From"]    = formataddr((display_name, smtp_address))
 
         msg.set_content(
             "El contenido de este mensaje requiere un lector de correos "
@@ -292,14 +309,14 @@ class EmailService:
                 msg.add_attachment(
                     att["content"],
                     maintype=att.get("maintype", "application"),
-                    subtype=att.get("subtype", "octet-stream"),
+                    subtype=att.get("subtype",  "octet-stream"),
                     filename=att["filename"],
                 )
 
         success = await asyncio.to_thread(self._send_sync, msg)
 
         if success:
-            print(f"📧 [Email] Enviado a {to}")
+            print(f"📧 [Email] Enviado a {to} (from: {display_name})")
             return {"exito": True}
 
         return {"exito": False, "error": "No se pudo entregar el correo."}
@@ -319,12 +336,12 @@ class EmailService:
     ) -> dict:
         """
         Método de alto nivel para enviar comprobantes electrónicos.
-        Construye el HTML, arma los adjuntos y delega a send_mail.
+        El From mostrará la razón social del emisor, no "Kipu".
         """
-        tipo_label          = TIPO_DOC_LABEL.get(tipo_doc, "Comprobante")
-        total, comprador    = _extraer_total_y_comprador(xml_str)
-        prefijo             = "[SANDBOX] " if es_sandbox else ""
-        subject             = f"{prefijo}{tipo_label} Electrónica — {razon_social} — {secuencial}"
+        tipo_label       = TIPO_DOC_LABEL.get(tipo_doc, "Comprobante")
+        total, comprador = _extraer_total_y_comprador(xml_str)
+        prefijo          = "[SANDBOX] " if es_sandbox else ""
+        subject          = f"{prefijo}{tipo_label} Electrónica — {razon_social} — {secuencial}"
 
         html_content = _build_html_comprobante(
             razon_social       = razon_social,
@@ -357,6 +374,7 @@ class EmailService:
             subject      = subject,
             html_content = html_content,
             attachments  = attachments,
+            from_name    = razon_social,  # ← el comprador ve el nombre del emisor
         )
 
 

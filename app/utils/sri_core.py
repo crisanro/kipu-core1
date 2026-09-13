@@ -77,7 +77,7 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
             raise HTTPException(status_code=404, detail="El 'cliente_id' proporcionado no existe.")
         return {
             "identificacion": row.identificacion,
-            "razon_social":   row.razon_social,
+            "razon_social":   (row.razon_social or "").strip(),
             "email":          row.email,
             "direccion":      row.direccion,
             "telefono":       row.telefono,
@@ -88,7 +88,7 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
     if cliente_obj:
         identificacion = cliente_obj.get("identificacion")
         tipo_id        = cliente_obj.get("tipo_id") or cliente_obj.get("tipoId") or "05"
-        razon_social   = cliente_obj.get("nombre") or cliente_obj.get("razonSocial")
+        razon_social   = (cliente_obj.get("nombre") or cliente_obj.get("razonSocial") or "").strip()
         email          = cliente_obj.get("email")
         direccion      = cliente_obj.get("direccion", "S/N")
         telefono       = cliente_obj.get("telefono", "")
@@ -110,7 +110,7 @@ async def resolver_cliente(factura_data: dict, emisor_id: int, db: AsyncSession)
                 existente = res.fetchone()
                 if existente:
                     cliente_emisor_id             = existente.id
-                    cliente_final["razon_social"] = existente.razon_social
+                    cliente_final["razon_social"] = (existente.razon_social or "").strip()
                     cliente_final["email"]        = existente.email or email
                     cliente_final["direccion"]    = existente.direccion or direccion
                     cliente_final["telefono"]     = existente.telefono or telefono
@@ -272,8 +272,8 @@ def construir_campos_adicionales(factura_data: dict) -> list:
 
     # Proveedor siempre al final
     campos.append({
-        "@nombre": "PROVEEDOR_SISTEMA_INFORMATICO",
-        "#text":   "1312838392001 (kipu.ec)"
+        "@nombre": "RUC PROVEEDOR",
+        "#text":   "1312838392001"
     })
 
     return campos

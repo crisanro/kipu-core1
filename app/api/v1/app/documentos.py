@@ -68,6 +68,10 @@ class EmitirDocumentoRequest(BaseModel):
     campos_adicionales:     Optional[list[CampoAdicional]] = None
     origen:                 Optional[str]                  = "web"
     proforma_id: Optional[str] = None
+    estado_cobro:            Optional[str]  = None
+    forma_pago_cobro:        Optional[str]  = None
+    numero_comprobante_pago: Optional[str]  = None
+    fecha_pago:              Optional[str]  = None
 
 class ActualizarCobro(BaseModel):
     estado_cobro:            str
@@ -199,8 +203,14 @@ async def historial_documentos(
             numero_doc ILIKE :q OR
             datos->'infoFactura'->>'razonSocialComprador' ILIKE :q OR
             datos->'infoFactura'->>'identificacionComprador' ILIKE :q OR
+            datos->'infoNotaCredito'->>'razonSocialComprador' ILIKE :q OR
+            datos->'infoNotaCredito'->>'identificacionComprador' ILIKE :q OR
+            datos->'infoNotaDebito'->>'razonSocialComprador' ILIKE :q OR
+            datos->'infoNotaDebito'->>'identificacionComprador' ILIKE :q OR
             datos->'infoLiquidacionCompra'->>'razonSocialProveedor' ILIKE :q OR
             datos->'infoLiquidacionCompra'->>'identificacionProveedor' ILIKE :q
+            datos->'infoCompRetencion'->>'razonSocialSujetoRetenido' ILIKE :q OR
+            datos->'infoCompRetencion'->>'identificacionSujetoRetenido' ILIKE :q OR
         )"""
         params["q"] = f"%{q}%"
 
@@ -215,8 +225,20 @@ async def historial_documentos(
             importe_total, origen, created_at,
             datos->>'legacy_razon_comprador' AS razon_comprador,
             datos->>'legacy_id_comprador'    AS id_comprador,
-            datos->'infoFactura'->>'razonSocialComprador'    AS razon_fac,
-            datos->'infoFactura'->>'identificacionComprador' AS id_fac
+            COALESCE(
+                datos->'infoFactura'->>'razonSocialComprador',
+                datos->'infoNotaCredito'->>'razonSocialComprador',
+                datos->'infoNotaDebito'->>'razonSocialComprador',
+                datos->'infoCompRetencion'->>'razonSocialSujetoRetenido',
+                datos->'infoLiquidacionCompra'->>'razonSocialProveedor'
+            ) AS razon_fac,
+            COALESCE(
+                datos->'infoFactura'->>'identificacionComprador',
+                datos->'infoNotaCredito'->>'identificacionComprador',
+                datos->'infoNotaDebito'->>'identificacionComprador',
+                datos->'infoCompRetencion'->>'identificacionSujetoRetenido',
+                datos->'infoLiquidacionCompra'->>'identificacionProveedor'
+            ) AS id_fac
         FROM documentos_emitidos
         {filtros}
         ORDER BY created_at DESC
@@ -705,7 +727,7 @@ async def actualizar_cobro(
     doc = res.fetchone()
     if not doc:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
-    if doc.tipo_doc not in ("FAC", "LIQ"):
+    if doc.tipo_doc not in ("FAC", "LIQ", "NDB"):
         raise HTTPException(status_code=400, detail="El estado de cobro solo aplica a facturas y liquidaciones.")
 
     await db.execute(text("""

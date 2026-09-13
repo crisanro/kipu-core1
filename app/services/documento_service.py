@@ -89,6 +89,12 @@ async def emitir_documento_core(
             doc_origen_emitido, cliente_final = await _cargar_doc_origen_emitido(
                 data, emisor_id, tipo_doc, db
             )
+
+            if cliente_final.get("tipo_id") == "07":
+                raise HTTPException(
+                    status_code=400,
+                    detail="No se pueden emitir notas de crédito ni débito para comprobantes a Consumidor Final."
+                )
         elif tipo_doc == "RET":
             doc_origen_emitido_id  = data.get("doc_origen_emitido_id")
             doc_origen_recibido_id = data.get("doc_origen_recibido_id")
@@ -139,6 +145,10 @@ async def emitir_documento_core(
         elif tipo_doc == "NDB":
             motivos_raw   = data.get("motivos", [])
             importe_total = sum(Decimal(str(m.get("valor", 0))) for m in motivos_raw)
+            # Sumar IVA al total si viene desglose de impuestos
+            impuestos_ndb_raw = data.get("impuestos", [])
+            if impuestos_ndb_raw:
+                importe_total += sum(Decimal(str(i.get("valor", 0))) for i in impuestos_ndb_raw)
             calculos      = None
         elif tipo_doc == "RET":
             impuestos_ret = data.get("impuestos_ret") or data.get("impuestos") or []
@@ -205,6 +215,7 @@ async def emitir_documento_core(
             doc_origen_recibido = doc_origen_recibido,
             es_sandbox          = es_sandbox,
             created_by          = created_by,
+            
             db                  = db,
         )
 
@@ -832,7 +843,11 @@ async def _construir_xml(
                 "valor":            "0.00",
             }]
 
-        pagos_xml = resolver_pagos(data.get("pagos", []), total_ndb)
+        # Calcular total con IVA
+        total_iva_ndb = sum(Decimal(str(i.get('valor', 0))) for i in impuestos_ndb_raw) if impuestos_ndb_raw else Decimal('0')
+        valor_total_ndb = total_ndb + total_iva_ndb
+
+        pagos_xml = resolver_pagos(data.get("pagos", []), valor_total_ndb)
 
         info_ndb = {
             "fechaEmision":                fecha_sri,
@@ -846,7 +861,7 @@ async def _construir_xml(
             "fechaEmisionDocSustento":     fecha_origen,
             "totalSinImpuestos":           f"{total_ndb:.2f}",
             "impuestos":                   {"impuesto": impuestos_ndb_xml},
-            "valorTotal":                  f"{total_ndb:.2f}",
+            "valorTotal":                  f"{valor_total_ndb:.2f}",
             "pagos":                       {"pago": pagos_xml},
         }
         if emisor.contribuyente_especial:
@@ -962,6 +977,8 @@ async def _persistir(
             email_comprador,
             doc_origen_emitido_id, doc_origen_recibido_id,
             es_sandbox, created_by,
+            estado_cobro, forma_pago_cobro,
+            numero_comprobante_pago, fecha_pago,
             created_at, updated_at
         ) VALUES (
             gen_random_uuid(),
@@ -973,6 +990,8 @@ async def _persistir(
             :email_comprador,
             :doc_origen_emitido_id, :doc_origen_recibido_id,
             :es_sandbox, :created_by,
+            :estado_cobro, :forma_pago_cobro,
+            :num_comp_pago, :fecha_pago_cobro,
             NOW(), NOW()
         ) RETURNING id
     """), {
@@ -995,6 +1014,10 @@ async def _persistir(
         "doc_origen_recibido_id": str(doc_origen_recibido.id) if doc_origen_recibido and getattr(doc_origen_recibido, "id", None) else None,
         "es_sandbox":             es_sandbox,
         "created_by":             str(created_by) if created_by else None,
+        "estado_cobro":           data.get("estado_cobro", "PENDIENTE"),
+        "forma_pago_cobro":       data.get("forma_pago_cobro"),
+        "num_comp_pago":          data.get("numero_comprobante_pago"),
+        "fecha_pago_cobro":       data.get("fecha_pago"),
     })
     doc_id = str(res.scalar())
 
