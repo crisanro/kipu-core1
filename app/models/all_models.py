@@ -52,6 +52,9 @@ class Emisor(Base):
     tipo_emisor = Column(String(10), nullable=False, server_default="NATURAL")
     contribuyente_especial  = Column(String(13))
     obligado_contabilidad   = Column(String(2), default="NO")
+    agente_retencion        = Column(String(8), nullable=True)
+    regimen_rimpe           = Column(String(50), nullable=True)
+    gran_contribuyente_resolucion = Column(String(50), nullable=True)
     periodo_iva             = Column(String(10), nullable=False, server_default="MENSUAL")
     ambiente                = Column(SmallInteger, default=1)       # 1=Pruebas 2=Producción
     p12_path                = Column(Text)

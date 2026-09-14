@@ -46,7 +46,7 @@ TIPO_DOC_MAP = {
     "LIQ": {"cod_doc": "03", "xml_root": "liquidacionCompra",    "xml_version": "1.1.0"},
     "NCR": {"cod_doc": "04", "xml_root": "notaCredito",          "xml_version": "1.1.0"},
     "NDB": {"cod_doc": "05", "xml_root": "notaDebito",           "xml_version": "1.0.0"},
-    "RET": {"cod_doc": "07", "xml_root": "comprobanteRetencion", "xml_version": "1.0.0"},
+    "RET": {"cod_doc": "07", "xml_root": "comprobanteRetencion", "xml_version": "2.0.0"},
 }
 
 MOTIVOS_NCR_VALIDOS = [
@@ -695,6 +695,21 @@ async def _construir_xml(
         "dirMatriz":       emisor.direccion_matriz,
     }
 
+    # ══ Leyendas SRI — Ficha Técnica v2.34 (tags en infoTributaria) ═════════
+    if getattr(emisor, "agente_retencion", None):
+        info_tributaria["agenteRetencion"] = emisor.agente_retencion
+    if getattr(emisor, "regimen_rimpe", None):
+        info_tributaria["contribuyenteRimpe"] = emisor.regimen_rimpe
+
+    # ══ Campos adicionales (infoAdicional) ══════════════════════════════════
+    campos_adicionales = construir_campos_adicionales(data)
+    # Anexo 24: Gran Contribuyente
+    if getattr(emisor, "gran_contribuyente_resolucion", None):
+        campos_adicionales.insert(-1, {  # antes del RUC Proveedor que va al final
+            "@nombre": "Gran Contribuyente",
+            "#text":   emisor.gran_contribuyente_resolucion,
+        })
+
     # ── FAC ───────────────────────────────────────────────────────────────────
     if tipo_doc == "FAC":
         propina   = Decimal(str(data.get("propina", 0) or 0)).quantize(Decimal("0.01"))
@@ -703,6 +718,7 @@ async def _construir_xml(
         info_fac = {
             "fechaEmision":                fecha_sri,
             "dirEstablecimiento":          direccion_est,
+            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
             "obligadoContabilidad":        getattr(emisor, "obligado_contabilidad", "NO"),
             "tipoIdentificacionComprador": cliente_final["tipo_id"],
             "razonSocialComprador":        cliente_final["razon_social"],
@@ -715,8 +731,6 @@ async def _construir_xml(
             "moneda":                      "DOLAR",
             "pagos":                       {"pago": pagos_xml},
         }
-        if emisor.contribuyente_especial:
-            info_fac["contribuyenteEspecial"] = emisor.contribuyente_especial
 
         return {
             "factura": {
@@ -725,7 +739,7 @@ async def _construir_xml(
                 "infoTributaria": info_tributaria,
                 "infoFactura":    info_fac,
                 "detalles":       {"detalle": calculos["detallesXml"]},
-                "infoAdicional":  {"campoAdicional": construir_campos_adicionales(data)},
+                "infoAdicional":  {"campoAdicional": campos_adicionales},
             }
         }
 
@@ -734,22 +748,22 @@ async def _construir_xml(
         pagos_xml = resolver_pagos(data.get("pagos", []), importe_total)
 
         info_liq = {
-            "fechaEmision":                fecha_sri,
-            "dirEstablecimiento":          direccion_est,
-            "obligadoContabilidad":        getattr(emisor, "obligado_contabilidad", "NO"),
+            "fechaEmision":                 fecha_sri,
+            "dirEstablecimiento":           direccion_est,
+            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
+            "obligadoContabilidad":         getattr(emisor, "obligado_contabilidad", "NO"),
             "tipoIdentificacionProveedor":  cliente_final["tipo_id"],
-            "razonSocialProveedor":        cliente_final["razon_social"],
-            "identificacionProveedor":     cliente_final["identificacion"],
-            "direccionProveedor":          cliente_final.get("direccion", "S/N"),
-            "totalSinImpuestos":           calculos["totales"]["totalSinImpuestos"],
-            "totalDescuento":              calculos["totales"]["totalDescuento"],
-            "totalConImpuestos":           {"totalImpuesto": calculos["totalConImpuestosXml"]},
-            "importeTotal":                f"{importe_total:.2f}",
-            "moneda":                      "DOLAR",
-            "pagos":                       {"pago": pagos_xml},
+            "razonSocialProveedor":         cliente_final["razon_social"],
+            "identificacionProveedor":      cliente_final["identificacion"],
+            "direccionProveedor":           cliente_final.get("direccion", "S/N"),
+            "totalSinImpuestos":            calculos["totales"]["totalSinImpuestos"],
+            "totalDescuento":               calculos["totales"]["totalDescuento"],
+            "totalConImpuestos":            {"totalImpuesto": calculos["totalConImpuestosXml"]},
+            "importeTotal":                 f"{importe_total:.2f}",
+            "moneda":                       "DOLAR",
+            "pagos":                        {"pago": pagos_xml},
         }
-        if emisor.contribuyente_especial:
-            info_liq["contribuyenteEspecial"] = emisor.contribuyente_especial
+
 
         return {
             "liquidacionCompra": {
@@ -758,7 +772,7 @@ async def _construir_xml(
                 "infoTributaria":        info_tributaria,
                 "infoLiquidacionCompra": info_liq,
                 "detalles":              {"detalle": calculos["detallesXml"]},
-                "infoAdicional":         {"campoAdicional": construir_campos_adicionales(data)},
+                "infoAdicional":         {"campoAdicional": campos_adicionales},
             }
         }
 
@@ -779,6 +793,7 @@ async def _construir_xml(
             "tipoIdentificacionComprador": cliente_final["tipo_id"],
             "razonSocialComprador":        cliente_final["razon_social"],
             "identificacionComprador":     cliente_final["identificacion"],
+            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
             "obligadoContabilidad":        info_origen.get("obligadoContabilidad", "NO"),
             "codDocModificado":            doc_origen_emitido.cod_doc,
             "numDocModificado":            doc_origen_emitido.numero_doc,
@@ -788,8 +803,6 @@ async def _construir_xml(
             "totalConImpuestos":           {"totalImpuesto": calculos["totalConImpuestosXml"]},
             "motivo":                      motivo,
         }
-        if emisor.contribuyente_especial:
-            info_nc["contribuyenteEspecial"] = emisor.contribuyente_especial
 
         return {
             "notaCredito": {
@@ -798,7 +811,7 @@ async def _construir_xml(
                 "infoTributaria":  info_tributaria,
                 "infoNotaCredito": info_nc,
                 "detalles":        {"detalle": detalles_nc},
-                "infoAdicional":   {"campoAdicional": construir_campos_adicionales(data)},
+                "infoAdicional":   {"campoAdicional": campos_adicionales},
             }
         }
 
@@ -843,7 +856,6 @@ async def _construir_xml(
                 "valor":            "0.00",
             }]
 
-        # Calcular total con IVA
         total_iva_ndb = sum(Decimal(str(i.get('valor', 0))) for i in impuestos_ndb_raw) if impuestos_ndb_raw else Decimal('0')
         valor_total_ndb = total_ndb + total_iva_ndb
 
@@ -855,6 +867,7 @@ async def _construir_xml(
             "tipoIdentificacionComprador": cliente_final["tipo_id"],
             "razonSocialComprador":        cliente_final["razon_social"],
             "identificacionComprador":     cliente_final["identificacion"],
+            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
             "obligadoContabilidad":        info_origen.get("obligadoContabilidad", "NO"),
             "codDocModificado":            doc_origen_emitido.cod_doc,
             "numDocModificado":            doc_origen_emitido.numero_doc,
@@ -864,8 +877,7 @@ async def _construir_xml(
             "valorTotal":                  f"{valor_total_ndb:.2f}",
             "pagos":                       {"pago": pagos_xml},
         }
-        if emisor.contribuyente_especial:
-            info_ndb["contribuyenteEspecial"] = emisor.contribuyente_especial
+
 
         return {
             "notaDebito": {
@@ -874,11 +886,11 @@ async def _construir_xml(
                 "infoTributaria": info_tributaria,
                 "infoNotaDebito": info_ndb,
                 "motivos":        {"motivo": motivos_xml},
-                "infoAdicional":  {"campoAdicional": construir_campos_adicionales(data)},
+                "infoAdicional":  {"campoAdicional": campos_adicionales},
             }
         }
 
-    # ── RET ───────────────────────────────────────────────────────────────────
+    # ── RET v2.0.0 ────────────────────────────────────────────────────────────
     elif tipo_doc == "RET":
         impuestos_ret = data.get("impuestos_ret") or data.get("impuestos") or []
         if not impuestos_ret:
@@ -890,40 +902,141 @@ async def _construir_xml(
 
         fecha_origen = doc_ret.fecha_emision.strftime("%d/%m/%Y")
 
-        impuestos_xml = [
+        # ── Datos del documento sustento ──────────────────────────────────
+        cod_sustento      = data.get("cod_sustento", "01")
+        pago_loc_ext      = data.get("pago_loc_ext", "01")
+        forma_pago_sust   = data.get("forma_pago_sustento", "01")
+        cod_doc_sustento  = str(getattr(doc_ret, "cod_doc", None) or "01")
+        num_doc_sustento  = (getattr(doc_ret, "numero_doc", "") or "").replace("-", "").zfill(15)
+
+        # Clave de acceso del doc sustento
+        num_aut = data.get("num_aut_doc_sustento") or getattr(doc_ret, "clave_acceso", None) or ""
+
+        # Totales del doc sustento — auto desde Kipu o manual desde frontend
+        total_sin_imp_sust = Decimal(str(
+            data.get("total_sin_impuestos_sustento")
+            or getattr(doc_ret, "subtotal_base", None)
+            or 0
+        ))
+        importe_total_sust = Decimal(str(
+            data.get("importe_total_sustento")
+            or getattr(doc_ret, "importe_total", None)
+            or 0
+        ))
+
+        # ── Impuestos del doc sustento (IVA/ICE que nos facturaron) ───────
+        imp_doc_sust_raw = data.get("impuestos_doc_sustento") or []
+
+        # Auto-rellenar desde datos del doc origen si viene de Kipu y no hay manual
+        if not imp_doc_sust_raw and hasattr(doc_ret, "datos") and doc_ret.datos:
+            datos_origen = doc_ret.datos or {}
+            # Buscar en resumenImpuestos o totalConImpuestos
+            resumen = datos_origen.get("resumenImpuestos", [])
+            if not resumen:
+                info_doc = (
+                    datos_origen.get("infoFactura")
+                    or datos_origen.get("infoLiquidacionCompra")
+                    or {}
+                )
+                total_imp = info_doc.get("totalConImpuestos", {}).get("totalImpuesto", [])
+                resumen = toArray_py(total_imp)
+
+            for imp in toArray_py(resumen):
+                tarifa  = str(imp.get("tarifa", "0"))
+                cod_pct = str(imp.get("codigoPorcentaje", "")) or _tarifa_a_codigo_porcentaje(tarifa)
+                imp_doc_sust_raw.append({
+                    "codImpuestoDocSustento": str(imp.get("codigo", "2")),
+                    "codigoPorcentaje":       cod_pct,
+                    "baseImponible":          str(imp.get("baseImponible", "0")),
+                    "tarifa":                 tarifa,
+                    "valorImpuesto":          str(imp.get("valor", "0")),
+                })
+
+            # Intentar obtener totalSinImpuestos desde datos si no vino
+            if total_sin_imp_sust == 0:
+                info_doc = (
+                    datos_origen.get("infoFactura")
+                    or datos_origen.get("infoLiquidacionCompra")
+                    or {}
+                )
+                total_sin_imp_sust = Decimal(str(info_doc.get("totalSinImpuestos", 0)))
+            if importe_total_sust == 0:
+                info_doc = (
+                    datos_origen.get("infoFactura")
+                    or datos_origen.get("infoLiquidacionCompra")
+                    or {}
+                )
+                importe_total_sust = Decimal(str(info_doc.get("importeTotal", 0)))
+
+        # Serializar impuestos doc sustento
+        impuestos_doc_xml = [
             {
-                "codigo":                  str(i.get("codigo", "1")),
-                "codigoRetencion":         str(i.get("codigoRetencion", "")),
-                "baseImponible":           f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
-                "porcentajeRetener":       str(i.get("porcentajeRetener", i.get("tarifa", ""))),
-                "valorRetenido":           f"{Decimal(str(i.get('valorRetenido', i.get('valor', 0)))):.2f}",
-                "codDocSustento":           str(i.get("codDocSustento", doc_ret.cod_doc or "01")),
-                "numDocSustento":           (doc_ret.numero_doc or "").replace("-", "").zfill(15),
-                "fechaEmisionDocSustento": fecha_origen,
+                "codImpuestoDocSustento": str(i.get("codImpuestoDocSustento", i.get("codigo", "2"))),
+                "codigoPorcentaje":       str(i.get("codigoPorcentaje", "0")),
+                "baseImponible":          f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
+                "tarifa":                 str(i.get("tarifa", "0")),
+                "valorImpuesto":          f"{Decimal(str(i.get('valorImpuesto', i.get('valor', 0)))):.2f}",
+            }
+            for i in imp_doc_sust_raw
+        ]
+
+        # ── Retenciones ──────────────────────────────────────────────────
+        retenciones_xml = [
+            {
+                "codigo":            str(i.get("codigo", "1")),
+                "codigoRetencion":   str(i.get("codigoRetencion", "")),
+                "baseImponible":     f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
+                "porcentajeRetener": str(i.get("porcentajeRetener", i.get("tarifa", ""))),
+                "valorRetenido":     f"{Decimal(str(i.get('valorRetenido', i.get('valor', 0)))):.2f}",
             }
             for i in impuestos_ret
         ]
 
-        info_ret = {
-            "fechaEmision":                    fecha_sri,
-            "dirEstablecimiento":                direccion_est,
-            "obligadoContabilidad":              getattr(emisor, "obligado_contabilidad", "NO"),
-            "tipoIdentificacionSujetoRetenido": cliente_final["tipo_id"],
-            "razonSocialSujetoRetenido":        cliente_final["razon_social"],
-            "identificacionSujetoRetenido":     cliente_final["identificacion"],
-            "periodoFiscal":                    data.get("periodo_fiscal", datetime.now(TZ_EC).strftime("%m/%Y")),
+        # ── Armar docSustento ────────────────────────────────────────────
+        doc_sustento = {
+            "codSustento":              cod_sustento,
+            "codDocSustento":           cod_doc_sustento,
+            **({"numDocSustento": num_doc_sustento} if num_doc_sustento.strip("0") else {}),
+            "fechaEmisionDocSustento":  fecha_origen,
+            **({"numAutDocSustento": num_aut} if num_aut else {}),
+            "pagoLocExt":               pago_loc_ext,
+            **({"tipoRegi":            data.get("tipo_regi", "01")}             if pago_loc_ext == "02" else {}),
+            **({"paisEfecPago":        data.get("pais_efec_pago", "593")}       if pago_loc_ext == "02" else {}),
+            **({"aplicConvDobTrib":    data.get("aplic_conv_dob_trib", "NO")}   if pago_loc_ext == "02" else {}),
+            **({"pagExtSujRetNorLeg":  data.get("pag_ext_suj_ret_nor_leg", "SI")} if pago_loc_ext == "02" and data.get("aplic_conv_dob_trib", "NO") == "NO" else {}),
+            **({"pagoRegFis":          data.get("pago_reg_fis", "NO")}          if pago_loc_ext == "02" else {}),
+            "totalSinImpuestos":        f"{total_sin_imp_sust:.2f}",
+            "importeTotal":             f"{importe_total_sust:.2f}",
+            "impuestosDocSustento":     {"impuestoDocSustento": impuestos_doc_xml},
+            "retenciones":              {"retencion": retenciones_xml},
+            "pagos":                    {"pago": [{
+                "formaPago": forma_pago_sust,   
+                "total":     f"{importe_total_sust:.2f}",
+            }]},
         }
-        if emisor.contribuyente_especial:
-            info_ret["contribuyenteEspecial"] = emisor.contribuyente_especial
+
+        # ── Info retención ───────────────────────────────────────────────
+        info_ret = {
+            "fechaEmision":                         fecha_sri,
+            "dirEstablecimiento":                   direccion_est,
+            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
+            "obligadoContabilidad":                 getattr(emisor, "obligado_contabilidad", "NO"),
+            "tipoIdentificacionSujetoRetenido":     cliente_final["tipo_id"],
+            **({"tipoSujetoRetenido": data.get("tipo_sujeto_retenido", "01")} if cliente_final["tipo_id"] == "08" else {}),
+            "parteRel":                             data.get("parte_rel", "NO"),
+            "razonSocialSujetoRetenido":            cliente_final["razon_social"],
+            "identificacionSujetoRetenido":         cliente_final["identificacion"],
+            "periodoFiscal":                        data.get("periodo_fiscal", datetime.now(TZ_EC).strftime("%m/%Y")),
+        }
 
         return {
             "comprobanteRetencion": {
                 "@id":               "comprobante",
-                "@version":          tipo_info["xml_version"],
+                "@version":          "2.0.0",
                 "infoTributaria":    info_tributaria,
                 "infoCompRetencion": info_ret,
-                "impuestos":         {"impuesto": impuestos_xml},
-                "infoAdicional":     {"campoAdicional": construir_campos_adicionales(data)},
+                "docsSustento":      {"docSustento": doc_sustento},
+                "infoAdicional":     {"campoAdicional": campos_adicionales},
             }
         }
 
@@ -1017,7 +1130,7 @@ async def _persistir(
         "estado_cobro":           data.get("estado_cobro", "PENDIENTE"),
         "forma_pago_cobro":       data.get("forma_pago_cobro"),
         "num_comp_pago":          data.get("numero_comprobante_pago"),
-        "fecha_pago_cobro":       data.get("fecha_pago"),
+        "fecha_pago_cobro":       date.fromisoformat(data["fecha_pago"]) if data.get("fecha_pago") else None,
     })
     doc_id = str(res.scalar())
 
@@ -1141,3 +1254,22 @@ async def _invalidar_cache(emisor_id: int):
             await redis.delete(*keys)
     except Exception as e:
         print(f"[Cache] ⚠️ No invalidado: {e}")
+
+
+def _tarifa_a_codigo_porcentaje(tarifa: str) -> str:
+    """Convierte tarifa IVA a codigoPorcentaje según Tabla 17 ficha técnica."""
+    MAPA = {
+        "0":  "0",
+        "5":  "5",
+        "12": "2",
+        "13": "10",
+        "14": "3",
+        "15": "4",
+    }
+    return MAPA.get(str(tarifa).split(".")[0], "0")
+
+def toArray_py(v):
+    """Normaliza a lista — equivalente al toArray de helpers.js"""
+    if not v:
+        return []
+    return v if isinstance(v, list) else [v]

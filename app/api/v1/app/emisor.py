@@ -361,6 +361,7 @@ async def get_config(
             e.ruc, e.razon_social, e.nombre_comercial, e.direccion_matriz,
             e.contribuyente_especial, e.obligado_contabilidad, e.ambiente,
             e.p12_path, e.p12_expiration, e.created_at, e.periodo_iva,
+            e.agente_retencion, e.regimen_rimpe, e.gran_contribuyente_resolucion,
             COALESCE(uc.balance, 0) AS balance_api,
             s.estado                AS sub_estado,
             s.plan                  AS sub_plan,
@@ -428,11 +429,18 @@ async def update_config(
         raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
     verificar_permiso(auth_data, "configuracion")
 
-    update_data = {
-        k: (mayusculas(v) if isinstance(v, str) else v)
-        for k, v in data.model_dump().items()
-        if v is not None
-    }
+    CAMPOS_LITERALES = {"regimen_rimpe"}
+    update_data = {}
+    for k, v in data.model_dump(exclude_unset=True).items():
+        if v is None:
+            update_data[k] = None  # permite borrar el campo
+        elif k in CAMPOS_LITERALES:
+            update_data[k] = v
+        elif isinstance(v, str):
+            update_data[k] = mayusculas(v)
+        else:
+            update_data[k] = v
+            
     if not update_data:
         return {"ok": True, "mensaje": "NO SE DETECTARON CAMBIOS."}
 

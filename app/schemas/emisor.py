@@ -21,7 +21,12 @@ class OnboardingRequest(BaseModel):
 class EmisorUpdate(BaseModel):
     nombre_comercial:       Optional[str] = None
     direccion_matriz:       Optional[str] = None
-    contribuyente_especial: Optional[str] = Field(None, max_length=5)
-    obligado_contabilidad:  Optional[str] = Field(None, max_length=2)
+    razon_social:           Optional[str] = Field(None, min_length=3)
+    contribuyente_especial: Optional[str] = Field(None, max_length=13)
+    obligado_contabilidad:  Optional[str] = Field(None, pattern="^(SI|NO)$")
     tipo_emisor:            Optional[str] = Field(None, pattern="^(NATURAL|JURIDICO)$")
-    periodo_iva:            Optional[str] = Field(None, pattern="^(MENSUAL|SEMESTRAL)$") 
+    periodo_iva:            Optional[str] = Field(None, pattern="^(MENSUAL|SEMESTRAL)$")
+    # ── Leyendas SRI v2.34 ────────────────────────────────────────
+    agente_retencion:              Optional[str] = Field(None, max_length=8)
+    regimen_rimpe:                 Optional[str] = Field(None, pattern="^(CONTRIBUYENTE RÉGIMEN RIMPE|CONTRIBUYENTE NEGOCIO POPULAR - RÉGIMEN RIMPE)$")
+    gran_contribuyente_resolucion: Optional[str] = Field(None, max_length=50)

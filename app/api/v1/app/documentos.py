@@ -66,12 +66,26 @@ class EmitirDocumentoRequest(BaseModel):
     impuestos:              Optional[list[dict]] = None
     periodo_fiscal:         Optional[str]        = None
     campos_adicionales:     Optional[list[CampoAdicional]] = None
+    cod_sustento:                   Optional[str]        = None   # Catálogo ATS tabla 5
+    pago_loc_ext:                   Optional[str]        = "01"   # 01=local 02=exterior
+    forma_pago_sustento:            Optional[str]        = "01"   # forma pago del doc sustento
+    total_sin_impuestos_sustento:   Optional[float]      = None
+    importe_total_sustento:         Optional[float]      = None
+    num_aut_doc_sustento:           Optional[str]        = None   # clave acceso del doc sustento
+    impuestos_doc_sustento:         Optional[list[dict]] = None   # IVA/ICE del doc sustento
+    parte_rel:                      Optional[str]        = "NO"    # SI/NO — parte relacionada
+    tipo_sujeto_retenido:           Optional[str]        = None    # Tabla 14 ATS — solo si tipo_id=08
     origen:                 Optional[str]                  = "web"
     proforma_id: Optional[str] = None
     estado_cobro:            Optional[str]  = None
     forma_pago_cobro:        Optional[str]  = None
     numero_comprobante_pago: Optional[str]  = None
     fecha_pago:              Optional[str]  = None
+    tipo_regi:              Optional[str] = None   # Tabla 19 ATS: 01=General, 02=Paraíso, 03=Preferente
+    pais_efec_pago:         Optional[str] = None   # Código país (tabla 25 ficha técnica)
+    aplic_conv_dob_trib:    Optional[str] = "NO"   # SI/NO
+    pag_ext_suj_ret_nor_leg: Optional[str] = "SI"  # SI/NO (cuando aplicConvDobTrib=NO)
+    pago_reg_fis:           Optional[str] = "NO"   # SI/NO
 
 class ActualizarCobro(BaseModel):
     estado_cobro:            str
@@ -208,9 +222,9 @@ async def historial_documentos(
             datos->'infoNotaDebito'->>'razonSocialComprador' ILIKE :q OR
             datos->'infoNotaDebito'->>'identificacionComprador' ILIKE :q OR
             datos->'infoLiquidacionCompra'->>'razonSocialProveedor' ILIKE :q OR
-            datos->'infoLiquidacionCompra'->>'identificacionProveedor' ILIKE :q
+            datos->'infoLiquidacionCompra'->>'identificacionProveedor' ILIKE :q OR
             datos->'infoCompRetencion'->>'razonSocialSujetoRetenido' ILIKE :q OR
-            datos->'infoCompRetencion'->>'identificacionSujetoRetenido' ILIKE :q OR
+            datos->'infoCompRetencion'->>'identificacionSujetoRetenido' ILIKE :q 
         )"""
         params["q"] = f"%{q}%"
 
@@ -325,6 +339,14 @@ async def resumen_documentos(
         FROM documentos_emitidos d,
              jsonb_array_elements(
                  CASE
+                     -- v2.0.0: docsSustento → docSustento → retenciones → retencion
+                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL
+                     THEN CASE
+                         WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                         THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                         ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
+                     END
+                     -- v1.0.0: impuestos → impuesto
                      WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
                      THEN d.datos->'impuestos'->'impuesto'
                      WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL

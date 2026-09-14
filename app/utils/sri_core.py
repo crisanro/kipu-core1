@@ -256,10 +256,6 @@ def resolver_pagos(pagos_raw: list, importe_total: Decimal) -> list:
 # ── Campos adicionales ─────────────────────────────────────────────────────────
 
 def construir_campos_adicionales(factura_data: dict) -> list:
-    """
-    Construye el array de campoAdicional para infoAdicional del XML.
-    El campo Proveedor siempre va al final.
-    """
     campos = []
 
     campos_raw = factura_data.get("campos_adicionales") or []
@@ -270,9 +266,9 @@ def construir_campos_adicionales(factura_data: dict) -> list:
                 "#text":   str(campo["valor"])[:300]
             })
 
-    # Proveedor siempre al final
+    # Anexo 26 — RUC del proveedor de facturación electrónica
     campos.append({
-        "@nombre": "RUC PROVEEDOR",
+        "@nombre": "RUC Proveedor",
         "#text":   "1312838392001"
     })
 
