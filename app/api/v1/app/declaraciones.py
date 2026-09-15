@@ -7,7 +7,7 @@
 # La declaración real la hace el usuario en el SRI en Línea.
 import json
 from datetime import date, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
@@ -15,6 +15,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
+from app.services.audit_service import audit_log
 from app.workers.declaraciones_worker import calcular_vencimiento
 
 import zipfile
@@ -945,6 +946,7 @@ async def _leer_campos_manuales(emisor_id: int, periodo_db: date, db: AsyncSessi
 # =============================================================================
 @router.patch("/iva/campos-manuales", summary="Guardar casilleros manuales del formulario 104")
 async def guardar_campos_manuales_iva(
+    request:   Request,
     periodo:   str          = Query(..., description="Período YYYY-MM, ej: 2026-08"),
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
@@ -999,6 +1001,10 @@ async def guardar_campos_manuales_iva(
         "valores": json.dumps(valores_limpios),
         "pid":     str(profile_id) if profile_id else None,
     })
+
+    await audit_log(db, auth_data, "UPDATE", "declaracion", None,
+                    {"periodo": periodo, "accion": "campos_manuales", "casilleros": valores_limpios},
+                    request)
     await db.commit()
 
     return {

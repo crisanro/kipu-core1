@@ -1137,6 +1137,9 @@ async def _persistir(
     if tipo_doc in ("FAC", "LIQ") and calculos:
         await _descontar_stock(datos_json, emisor.id, db)
 
+    if tipo_doc in ("FAC", "LIQ") and data.get("items"):
+        await _guardar_items_catalogo(data["items"], emisor.id, db)
+
     await _invalidar_cache(emisor.id)
 
     # ── Redis: contador de uso + cola SRI ─────────────────────────────────────
@@ -1210,6 +1213,8 @@ async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
         if not isinstance(detalles, list):
             detalles = [detalles]
 
+        hubo_descuento = False
+
         for det in detalles:
             codigo  = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
             if not codigo or codigo == "S/C":
@@ -1227,7 +1232,8 @@ async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
             if not item:
                 continue
 
-            # Notificar stock bajo
+            hubo_descuento = True
+
             if item.stock_minimo > 0 and item.stock <= item.stock_minimo:
                 try:
                     await crear_notificacion(
@@ -1240,6 +1246,10 @@ async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
                     )
                 except Exception as e:
                     print(f"[Stock] ⚠️ Error notificando stock bajo: {e}")
+
+        if hubo_descuento:
+            from app.core.cache import cache_clear_prefix
+            await cache_clear_prefix(f"productos:{emisor_id}:")
 
     except Exception as e:
         print(f"[Stock] ⚠️ Error descontando stock: {e}")
@@ -1273,3 +1283,42 @@ def toArray_py(v):
     if not v:
         return []
     return v if isinstance(v, list) else [v]
+
+
+async def _guardar_items_catalogo(items: list, emisor_id: int, db: AsyncSession):
+    """Guarda en catalogo_items los ítems marcados con guardar_catalogo=True."""
+    try:
+        guardados = 0
+        for item in items:
+            if not item.get("guardar_catalogo"):
+                continue
+            codigo = (item.get("codigo") or "").strip()
+            if not codigo:
+                continue
+
+            res = await db.execute(text("""
+                SELECT id FROM catalogo_items
+                WHERE emisor_id = :eid AND codigo = :cod
+            """), {"eid": emisor_id, "cod": codigo})
+            if res.fetchone():
+                continue
+
+            await db.execute(text("""
+                INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad)
+                VALUES (:eid, :cod, :desc, :precio, :iva, :unidad)
+            """), {
+                "eid":    emisor_id,
+                "cod":    codigo,
+                "desc":   item.get("descripcion", ""),
+                "precio": item.get("precio_unitario", 0),
+                "iva":    str(item.get("tipo_iva", "15")),
+                "unidad": item.get("unidad_medida", "UNIDAD"),
+            })
+            guardados += 1
+
+        if guardados > 0:
+            from app.core.cache import cache_clear_prefix
+            await cache_clear_prefix(f"productos:{emisor_id}:")
+            print(f"[Catálogo] ✅ {guardados} ítem(s) guardado(s) en catálogo")
+    except Exception as e:
+        print(f"[Catálogo] ⚠️ Error guardando ítems: {e}")

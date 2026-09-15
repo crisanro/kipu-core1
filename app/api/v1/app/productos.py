@@ -260,9 +260,11 @@ async def actualizar_producto(
     verificar_permiso(auth_data, "productos")
 
     res = await db.execute(text("""
-        SELECT id FROM catalogo_items WHERE id = :id AND emisor_id = :eid
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, activo
+        FROM catalogo_items WHERE id = :id AND emisor_id = :eid
     """), {"id": producto_id, "eid": emisor_id})
-    if not res.fetchone():
+    actual = res.fetchone()
+    if not actual:
         raise HTTPException(status_code=404, detail="Producto no encontrado.")
 
     if data.tipo_iva and data.tipo_iva not in ("0", "5", "15"):
@@ -284,6 +286,12 @@ async def actualizar_producto(
 
     campos.append("updated_at = NOW()")
 
+    campos_nuevos = data.model_dump(exclude_none=True)
+    antes = {}
+    for campo in campos_nuevos:
+        if hasattr(actual, campo):
+            antes[campo] = str(getattr(actual, campo))
+
     try:
         await db.execute(text(f"""
             UPDATE catalogo_items SET {', '.join(campos)}
@@ -296,7 +304,7 @@ async def actualizar_producto(
             accion     = "UPDATE",
             entidad    = "producto",
             entidad_id = producto_id,
-            detalle    = data.model_dump(exclude_none=True),
+            detalle    = {"antes": antes, "despues": campos_nuevos},
             request    = request,
         )
         await db.commit()
@@ -308,6 +316,8 @@ async def actualizar_producto(
 
     await invalidar_cache_productos(emisor_id)
     return {"ok": True, "mensaje": "Producto actualizado exitosamente."}
+
+
 
 # ── PATCH /{producto_id}/stock ────────────────────────────────────────────────
 @router.patch("/{producto_id}/stock", summary="Ajustar stock manualmente")

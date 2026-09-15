@@ -1,5 +1,5 @@
 # app/api/v1/app/cuentas.py
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
@@ -17,6 +17,7 @@ from app.services.cuentas_service import (
     registrar_abono_core,
     registrar_ajuste_core,
 )
+from app.services.audit_service import audit_log
 
 router = APIRouter()
 
@@ -56,12 +57,19 @@ async def _verificar_suscripcion(emisor_id: int, db: AsyncSession):
 @router.post("")
 async def crear_cuenta(
     datos:     CuentaCreate,
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
     await _verificar_suscripcion(auth_data["emisor_id"], db)
-    return await crear_cuenta_core(auth_data["emisor_id"], datos.model_dump(), db)
+    result = await crear_cuenta_core(auth_data["emisor_id"], datos.model_dump(), db)
+    await audit_log(db, auth_data, "CREATE", "cuenta",
+                    result.get("id"),
+                    {"tipo": datos.tipo, "concepto": datos.concepto, "monto_total": datos.monto_total},
+                    request)
+    await db.commit()
+    return result
 
 @router.get("")
 async def listar_cuentas(
@@ -95,17 +103,24 @@ async def detalle_cuenta(
 async def registrar_abono(
     cuenta_id: str,
     datos:     AbonoCreate,
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
     await _verificar_suscripcion(auth_data["emisor_id"], db)
-    return await registrar_abono_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
+    result = await registrar_abono_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
+    await audit_log(db, auth_data, "UPDATE", "cuenta", cuenta_id,
+                    {"accion": "abono", "monto": datos.monto, "forma_pago": datos.forma_pago},
+                    request)
+    await db.commit()
+    return result
 
 @router.post("/{cuenta_id}/ajustes")
 async def registrar_ajuste(
     cuenta_id: str,
     datos:     AjusteCreate,
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
@@ -115,14 +130,23 @@ async def registrar_ajuste(
     """
     verificar_permiso(auth_data, "clientes")
     await _verificar_suscripcion(auth_data["emisor_id"], db)
-    return await registrar_ajuste_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
+    result = await registrar_ajuste_core(auth_data["emisor_id"], cuenta_id, datos.model_dump(), db)
+    await audit_log(db, auth_data, "UPDATE", "cuenta", cuenta_id,
+                    {"accion": "ajuste", "monto": datos.monto, "motivo": datos.motivo},
+                    request)
+    await db.commit()
+    return result
 
 @router.patch("/{cuenta_id}/anular")
 async def anular_cuenta(
     cuenta_id: str,
+    request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
     verificar_permiso(auth_data, "clientes")
     await _verificar_suscripcion(auth_data["emisor_id"], db)
-    return await anular_cuenta_core(auth_data["emisor_id"], cuenta_id, db)
+    result = await anular_cuenta_core(auth_data["emisor_id"], cuenta_id, db)
+    await audit_log(db, auth_data, "ANULAR", "cuenta", cuenta_id, None, request)
+    await db.commit()
+    return result

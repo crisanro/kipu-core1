@@ -43,7 +43,7 @@ async def audit_log(
             "accion":     accion.upper(),
             "entidad":    entidad.lower(),
             "entidad_id": str(entidad_id) if entidad_id else None,
-            "detalle":    json.dumps(detalle) if detalle else None,
+            "detalle":    json.dumps(detalle, default=str) if detalle else None,
             "ip":         ip,
         })
         # No hacemos commit aquí — se commitea junto con la operación principal

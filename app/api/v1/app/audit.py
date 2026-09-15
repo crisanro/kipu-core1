@@ -13,15 +13,16 @@ router = APIRouter()
 
 @router.get("", summary="Historial de auditoría de la empresa")
 async def listar_audit_logs(
-    auth_data:  dict         = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db),
-    entidad:    Optional[str] = Query(None, description="documento | cliente | producto | usuario | config | api_key | firma"),
-    accion:     Optional[str] = Query(None, description="CREATE | UPDATE | DELETE | REVOKE | INVITE | ACTIVATE"),
-    profile_id: Optional[str] = Query(None, description="Filtrar por usuario"),
+    auth_data:    dict         = Depends(verify_firebase_token),
+    db:           AsyncSession = Depends(get_db),
+    entidad:      Optional[str] = Query(None, description="documento | cliente | producto | usuario | config | api_key | firma"),
+    accion:       Optional[str] = Query(None, description="CREATE | UPDATE | DELETE | REVOKE | INVITE | ACTIVATE"),
+    profile_id:   Optional[str] = Query(None, description="Filtrar por usuario"),
     fecha_inicio: Optional[str] = Query(None),
     fecha_fin:    Optional[str] = Query(None),
-    limit:      int           = Query(50, le=200),
-    offset:     int           = Query(0),
+    q:            Optional[str] = Query(None, description="Búsqueda en detalle JSONB"),
+    limit:        int           = Query(50, le=200),
+    offset:       int           = Query(0),
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
@@ -50,6 +51,10 @@ async def listar_audit_logs(
     if fecha_fin:
         filtros += " AND al.created_at <= :ff"
         params["ff"] = fecha_fin
+
+    if q:
+        filtros += " AND al.detalle::text ILIKE :q"
+        params["q"] = f"%{q}%"
 
     params["limit"]  = limit
     params["offset"] = offset
