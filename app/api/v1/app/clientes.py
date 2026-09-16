@@ -116,3 +116,82 @@ async def actualizar_cliente(
     )
     await db.commit()
     return result
+
+
+
+# =============================================================================
+# LOOKUP — GET /identificaciones/lookup
+# =============================================================================
+@router.get("/identificaciones/lookup", summary="Buscar identificación en cache global")
+async def lookup_identificacion(
+    id:        str          = QueryParam(..., min_length=5, max_length=13),
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """Busca en sujetos_global. Si existe, retorna el nombre."""
+    from sqlalchemy import text
+
+    cedula = id.strip()[:10]  # primeros 10 dígitos para buscar
+
+    # Buscar exacto (cédula 10 dígitos) o con 001 (RUC 13 dígitos)
+    res = await db.execute(text("""
+        SELECT identificacion, razon_social, tipo_identificacion_sri
+        FROM sujetos_global
+        WHERE identificacion = :ced
+           OR identificacion = :ruc
+        LIMIT 1
+    """), {"ced": cedula, "ruc": cedula + "001"})
+    row = res.fetchone()
+
+    if row:
+        return {
+            "ok": True, "found": True,
+            "data": {
+                "identificacion": row.identificacion,
+                "razon_social":   row.razon_social,
+                "tipo":           row.tipo_identificacion_sri,
+            }
+        }
+
+    return {"ok": True, "found": False}
+
+
+# =============================================================================
+# SAVE — POST /identificaciones
+# =============================================================================
+@router.post("/identificaciones", summary="Guardar identificación en cache global")
+async def guardar_identificacion(
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """Guarda en sujetos_global una identificación consultada externamente."""
+    from sqlalchemy import text
+
+    body = await request.json()
+    identificacion = (body.get("identificacion") or "").strip()
+    razon_social   = (body.get("razon_social") or "").strip()
+
+    if not identificacion or not razon_social:
+        raise HTTPException(status_code=400, detail="identificacion y razon_social son requeridos.")
+
+    # Determinar tipo
+    largo = len(identificacion)
+    if largo == 13 and identificacion.endswith("001"):
+        tipo = "04"
+    elif largo == 10 and identificacion.isdigit():
+        tipo = "05"
+    else:
+        tipo = "06"
+
+    await db.execute(text("""
+        INSERT INTO sujetos_global (id, tipo_identificacion_sri, identificacion, razon_social, ultima_sincronizacion)
+        VALUES (gen_random_uuid(), :tipo, :ident, :razon, NOW())
+        ON CONFLICT (identificacion) DO UPDATE
+        SET razon_social = EXCLUDED.razon_social,
+            ultima_sincronizacion = NOW()
+    """), {"tipo": tipo, "ident": identificacion, "razon": razon_social})
+
+    await db.commit()
+
+    return {"ok": True, "mensaje": "Guardado en cache global."}
