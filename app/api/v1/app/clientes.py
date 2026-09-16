@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
 from app.schemas.cliente import ClienteCreate, ClienteBusquedaMasiva, ClienteUpdate
+from app.core.rate_limit import RateLimit, RateLimitScope
 from app.services.cliente_service import (
     crear_cliente_core,
     consultar_cliente_por_identificacion_core,
@@ -127,6 +128,7 @@ async def lookup_identificacion(
     id:        str          = QueryParam(..., min_length=5, max_length=13),
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.PUBLIC_CHECK)),
 ):
     """Busca en sujetos_global. Si existe, retorna el nombre."""
     from sqlalchemy import text
@@ -164,6 +166,7 @@ async def guardar_identificacion(
     request:   Request,
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
+    _rl: None = Depends(RateLimit(RateLimitScope.PUBLIC_CHECK)),
 ):
     """Guarda en sujetos_global una identificación consultada externamente."""
     from sqlalchemy import text
