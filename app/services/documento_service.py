@@ -1310,9 +1310,9 @@ async def _guardar_items_catalogo(items: list, emisor_id: int, db: AsyncSession)
                 "eid":    emisor_id,
                 "cod":    codigo,
                 "desc":   item.get("descripcion", ""),
-                "precio": item.get("precio_unitario", 0),
+                "precio": item.get("precio_unitario", item.get("precio", 0)),
                 "iva":    str(item.get("tipo_iva", "15")),
-                "unidad": item.get("unidad_medida", "UNIDAD"),
+                "unidad": item.get("unidad_medida", item.get("unidad", "UNIDAD")),
             })
             guardados += 1
 
