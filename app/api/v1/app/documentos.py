@@ -35,6 +35,7 @@ class ItemDoc(BaseModel):
     descuento:       float          = 0
     tipo_iva:        str            = "15"
     unidad_medida:   Optional[str]  = "UNIDAD"
+    guardar_catalogo: Optional[bool] = False
 
 class PagoDoc(BaseModel):
     forma_pago:    str            = "01"
