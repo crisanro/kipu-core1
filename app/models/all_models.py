@@ -87,16 +87,17 @@ class Profile(Base):
     """Usuarios del sistema. Vinculan Firebase Auth con Kipu."""
     __tablename__ = "profiles"
 
-    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    firebase_uid    = Column(Text, unique=True, nullable=False)
-    email           = Column(Text, unique=True, nullable=False)
-    full_name       = Column(Text)
-    role            = Column(String(20), default="admin")
-    whatsapp_number = Column(String(20))
-    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    id                 = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    firebase_uid       = Column(Text, unique=True, nullable=False)
+    email              = Column(Text, unique=True, nullable=False)
+    full_name          = Column(Text)
+    role               = Column(String(20), default="admin")
+    whatsapp_number    = Column(String(20))
+    empresa_default_id = Column(Integer, ForeignKey("emisores.id", ondelete="SET NULL"), nullable=True)  # empresa al iniciar sesión
+    created_at         = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
-    emisores        = relationship("EmisorUsuario", back_populates="profile")
-    audit_logs = relationship("AuditLog", foreign_keys="AuditLog.profile_id", backref="profile_audit")
+    emisores           = relationship("EmisorUsuario", back_populates="profile")
+    audit_logs         = relationship("AuditLog", foreign_keys="AuditLog.profile_id", backref="profile_audit")
 
 
 class EmisorUsuario(Base):
@@ -431,6 +432,9 @@ class DocumentoEmitido(Base):
     forma_pago_cobro        = Column(String(30), nullable=True)     # EFECTIVO | TRANSFERENCIA | CHEQUE | TARJETA | OTRO
     numero_comprobante_pago = Column(String(100), nullable=True)
     fecha_pago              = Column(Date, nullable=True)
+    anulacion_estado            = Column(String(12), nullable=True)   # PENDIENTE | ACEPTADA | RECHAZADA | VENCIDA
+    anulacion_solicitada_at     = Column(TIMESTAMP(timezone=True), nullable=True)
+    anulacion_limite_aceptacion = Column(Date, nullable=True)
 
     # Total desnormalizado para queries rápidas
     importe_total           = Column(Numeric(12, 2), nullable=False)

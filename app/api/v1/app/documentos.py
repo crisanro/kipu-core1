@@ -13,6 +13,11 @@ from app.core.rate_limit import RateLimit, RateLimitScope
 from app.core.idempotency import verificar_idempotency, guardar_idempotency
 from app.services.documento_service import emitir_documento_core
 from app.services.audit_service import audit_log
+from app.services.anulacion_service import (
+    MOTIVOS_ANULACION, DIAS_HABILES_ACEPTACION,
+    evaluar_anulacion, vencer_si_corresponde, aplicar_efectos_anulacion,
+    hoy_ec, sumar_dias_habiles, fecha_sri, iso,
+)
 
 router = APIRouter()
 
@@ -93,6 +98,59 @@ class ActualizarCobro(BaseModel):
     forma_pago_cobro:        Optional[str]  = None
     numero_comprobante_pago: Optional[str]  = None
     fecha_pago:              Optional[date] = None
+
+class AnulacionRequest(BaseModel):
+    motivo:     str
+    confirmado: bool  # el usuario marcó "ya ingresé la solicitud en el SRI"
+
+class ResolverAnulacionRequest(BaseModel):
+    aceptada: bool    # True = el receptor aceptó en el SRI, False = la rechazó
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+COLUMNAS_ANULACION = """
+    id, tipo_doc, estado_sri, es_sandbox, fecha_emision, fecha_autorizacion,
+    numero_doc, clave_acceso, email_comprador, datos, motivo_anulacion,
+    anulacion_estado, anulacion_solicitada_at, anulacion_limite_aceptacion
+"""
+
+async def _cargar_doc_anulacion(db: AsyncSession, doc_id: str, emisor_id: int) -> dict:
+    res = await db.execute(text(f"""
+        SELECT {COLUMNAS_ANULACION}
+        FROM documentos_emitidos
+        WHERE id = :did AND emisor_id = :eid
+    """), {"did": doc_id, "eid": emisor_id})
+    row = res.mappings().fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Documento no encontrado.")
+    return dict(row)
+
+
+async def _invalidar_cache_emisor(emisor_id: int):
+    try:
+        from app.core.cache import get_redis
+        redis = await get_redis()
+        for pattern in (f"dashboard:{emisor_id}*", f"dashboard_docs:{emisor_id}:*"):
+            async for key in redis.scan_iter(pattern):
+                await redis.delete(key)
+    except Exception as e:
+        print(f"[Cache] ⚠️ No invalidado: {e}")
+
+
+async def _notificar(db: AsyncSession, emisor_id: int, titulo: str, mensaje: str, doc_id: str):
+    try:
+        from app.services.notification_service import crear_notificacion
+        await crear_notificacion(
+            db         = db,
+            emisor_id  = emisor_id,
+            tipo       = "DOCUMENTO",
+            titulo     = titulo,
+            mensaje    = mensaje,
+            referencia = f"/documentos/{doc_id}",
+        )
+    except Exception as e:
+        print(f"[Notif] ⚠️ No se pudo notificar: {e}")
 
 # =============================================================================
 # EMIT — POST /emit/{tipo_doc}
@@ -238,6 +296,7 @@ async def historial_documentos(
             clave_acceso, numero_doc, secuencial,
             fecha_emision, estado_sri, estado_cobro,
             importe_total, origen, created_at,
+            anulacion_estado,
             datos->>'legacy_razon_comprador' AS razon_comprador,
             datos->>'legacy_id_comprador'    AS id_comprador,
             COALESCE(
@@ -266,19 +325,20 @@ async def historial_documentos(
         razon  = r.razon_fac or r.razon_comprador or ""
         id_com = r.id_fac or r.id_comprador or ""
         data.append({
-            "id":             str(r.id),
-            "tipo_doc":       r.tipo_doc,
-            "cod_doc":        r.cod_doc,
-            "clave_acceso":   r.clave_acceso,
-            "numero_doc":     r.numero_doc,
-            "fecha_emision":  str(r.fecha_emision),
-            "estado_sri":     r.estado_sri,
-            "estado_cobro":   r.estado_cobro,
-            "importe_total":  float(r.importe_total),
-            "razon_social":   razon,
-            "identificacion": id_com,
-            "origen":         r.origen,
-            "created_at":     str(r.created_at),
+            "id":               str(r.id),
+            "tipo_doc":         r.tipo_doc,
+            "cod_doc":          r.cod_doc,
+            "clave_acceso":     r.clave_acceso,
+            "numero_doc":       r.numero_doc,
+            "fecha_emision":    str(r.fecha_emision),
+            "estado_sri":       r.estado_sri,
+            "estado_cobro":     r.estado_cobro,
+            "anulacion_estado": r.anulacion_estado,
+            "importe_total":    float(r.importe_total),
+            "razon_social":     razon,
+            "identificacion":   id_com,
+            "origen":           r.origen,
+            "created_at":       iso(r.created_at),
         })
     return {"ok": True, "total": len(data), "data": data}
 
@@ -436,19 +496,7 @@ async def resumen_documentos(
 # =============================================================================
 # ANULAR — POST /{doc_id}/anular
 # =============================================================================
-MOTIVOS_ANULACION = [
-    "ERROR EN DATOS DEL CLIENTE",
-    "ERROR EN MONTO O ÍTEMS",
-    "DOCUMENTO DUPLICADO",
-    "OPERACIÓN NO REALIZADA",
-    "OTRO",
-]
-
-class AnulacionRequest(BaseModel):
-    motivo:      str
-    confirmado:  bool  # el usuario marcó el check "ya lo anulé en el SRI"
-
-@router.post("/{doc_id}/anular", summary="Anular comprobante autorizado")
+@router.post("/{doc_id}/anular", summary="Registrar anulación hecha en el portal SRI")
 async def anular_documento(
     doc_id:    str,
     body:      AnulacionRequest,
@@ -458,53 +506,69 @@ async def anular_documento(
 ):
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
-        raise HTTPException(status_code=400, detail="EL USUARIO NO TIENE UN EMISOR VINCULADO.")
-
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "emitir")
 
     if not body.confirmado:
         raise HTTPException(
             status_code=400,
-            detail="DEBES CONFIRMAR QUE YA ANULASTE EL COMPROBANTE EN EL PORTAL DEL SRI."
+            detail="Confirma que ya ingresaste la solicitud de anulación en el portal del SRI."
         )
     if body.motivo not in MOTIVOS_ANULACION:
         raise HTTPException(
             status_code=400,
-            detail=f"MOTIVO INVÁLIDO. OPCIONES: {', '.join(MOTIVOS_ANULACION)}"
+            detail=f"Motivo inválido. Opciones: {', '.join(MOTIVOS_ANULACION)}."
         )
 
-    # Cargar documento
-    res = await db.execute(text("""
-        SELECT
-            id, estado_sri, es_sandbox, tipo_doc,
-            numero_doc, clave_acceso, fecha_autorizacion,
-            email_comprador, datos
-        FROM documentos_emitidos
-        WHERE id = :did AND emisor_id = :eid
-    """), {"did": doc_id, "eid": emisor_id})
-    doc = res.fetchone()
+    doc = await _cargar_doc_anulacion(db, doc_id, emisor_id)
+    doc = await vencer_si_corresponde(db, doc)
+    ev  = evaluar_anulacion(doc)
 
-    if not doc:
-        raise HTTPException(status_code=404, detail="DOCUMENTO NO ENCONTRADO.")
-    if doc.es_sandbox:
-        raise HTTPException(status_code=400, detail="NO SE PUEDEN ANULAR DOCUMENTOS DE PRUEBA.")
-    if doc.estado_sri == "ANULADO":
-        raise HTTPException(status_code=400, detail="EL DOCUMENTO YA ESTÁ ANULADO.")
-    if doc.estado_sri != "AUTORIZADO":
-        raise HTTPException(
-            status_code=400,
-            detail=f"SOLO SE PUEDEN ANULAR DOCUMENTOS AUTORIZADOS. ESTADO ACTUAL: {doc.estado_sri}."
+    if not ev["puede_anular"]:
+        raise HTTPException(status_code=400, detail=ev["motivo_bloqueo"])
+
+    efectos = {"cuentas_anuladas": 0, "cuentas_con_abonos": 0}
+
+    if ev["requiere_aceptacion"]:
+        # RET / NCR / NDB → queda pendiente; estado_sri sigue AUTORIZADO
+        limite_aceptacion = sumar_dias_habiles(hoy_ec(), DIAS_HABILES_ACEPTACION)
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET anulacion_estado            = 'PENDIENTE',
+                anulacion_solicitada_at     = NOW(),
+                anulacion_limite_aceptacion = :limite,
+                motivo_anulacion            = :motivo,
+                updated_at                  = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"limite": limite_aceptacion, "motivo": body.motivo, "did": doc_id, "eid": emisor_id})
+        estado_resultado = "PENDIENTE"
+        titulo  = "⏳ Anulación en espera del receptor"
+        mensaje = (
+            f"{doc['numero_doc']}: el receptor tiene hasta el {fecha_sri(limite_aceptacion)} "
+            "para aceptar la anulación en el SRI."
         )
-
-    # Anular
-    await db.execute(text("""
-        UPDATE documentos_emitidos
-        SET estado_sri       = 'ANULADO',
-            motivo_anulacion = :motivo,
-            fecha_anulacion  = NOW(),
-            updated_at       = NOW()
-        WHERE id = :did AND emisor_id = :eid
-    """), {"motivo": body.motivo, "did": doc_id, "eid": emisor_id})
+    else:
+        # FAC / LIQ (o receptor del exterior) → anulación directa
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET estado_sri              = 'ANULADO',
+                motivo_anulacion        = :motivo,
+                fecha_anulacion         = NOW(),
+                anulacion_estado        = NULL,
+                anulacion_solicitada_at = NOW(),
+                estado_cobro            = CASE
+                                            WHEN tipo_doc IN ('FAC', 'LIQ', 'NDB') THEN 'ANULADO'
+                                            ELSE estado_cobro
+                                          END,
+                updated_at              = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"motivo": body.motivo, "did": doc_id, "eid": emisor_id})
+        efectos = await aplicar_efectos_anulacion(db, doc_id, emisor_id)
+        estado_resultado = "ANULADO"
+        titulo  = "🚫 Comprobante anulado"
+        mensaje = f"{doc['numero_doc']} fue anulado. Motivo: {body.motivo.lower()}."
+        if efectos["cuentas_con_abonos"]:
+            mensaje += " Tenía abonos registrados: revisa si debes devolver dinero al cliente."
 
     await audit_log(
         db         = db,
@@ -513,64 +577,107 @@ async def anular_documento(
         entidad    = "documento",
         entidad_id = doc_id,
         detalle    = {
-            "numero_doc":   doc.numero_doc,
-            "clave_acceso": doc.clave_acceso,
-            "motivo":       body.motivo,
+            "numero_doc":          doc["numero_doc"],
+            "clave_acceso":        doc["clave_acceso"],
+            "motivo":              body.motivo,
+            "requiere_aceptacion": ev["requiere_aceptacion"],
+            "resultado":           estado_resultado,
+            **efectos,
         },
         request    = request,
     )
-
     await db.commit()
 
-    # Invalidar cache del dashboard y documentos
-    try:
-        from app.core.cache import get_redis
-        redis   = await get_redis()
-        pattern = f"dashboard:{emisor_id}*"
-        async for key in redis.scan_iter(pattern):
-            await redis.delete(key)
-    except Exception as e:
-        print(f"[Cache] ⚠️ No invalidado: {e}")
-
-    # Notificación interna
-    try:
-        from app.services.notification_service import crear_notificacion
-        await crear_notificacion(
-            db         = db,
-            emisor_id  = emisor_id,
-            tipo       = "DOCUMENTO",
-            titulo     = "🚫 Comprobante anulado",
-            mensaje    = f"{doc.numero_doc} fue marcado como anulado. Motivo: {body.motivo}.",
-            referencia = f"/documentos/{doc_id}",
-        )
-    except Exception as e:
-        print(f"[Notif] ⚠️ No se pudo notificar: {e}")
-
-    # Extraer datos del comprador para el response
-    datos    = doc.datos or {}
-    info_fac = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
-    id_comprador    = info_fac.get("identificacionComprador") or info_fac.get("identificacionProveedor") or ""
-    email_comprador = doc.email_comprador or ""
+    await _invalidar_cache_emisor(emisor_id)
+    await _notificar(db, emisor_id, titulo, mensaje, doc_id)
 
     return {
         "ok":      True,
-        "mensaje": "COMPROBANTE MARCADO COMO ANULADO CORRECTAMENTE.",
-        "data": {
-            "id":               doc_id,
-            "numero_doc":       doc.numero_doc,
-            "estado_sri":       "ANULADO",
-            "motivo_anulacion": body.motivo,
-            # Datos para que el usuario pueda ir al SRI
-            "sri": {
-                "tipo_comprobante":   doc.tipo_doc,
-                "fecha_autorizacion": str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
-                "clave_acceso":       doc.clave_acceso,
-                "numero_autorizacion": doc.clave_acceso,  # en Ecuador la clave acceso = número autorización
-                "identificacion_receptor": id_comprador,
-                "email_receptor":     email_comprador,
-            }
-        }
+        "estado":  estado_resultado,
+        "efectos": efectos,
+        "mensaje": (
+            "Solicitud registrada. El comprobante sigue vigente hasta que el receptor acepte."
+            if estado_resultado == "PENDIENTE"
+            else "Comprobante marcado como anulado."
+        ),
     }
+
+# =============================================================================
+# RESOLVER ANULACIÓN — POST /{doc_id}/anulacion/resolver
+# =============================================================================
+@router.post("/{doc_id}/anulacion/resolver", summary="Registrar si el receptor aceptó o rechazó la anulación")
+async def resolver_anulacion(
+    doc_id:    str,
+    body:      ResolverAnulacionRequest,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "emitir")
+
+    doc = await _cargar_doc_anulacion(db, doc_id, emisor_id)
+    doc = await vencer_si_corresponde(db, doc)
+
+    if doc["anulacion_estado"] == "VENCIDA":
+        raise HTTPException(
+            status_code=400,
+            detail="El plazo del receptor venció sin respuesta. El comprobante sigue vigente."
+        )
+    if doc["anulacion_estado"] != "PENDIENTE":
+        raise HTTPException(status_code=400, detail="No hay una solicitud de anulación pendiente.")
+
+    efectos = {"cuentas_anuladas": 0, "cuentas_con_abonos": 0}
+
+    if body.aceptada:
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET estado_sri       = 'ANULADO',
+                anulacion_estado = 'ACEPTADA',
+                fecha_anulacion  = NOW(),
+                estado_cobro     = CASE
+                                     WHEN tipo_doc IN ('FAC', 'LIQ', 'NDB') THEN 'ANULADO'
+                                     ELSE estado_cobro
+                                   END,
+                updated_at       = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"did": doc_id, "eid": emisor_id})
+        efectos = await aplicar_efectos_anulacion(db, doc_id, emisor_id)
+        titulo  = "🚫 Comprobante anulado"
+        mensaje = f"{doc['numero_doc']}: el receptor aceptó la anulación."
+        if efectos["cuentas_con_abonos"]:
+            mensaje += " Tenía abonos registrados: revisa si debes devolver dinero."
+    else:
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET anulacion_estado = 'RECHAZADA', updated_at = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"did": doc_id, "eid": emisor_id})
+        titulo  = "↩️ Anulación rechazada"
+        mensaje = f"{doc['numero_doc']}: el receptor rechazó la anulación. El comprobante sigue vigente."
+
+    await audit_log(
+        db         = db,
+        auth_data  = auth_data,
+        accion     = "UPDATE",
+        entidad    = "documento",
+        entidad_id = doc_id,
+        detalle    = {
+            "accion":     "resolver_anulacion",
+            "numero_doc": doc["numero_doc"],
+            "aceptada":   body.aceptada,
+            **efectos,
+        },
+        request    = request,
+    )
+    await db.commit()
+
+    await _invalidar_cache_emisor(emisor_id)
+    await _notificar(db, emisor_id, titulo, mensaje, doc_id)
+
+    return {"ok": True, "estado": "ANULADO" if body.aceptada else "RECHAZADA"}
 
 # =============================================================================
 # DETALLE — GET /{doc_id}
@@ -600,6 +707,9 @@ async def detalle_documento(
             d.doc_origen_emitido_id,
             d.doc_origen_recibido_id,
             d.es_sandbox,
+            d.email_comprador,
+            d.motivo_anulacion, d.fecha_anulacion,
+            d.anulacion_estado, d.anulacion_solicitada_at, d.anulacion_limite_aceptacion,
             (
                 SELECT json_agg(json_build_object(
                     'id', dd.id, 'tipo_doc', dd.tipo_doc,
@@ -629,40 +739,46 @@ async def detalle_documento(
         FROM documentos_emitidos d
         WHERE d.id = :did AND d.emisor_id = :eid
     """), {"did": doc_id, "eid": emisor_id})
-    doc = res.fetchone()
-    if not doc:
+    row = res.mappings().fetchone()
+    if not row:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
+
+    doc = await vencer_si_corresponde(db, dict(row))
 
     return {
         "ok": True,
         "data": {
-            "id":                     str(doc.id),
-            "tipo_doc":               doc.tipo_doc,
-            "cod_doc":                doc.cod_doc,
-            "clave_acceso":           doc.clave_acceso,
-            "numero_doc":             doc.numero_doc,
-            "secuencial":             doc.secuencial,
-            "fecha_emision":          str(doc.fecha_emision),
-            "estado_sri":             doc.estado_sri,
-            "mensajes_sri":           doc.mensajes_sri,
-            "fecha_envio_sri":        str(doc.fecha_envio_sri) if doc.fecha_envio_sri else None,
-            "fecha_autorizacion":     str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
-            "estado_cobro":           doc.estado_cobro,
-            "forma_pago_cobro":       doc.forma_pago_cobro,
-            "numero_comprobante_pago": doc.numero_comprobante_pago,
-            "fecha_pago":             str(doc.fecha_pago) if doc.fecha_pago else None,
-            "importe_total":          float(doc.importe_total),
-            "datos":                  doc.datos,
-            "xml_path":               doc.xml_path,
-            "pdf_path":               doc.pdf_path,
-            "origen":                 doc.origen,
-            "es_sandbox":             doc.es_sandbox,
-            "created_at":             str(doc.created_at),
-            "doc_origen_emitido_id":  str(doc.doc_origen_emitido_id) if doc.doc_origen_emitido_id else None,
-            "doc_origen_recibido_id": str(doc.doc_origen_recibido_id) if doc.doc_origen_recibido_id else None,
-            "documentos_derivados":   doc.documentos_derivados or [],
-            "doc_origen_emitido":     doc.doc_origen_emitido,
-            "doc_origen_recibido":    doc.doc_origen_recibido,
+            "id":                     str(doc["id"]),
+            "tipo_doc":               doc["tipo_doc"],
+            "cod_doc":                doc["cod_doc"],
+            "clave_acceso":           doc["clave_acceso"],
+            "numero_doc":             doc["numero_doc"],
+            "secuencial":             doc["secuencial"],
+            "fecha_emision":          iso(doc["fecha_emision"]),
+            "estado_sri":             doc["estado_sri"],
+            "mensajes_sri":           doc["mensajes_sri"],
+            "fecha_envio_sri":        iso(doc["fecha_envio_sri"]),
+            "fecha_autorizacion":     iso(doc["fecha_autorizacion"]),
+            "estado_cobro":           doc["estado_cobro"],
+            "forma_pago_cobro":       doc["forma_pago_cobro"],
+            "numero_comprobante_pago": doc["numero_comprobante_pago"],
+            "fecha_pago":             iso(doc["fecha_pago"]),
+            "importe_total":          float(doc["importe_total"]),
+            "datos":                  doc["datos"],
+            "xml_path":               doc["xml_path"],
+            "pdf_path":               doc["pdf_path"],
+            "origen":                 doc["origen"],
+            "es_sandbox":             doc["es_sandbox"],
+            "email_comprador":        doc["email_comprador"],
+            "motivo_anulacion":       doc["motivo_anulacion"],
+            "fecha_anulacion":        iso(doc["fecha_anulacion"]),
+            "created_at":             iso(doc["created_at"]),
+            "doc_origen_emitido_id":  str(doc["doc_origen_emitido_id"]) if doc["doc_origen_emitido_id"] else None,
+            "doc_origen_recibido_id": str(doc["doc_origen_recibido_id"]) if doc["doc_origen_recibido_id"] else None,
+            "documentos_derivados":   doc["documentos_derivados"] or [],
+            "doc_origen_emitido":     doc["doc_origen_emitido"],
+            "doc_origen_recibido":    doc["doc_origen_recibido"],
+            "anulacion":              evaluar_anulacion(doc),
         }
     }
 

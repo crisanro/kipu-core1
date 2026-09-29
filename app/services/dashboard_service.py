@@ -31,6 +31,22 @@ def _meses_en_rango(fecha_inicio: date, fecha_fin: date) -> list[tuple[int, int]
     return meses
 
 
+def _contraparte(tipo_doc: str, datos: dict) -> tuple[str, str]:
+    """
+    Nombre e identificación de la contraparte según el tipo de comprobante.
+    FAC → comprador | LIQ → proveedor (el SRI no usa 'comprador' en liquidaciones)
+    """
+    if tipo_doc == "LIQ":
+        info  = datos.get("infoLiquidacionCompra") or {}
+        razon = info.get("razonSocialProveedor") or datos.get("legacy_razon_comprador") or ""
+        ident = info.get("identificacionProveedor") or datos.get("legacy_id_comprador") or ""
+    else:
+        info  = datos.get("infoFactura") or {}
+        razon = info.get("razonSocialComprador") or datos.get("legacy_razon_comprador") or ""
+        ident = info.get("identificacionComprador") or datos.get("legacy_id_comprador") or ""
+    return razon, ident
+
+
 async def obtener_dashboard_core(
     emisor_id:         int | None,
     email_usuario:     str,
@@ -48,7 +64,14 @@ async def obtener_dashboard_core(
         data_header      = await cache_get(cache_key_header)
 
         if not data_header:
-            res_header = await db.execute(text("""
+            # Con emisor activo → header de ESA empresa (multiempresa).
+            # Sin emisor (usuario nuevo) → cualquiera vinculada al email.
+            filtro_emisor = "AND e.id = :eid" if emisor_id else ""
+            params_header = {"email": email_usuario}
+            if emisor_id:
+                params_header["eid"] = emisor_id
+
+            res_header = await db.execute(text(f"""
                 SELECT
                     e.ruc, e.p12_path, e.p12_expiration, e.ambiente, e.tipo_emisor,
                     uc.balance AS balance_api,
@@ -69,8 +92,9 @@ async def obtener_dashboard_core(
                 LEFT JOIN user_credits uc    ON uc.emisor_id = e.id
                 LEFT JOIN subscriptions s    ON s.emisor_id  = e.id
                 WHERE LOWER(p.email) = LOWER(:email)
+                {filtro_emisor}
                 LIMIT 1
-            """), {"email": email_usuario})
+            """), params_header)
 
             row = res_header.mappings().fetchone()
             if not row:
@@ -153,7 +177,7 @@ async def obtener_dashboard_core(
                                     continue
                                 tarifa = str(i.get("tarifa", "0"))
                                 if tarifa not in impuestos_por_tarifa:
-                                     impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
+                                    impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
                                 impuestos_por_tarifa[tarifa]["base"] += float(i.get("baseImponible") or 0)
                                 impuestos_por_tarifa[tarifa]["iva"]  += float(i.get("valor") or 0)
 
@@ -162,12 +186,10 @@ async def obtener_dashboard_core(
                         subtotal_0    = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k == "0")
                         iva_calculado = sum(v["iva"]  for v in impuestos_por_tarifa.values())
 
-                        info_fac    = datos.get("infoFactura") or datos.get("infoLiquidacionCompra") or {}
-                        total       = float(d["importe_total"] or 0)
+                        total = float(d["importe_total"] or 0)
 
-                        # Comprador
-                        razon  = info_fac.get("razonSocialComprador") or datos.get("legacy_razon_comprador") or ""
-                        id_com = info_fac.get("identificacionComprador") or datos.get("legacy_id_comprador") or ""
+                        # Contraparte: comprador (FAC) o proveedor (LIQ)
+                        razon, id_com = _contraparte(d["tipo_doc"], datos)
 
                         docs_mes.append({
                             "id":                str(d["id"]),

@@ -27,6 +27,9 @@ class CambiarEmpresaRequest(BaseModel):
 class ActualizarPermisosRequest(BaseModel):
     permisos: dict
 
+class EmpresaDefaultRequest(BaseModel):
+    emisor_id: Optional[int] = None  # None = quitar predeterminada
+
 # ── GET /empresas ──────────────────────────────────────────────────────────────
 @router.get("/empresas", summary="Listar mis empresas")
 async def listar_empresas(
@@ -35,7 +38,7 @@ async def listar_empresas(
 ):
     profile_id = auth_data.get("profile_id")
     if not profile_id:
-        return {"ok": True, "data": [], "role": None}
+        return {"ok": True, "data": [], "role": None, "default_id": None}
 
     cache_key = f"usuario:{profile_id}:empresas"
     cached    = await cache_get(cache_key)
@@ -51,14 +54,16 @@ async def listar_empresas(
             s.estado                 AS sub_estado,
             s.plan                   AS sub_plan,
             s.current_period_end,
-            p.role                   AS profile_role
+            p.role                   AS profile_role,
+            p.empresa_default_id
         FROM emisor_usuarios eu
         JOIN emisores e         ON e.id = eu.emisor_id
         JOIN profiles p         ON p.id = eu.profile_id
         LEFT JOIN user_credits  uc ON uc.emisor_id = e.id
         LEFT JOIN subscriptions s  ON s.emisor_id  = e.id
         WHERE eu.profile_id = :pid
-        ORDER BY e.razon_social ASC
+        ORDER BY COALESCE(e.id = p.empresa_default_id, FALSE) DESC,
+                 e.razon_social ASC
     """), {"pid": str(profile_id)})
     rows = res.fetchall()
 
@@ -74,6 +79,7 @@ async def listar_empresas(
             "rol":              r.rol,
             "permisos":         r.permisos or {},
             "balance_api":      r.balance_api,
+            "es_default":       r.id == r.empresa_default_id,
             "suscripcion_activa": r.sub_estado in ("ACTIVO", "TRIAL"),
             "suscripcion": {
                 "activa": r.sub_estado in ("ACTIVO", "TRIAL"),
@@ -85,9 +91,45 @@ async def listar_empresas(
     ]
 
     profile_role = rows[0].profile_role if rows else None
-    response = {"ok": True, "data": data, "role": profile_role}
+    default_id   = rows[0].empresa_default_id if rows else None
+    # Solo es válida si el usuario todavía pertenece a esa empresa
+    if default_id is not None and not any(e["id"] == default_id for e in data):
+        default_id = None
+
+    response = {"ok": True, "data": data, "role": profile_role, "default_id": default_id}
     await cache_set(cache_key, response, TTL_EMPRESAS)
     return response
+
+# ── PUT /empresas/default ──────────────────────────────────────────────────────
+@router.put("/empresas/default", summary="Definir mi empresa predeterminada")
+async def definir_empresa_default(
+    data:      EmpresaDefaultRequest,
+    auth_data: dict = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    profile_id = auth_data.get("profile_id")
+    if not profile_id:
+        raise HTTPException(status_code=400, detail="Perfil no encontrado.")
+
+    if data.emisor_id is not None:
+        res = await db.execute(text("""
+            SELECT 1 FROM emisor_usuarios
+            WHERE profile_id = :pid AND emisor_id = :eid
+        """), {"pid": str(profile_id), "eid": data.emisor_id})
+        if not res.fetchone():
+            raise HTTPException(status_code=403, detail="No tienes acceso a esa empresa.")
+
+    await db.execute(text("""
+        UPDATE profiles SET empresa_default_id = :eid WHERE id = :pid
+    """), {"eid": data.emisor_id, "pid": str(profile_id)})
+    await db.commit()
+    await cache_delete(f"usuario:{profile_id}:empresas")
+
+    return {
+        "ok":      True,
+        "mensaje": "Empresa predeterminada actualizada." if data.emisor_id else "Empresa predeterminada eliminada.",
+        "default_id": data.emisor_id,
+    }
 
 # ── POST /empresas/cambiar ─────────────────────────────────────────────────────
 @router.post("/empresas/cambiar", summary="Cambiar empresa activa")
@@ -130,7 +172,7 @@ async def cambiar_empresa(
             "tipo_emisor":        row.tipo_emisor,
             "rol":                row.rol,
             "permisos":           row.permisos or {},
-            "firma_ok":           bool(row.p12_path),  # ← añadido
+            "firma_ok":           bool(row.p12_path),
             "balance_api":        row.balance_api,
             "suscripcion_activa": row.sub_estado in ("ACTIVO", "TRIAL"),
             "suscripcion": {
@@ -401,6 +443,12 @@ async def remover_usuario(
     """), {"eid": emisor_id, "pid": target_profile_id})
     if not res.fetchone():
         raise HTTPException(status_code=404, detail="Usuario no encontrado en esta empresa.")
+
+    # Si era su empresa predeterminada, limpiarla
+    await db.execute(text("""
+        UPDATE profiles SET empresa_default_id = NULL
+        WHERE id = :pid AND empresa_default_id = :eid
+    """), {"pid": target_profile_id, "eid": emisor_id})
 
     await audit_log(
         db        = db,
