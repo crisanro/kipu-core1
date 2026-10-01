@@ -13,6 +13,8 @@ from app.core.rate_limit import RateLimit, RateLimitScope
 from app.core.idempotency import verificar_idempotency, guardar_idempotency
 from app.services.documento_service import emitir_documento_core
 from app.services.audit_service import audit_log
+from app.services import comprobante_estado_service as estado_svc
+from app.services import sri_client as sri
 from app.services.anulacion_service import (
     MOTIVOS_ANULACION, DIAS_HABILES_ACEPTACION,
     evaluar_anulacion, vencer_si_corresponde, aplicar_efectos_anulacion,
@@ -496,7 +498,7 @@ async def resumen_documentos(
 # =============================================================================
 # ANULAR — POST /{doc_id}/anular
 # =============================================================================
-@router.post("/{doc_id}/anular", summary="Registrar anulación hecha en el portal SRI")
+@router.post("/{doc_id}/anular", summary="Verificar y registrar anulación del comprobante")
 async def anular_documento(
     doc_id:    str,
     body:      AnulacionRequest,
@@ -527,48 +529,20 @@ async def anular_documento(
     if not ev["puede_anular"]:
         raise HTTPException(status_code=400, detail=ev["motivo_bloqueo"])
 
-    efectos = {"cuentas_anuladas": 0, "cuentas_con_abonos": 0}
+    # -------------------------------------------------------------------------
+    # CONSULTA Y VERIFICACIÓN REAL EN EL SOAP DEL SRI
+    # -------------------------------------------------------------------------
+    # Si el SRI devuelve AUTORIZADO, esta función lanza HTTPException(422) 
+    # y la ejecución se detiene sin alterar la base de datos.
+    from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
 
-    if ev["requiere_aceptacion"]:
-        # RET / NCR / NDB → queda pendiente; estado_sri sigue AUTORIZADO
-        limite_aceptacion = sumar_dias_habiles(hoy_ec(), DIAS_HABILES_ACEPTACION)
-        await db.execute(text("""
-            UPDATE documentos_emitidos
-            SET anulacion_estado            = 'PENDIENTE',
-                anulacion_solicitada_at     = NOW(),
-                anulacion_limite_aceptacion = :limite,
-                motivo_anulacion            = :motivo,
-                updated_at                  = NOW()
-            WHERE id = :did AND emisor_id = :eid
-        """), {"limite": limite_aceptacion, "motivo": body.motivo, "did": doc_id, "eid": emisor_id})
-        estado_resultado = "PENDIENTE"
-        titulo  = "⏳ Anulación en espera del receptor"
-        mensaje = (
-            f"{doc['numero_doc']}: el receptor tiene hasta el {fecha_sri(limite_aceptacion)} "
-            "para aceptar la anulación en el SRI."
-        )
-    else:
-        # FAC / LIQ (o receptor del exterior) → anulación directa
-        await db.execute(text("""
-            UPDATE documentos_emitidos
-            SET estado_sri              = 'ANULADO',
-                motivo_anulacion        = :motivo,
-                fecha_anulacion         = NOW(),
-                anulacion_estado        = NULL,
-                anulacion_solicitada_at = NOW(),
-                estado_cobro            = CASE
-                                            WHEN tipo_doc IN ('FAC', 'LIQ', 'NDB') THEN 'ANULADO'
-                                            ELSE estado_cobro
-                                          END,
-                updated_at              = NOW()
-            WHERE id = :did AND emisor_id = :eid
-        """), {"motivo": body.motivo, "did": doc_id, "eid": emisor_id})
-        efectos = await aplicar_efectos_anulacion(db, doc_id, emisor_id)
-        estado_resultado = "ANULADO"
-        titulo  = "🚫 Comprobante anulado"
-        mensaje = f"{doc['numero_doc']} fue anulado. Motivo: {body.motivo.lower()}."
-        if efectos["cuentas_con_abonos"]:
-            mensaje += " Tenía abonos registrados: revisa si debes devolver dinero al cliente."
+    res_anulacion = await verificar_sri_y_procesar_anulacion(db, doc, emisor_id, body.motivo)
+
+    estado_resultado = res_anulacion["estado"]
+    efectos          = res_anulacion.get("efectos", {"cuentas_anuladas": 0, "cuentas_con_abonos": 0})
+
+    titulo  = "🚫 Comprobante anulado" if estado_resultado == "ANULADO" else "⏳ Anulación en espera del receptor"
+    mensaje = res_anulacion["mensaje"]
 
     await audit_log(
         db         = db,
@@ -577,11 +551,10 @@ async def anular_documento(
         entidad    = "documento",
         entidad_id = doc_id,
         detalle    = {
-            "numero_doc":          doc["numero_doc"],
-            "clave_acceso":        doc["clave_acceso"],
-            "motivo":              body.motivo,
-            "requiere_aceptacion": ev["requiere_aceptacion"],
-            "resultado":           estado_resultado,
+            "numero_doc":   doc["numero_doc"],
+            "clave_acceso": doc["clave_acceso"],
+            "motivo":       body.motivo,
+            "resultado":    estado_resultado,
             **efectos,
         },
         request    = request,
@@ -595,12 +568,56 @@ async def anular_documento(
         "ok":      True,
         "estado":  estado_resultado,
         "efectos": efectos,
-        "mensaje": (
-            "Solicitud registrada. El comprobante sigue vigente hasta que el receptor acepte."
-            if estado_resultado == "PENDIENTE"
-            else "Comprobante marcado como anulado."
-        ),
+        "mensaje": mensaje,
     }
+
+
+# =============================================================================
+# SINCRONIZAR ANULACIÓN — POST /{doc_id}/anulacion/sincronizar
+# =============================================================================
+@router.post("/{doc_id}/anulacion/sincronizar", summary="Consultar estado de anulación directamente en el SRI")
+async def sincronizar_anulacion_documento(
+    doc_id:    str,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """
+    Re-consulta al SRI el estado de un documento. Si el receptor aceptó/rechazó
+    o el SRI ya procesó la anulación, actualiza la base de datos automáticamente.
+    """
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "emitir")
+
+    doc = await _cargar_doc_anulacion(db, doc_id, emisor_id)
+    
+    from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
+
+    res_sync = await verificar_sri_y_procesar_anulacion(
+        db, doc, emisor_id, motivo=doc.get("motivo_anulacion") or "ERROR EN EL COMPROBANTE"
+    )
+
+    if res_sync.get("cambio"):
+        await audit_log(
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "UPDATE",
+            entidad    = "documento",
+            entidad_id = doc_id,
+            detalle    = {
+                "accion":       "sincronizar_anulacion",
+                "numero_doc":   doc["numero_doc"],
+                "nuevo_estado": res_sync["estado"],
+            },
+            request    = request,
+        )
+        await db.commit()
+        await _invalidar_cache_emisor(emisor_id)
+
+    return res_sync
+
 
 # =============================================================================
 # RESOLVER ANULACIÓN — POST /{doc_id}/anulacion/resolver
@@ -679,6 +696,8 @@ async def resolver_anulacion(
 
     return {"ok": True, "estado": "ANULADO" if body.aceptada else "RECHAZADA"}
 
+
+
 # =============================================================================
 # DETALLE — GET /{doc_id}
 # =============================================================================
@@ -710,6 +729,7 @@ async def detalle_documento(
             d.email_comprador,
             d.motivo_anulacion, d.fecha_anulacion,
             d.anulacion_estado, d.anulacion_solicitada_at, d.anulacion_limite_aceptacion,
+            d.ultimo_error_tecnico, d.sri_verificado_at,
             (
                 SELECT json_agg(json_build_object(
                     'id', dd.id, 'tipo_doc', dd.tipo_doc,
@@ -779,8 +799,62 @@ async def detalle_documento(
             "doc_origen_emitido":     doc["doc_origen_emitido"],
             "doc_origen_recibido":    doc["doc_origen_recibido"],
             "anulacion":              evaluar_anulacion(doc),
+            "ultimo_error_tecnico":   doc["ultimo_error_tecnico"],
+            "sri_verificado_at":      iso(doc["sri_verificado_at"]),
         }
     }
+
+# =============================================================================
+# CONSULTAR EN EL SRI — POST /{doc_id}/sincronizar
+# =============================================================================
+@router.post("/{doc_id}/sincronizar", summary="Consultar el estado real del comprobante en el SRI")
+async def sincronizar_documento(
+    doc_id:    str,
+    request:   Request,
+    auth_data: dict         = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    """
+    Le pregunta al SRI por la clave de acceso y corrige el estado si no coincide
+    (por ejemplo, un DEVUELTA que en realidad estaba AUTORIZADO). Si corrige un
+    falso rechazo, vuelve a aplicar el inventario y el crédito que se habían devuelto.
+    """
+    emisor_id = auth_data.get("emisor_id")
+    if not emisor_id:
+        raise HTTPException(status_code=400, detail="Emisor no vinculado.")
+    verificar_permiso(auth_data, "emitir")
+
+    res = await db.execute(text("""
+        SELECT id, numero_doc, estado_sri FROM documentos_emitidos
+        WHERE id = :did AND emisor_id = :eid
+    """), {"did": doc_id, "eid": emisor_id})
+    doc = res.fetchone()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Documento no encontrado.")
+
+    resultado = await estado_svc.sincronizar_documento(db, doc_id)
+    if not resultado.get("ok"):
+        raise HTTPException(status_code=503, detail=resultado.get("mensaje", "No pudimos consultar al SRI."))
+
+    if resultado.get("cambio"):
+        await audit_log(
+            db         = db,
+            auth_data  = auth_data,
+            accion     = "UPDATE",
+            entidad    = "documento",
+            entidad_id = doc_id,
+            detalle    = {
+                "accion":          "sincronizar_sri",
+                "numero_doc":      doc.numero_doc,
+                "estado_anterior": resultado.get("estado_anterior"),
+                "estado_nuevo":    resultado.get("estado_actual"),
+            },
+            request    = request,
+        )
+        await db.commit()
+
+    return {"ok": True, **resultado}
+
 
 # =============================================================================
 # REINTENTAR — POST /{doc_id}/reintentar
@@ -792,6 +866,11 @@ async def reintentar_documento(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
+    """
+    Antes de reenviar se le pregunta al SRI: si ya lo tiene (autorizado, rechazado o
+    en proceso) se corrige el estado y NO se reenvía. Solo si el SRI no lo tiene,
+    vuelve a la cola. Funciona también para documentos de prueba (sandbox).
+    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
@@ -805,14 +884,26 @@ async def reintentar_documento(
     doc = res.fetchone()
     if not doc:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
-    if doc.es_sandbox:
-        raise HTTPException(status_code=400, detail="No se pueden reintentar documentos sandbox.")
-    if doc.estado_sri not in ("DEVUELTA", "RECHAZADO", "FIRMADO"):
+    if doc.estado_sri not in ("DEVUELTA", "RECHAZADO", "FIRMADO", "EN_REVISION"):
         raise HTTPException(status_code=400, detail=f"No se puede reintentar en estado {doc.estado_sri}.")
 
+    # 1) ¿El SRI ya lo tiene?
+    consulta = await estado_svc.sincronizar_documento(db, doc_id)
+    if not consulta.get("ok"):
+        raise HTTPException(status_code=503, detail=consulta.get("mensaje", "No pudimos consultar al SRI."))
+    if consulta.get("sri") != sri.NO_ENCONTRADO:
+        return {
+            "ok":      True,
+            "mensaje": consulta.get("mensaje") or "El SRI ya tiene este comprobante; no se reenvió.",
+            "estado":  consulta.get("estado_actual"),
+            "reenviado": False,
+        }
+
+    # 2) El SRI no lo tiene: se reenvía
     await db.execute(text("""
         UPDATE documentos_emitidos
-        SET estado_sri = 'FIRMADO', mensajes_sri = NULL, updated_at = NOW()
+        SET estado_sri = 'FIRMADO', mensajes_sri = NULL, ultimo_error_tecnico = NULL,
+            retry_count = 0, updated_at = NOW()
         WHERE id = :did AND emisor_id = :eid
     """), {"did": doc_id, "eid": emisor_id})
 
@@ -823,21 +914,17 @@ async def reintentar_documento(
         entidad   = "documento",
         entidad_id = doc_id,
         detalle   = {
-            "accion":     "reintento",
-            "numero_doc": doc.numero_doc,
+            "accion":          "reintento",
+            "numero_doc":      doc.numero_doc,
             "estado_anterior": doc.estado_sri,
             "estado_nuevo":    "FIRMADO",
         },
         request   = request,
     )
-
     await db.commit()
+    await estado_svc.encolar(estado_svc.QUEUE_EMISION, doc_id)
 
-    from app.core.cache import get_redis
-    redis = await get_redis()
-    await redis.lpush("kipu:queue:emision", doc_id)
-
-    return {"ok": True, "mensaje": "Documento reencolado para reintento.", "estado": "FIRMADO"}
+    return {"ok": True, "mensaje": "El SRI no lo tenía: se reenvió.", "estado": "FIRMADO", "reenviado": True}
 
 # =============================================================================
 # COBRO — PATCH /{doc_id}/cobro

@@ -3,8 +3,7 @@
 # Reglas de anulación de comprobantes electrónicos (Res. NAC-DGERCGC25-00000017).
 #
 # - Plazo: hasta el día 7 del mes siguiente a la emisión. Si cae en fin de
-#   semana se corre al lunes. (Feriados NO contemplados: si el 7 es feriado,
-#   Kipu bloquea un día antes que el SRI.)
+#   semana se corre al lunes.
 # - FAC / LIQ: se anulan sin aceptación del receptor.
 # - RET / NCR / NDB: requieren aceptación del receptor en 5 días hábiles.
 #   Sin respuesta → la solicitud queda sin efecto y el comprobante sigue vigente.
@@ -12,21 +11,25 @@
 # - FAC a consumidor final: no se anula ni admite nota de crédito (desde 2026).
 # - Vencido el plazo: FAC solo con nota de crédito (máx. 12 meses).
 #
-# Kipu NO anula en el SRI. Registra lo que el usuario hizo en el portal y
-# lleva el control del proceso.
+# Integración con el SOAP del SRI:
+# - Verifica mediante `consultar_estado` antes de marcar un comprobante como ANULADO o PENDIENTE.
 #
 # Columnas en documentos_emitidos:
-#   anulacion_estado            NULL | PENDIENTE | ACEPTADA | RECHAZADA | VENCIDA
-#   anulacion_solicitada_at     timestamptz
+#   anulacion_estado        NULL | PENDIENTE | ACEPTADA | RECHAZADA | VENCIDA
+#   anulacion_solicitada_at timestamptz
 #   anulacion_limite_aceptacion date (último día hábil para que el receptor acepte)
-#
-# Mientras anulacion_estado = PENDIENTE, estado_sri sigue en AUTORIZADO,
-# así reportes y declaraciones lo siguen contando (legalmente está vigente).
+#   sri_verificado_at       timestamptz
 
+import logging
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import HTTPException
+
+from app.services import sri_client as sri
+
+logger = logging.getLogger(__name__)
 
 TZ_EC = ZoneInfo("America/Guayaquil")
 
@@ -215,6 +218,99 @@ def evaluar_anulacion(doc: dict) -> dict:
         },
     }
 
+
+# =============================================================================
+# INTEGRACIÓN CON WEBSERVICE DEL SRI (ConsultaComprobante)
+# =============================================================================
+async def verificar_sri_y_procesar_anulacion(
+    db: AsyncSession,
+    doc: dict,
+    emisor_id: int,
+    motivo: str = "ERROR EN EL COMPROBANTE"
+) -> dict:
+    """
+    Consulta al SRI. Si el SRI responde AUTORIZADO, SIGNIFICA QUE NO HA SIDO ANULADO
+    en el portal del SRI todavía (o el SRI aún no actualiza sus registros).
+    Por ende, RECHAZA la anulación en Kipu para evitar anulaciones falsas.
+    """
+    ambiente = 1 if doc.get("es_sandbox") else doc.get("ambiente", 2)
+    clave_acceso = doc["clave_acceso"]
+
+    # 1. Consulta al WS del SRI
+    res_sri = await sri.consultar_estado(clave_acceso, ambiente)
+
+    if res_sri.estado == sri.TECNICO:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No pudimos verificar el estado con el SRI: {res_sri.detalle}"
+        )
+
+    # 2. CASO REAL: El SRI ya lo reporta como ANULADO oficialmente
+    if res_sri.estado == sri.ANULADO:
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET estado_sri               = 'ANULADO',
+                motivo_anulacion        = :motivo,
+                fecha_anulacion         = NOW(),
+                anulacion_estado        = 'ACEPTADA',
+                sri_verificado_at       = NOW(),
+                estado_cobro            = CASE
+                                            WHEN tipo_doc IN ('FAC', 'LIQ', 'NDB') THEN 'ANULADO'
+                                            ELSE estado_cobro
+                                          END,
+                updated_at              = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"motivo": motivo, "did": str(doc["id"]), "eid": emisor_id})
+
+        efectos = await aplicar_efectos_anulacion(db, str(doc["id"]), emisor_id)
+
+        return {
+            "ok": True,
+            "estado": "ANULADO",
+            "sri_estado": "ANULADO",
+            "cambio": True,
+            "mensaje": "Comprobante verificado y confirmado como ANULADO en el SRI.",
+            "efectos": efectos,
+        }
+
+    # 3. CASO PENDIENTE EN EL SRI (Retenciones / Notas de Crédito que esperan al receptor)
+    if res_sri.estado == sri.PENDIENTE_ANULAR:
+        limite_aceptacion = sumar_dias_habiles(hoy_ec(), DIAS_HABILES_ACEPTACION)
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET anulacion_estado        = 'PENDIENTE',
+                anulacion_solicitada_at = NOW(),
+                anulacion_limite_aceptacion = :limite,
+                motivo_anulacion        = :motivo,
+                sri_verificado_at       = NOW(),
+                updated_at              = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"limite": limite_aceptacion, "motivo": motivo, "did": str(doc["id"]), "eid": emisor_id})
+
+        return {
+            "ok": True,
+            "estado": "PENDIENTE",
+            "sri_estado": "PENDIENTE_ANULAR",
+            "cambio": True,
+            "mensaje": f"La anulación está registrada en el SRI en espera de aceptación del receptor.",
+            "efectos": {"cuentas_anuladas": 0, "cuentas_con_abonos": 0},
+        }
+
+    # 4. PROTECCIÓN ESTRICTA: Si sigue AUTORIZADO en el SRI, BLOQUEAR la anulación
+    if res_sri.estado == sri.AUTORIZADO:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "El SRI reporta que este comprobante aún está AUTORIZADO y vigente en su portal. "
+                "Debes ingresar primero a SRI en línea y procesar la anulación. "
+                "Una vez procesada allá, vuelve a intentar la verificación aquí."
+            )
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Estado del comprobante en el SRI no permite la anulación: {res_sri.estado}"
+    )
 
 # =============================================================================
 # EFECTOS DE UNA ANULACIÓN CONFIRMADA

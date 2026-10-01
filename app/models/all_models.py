@@ -7,7 +7,7 @@
 
 from sqlalchemy import (
     Column, String, Integer, SmallInteger, Boolean, Text,
-    Date, Numeric, ForeignKey, UniqueConstraint,
+    Date, Numeric, ForeignKey, UniqueConstraint, BigInteger, Index,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
 from sqlalchemy.orm import relationship, declarative_base
@@ -150,8 +150,8 @@ class Subscription(Base):
 
 class UserCredits(Base):
     """
-    Créditos exclusivos para consumo de la API REST externa.
-    Los suscriptores usan el sistema sin créditos — esto es solo para API.
+    Créditos por documento. Los consume quien NO tiene suscripción activa,
+    ya emita por la web o por la API REST. Los suscriptores no consumen créditos.
     """
     __tablename__ = "user_credits"
 
@@ -229,7 +229,7 @@ class ApiKey(Base):
     nombre          = Column(String(100), nullable=False)
     key_prefix      = Column(String(10), nullable=False)
     key_hash        = Column(String(64), unique=True, nullable=False)
-    key_plain       = Column(Text, nullable=True)   # ← agregar — solo para sandbox
+    key_plain       = Column(Text, nullable=True)   # solo para sandbox
     revoked         = Column(Boolean, default=False)
     es_sandbox      = Column(Boolean, default=False, nullable=False)
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=True)
@@ -315,7 +315,7 @@ class PuntoEmision(Base):
     establecimiento_id = Column(Integer, ForeignKey("establecimientos.id", ondelete="CASCADE"), nullable=False)
     emisor_id          = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
     codigo             = Column(String(3), nullable=False)
-    secuencial_actual  = Column(Integer, default=1)  # ← mantener por compatibilidad, ya no se usa
+    secuencial_actual  = Column(Integer, default=1)  # mantener por compatibilidad, ya no se usa
     secuenciales       = Column(JSONB, nullable=False, server_default='{"FAC":0,"LIQ":0,"NCR":0,"NDB":0,"RET":0}')
     nombre             = Column(Text)
     is_active          = Column(Boolean, default=True)
@@ -341,6 +341,7 @@ class CatalogoItem(Base):
     updated_at  = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
     emisor      = relationship("Emisor", back_populates="catalogo_items")
+    movimientos = relationship("MovimientoStock", back_populates="catalogo_item")
 
 
 class ClienteEmisor(Base):
@@ -386,8 +387,25 @@ class DocumentoEmitido(Base):
         NDB → 05  Nota de débito
         RET → 07  Retención
 
-    estado_sri:   PENDIENTE | FIRMADO | RECIBIDA | AUTORIZADO | DEVUELTA | RECHAZADO
+    estado_sri:
+        FIRMADO      en cola para enviarse al SRI
+        RECIBIDA     el SRI lo recibió, falta la autorización
+        AUTORIZADO   autorizado por el SRI
+        DEVUELTA     rechazado por el SRI en recepción (con mensajes del SRI)
+        RECHAZADO    no autorizado por el SRI (con mensajes del SRI)
+        EN_REVISION  falla técnica sin resolver — NO es un rechazo del SRI;
+                     la conciliación lo sigue verificando
+        ANULADO      anulado en el SRI
+
     estado_cobro: PENDIENTE | PAGADO | PARCIAL | ANULADO  (solo FAC y LIQ)
+
+    credito_estado: COBRADO | DEVUELTO | NULL
+        Si se descontó un crédito al emitir. Solo lo cobrado se devuelve si el
+        SRI rechaza, y se vuelve a cobrar si después resulta autorizado.
+
+    stock_estado: APLICADO | REVERTIDO | SIN_STOCK | NULL
+        Estado del movimiento de inventario del documento (ver MovimientoStock).
+        NULL = documento anterior al registro de movimientos.
 
     Referencias entre documentos:
         NCR/NDB desde FAC propia:    doc_origen_emitido_id  → documentos_emitidos.id
@@ -396,8 +414,9 @@ class DocumentoEmitido(Base):
     datos JSONB según tipo_doc:
         FAC/LIQ: { infoTributaria, infoFactura, detalles[], pagos[], resumenImpuestos }
         NCR:     { infoTributaria, infoNotaCredito, detalles[], resumenImpuestos }
-        NDB:     { infoTributaria, infoNotaDebito, motivos[], resumenImpuestos }
-        RET:     { infoTributaria, infoRetencion, impuestos[] }
+        NDB:     { infoTributaria, infoNotaDebito, motivos[], resumenImpuestos: [] }
+                 (los impuestos de la ND van en infoNotaDebito.impuestos)
+        RET:     { infoTributaria, infoCompRetencion, docsSustento }
     """
     __tablename__ = "documentos_emitidos"
 
@@ -407,7 +426,7 @@ class DocumentoEmitido(Base):
     punto_emision_id        = Column(Integer, ForeignKey("puntos_emision.id"), nullable=True)
     cliente_id              = Column(UUID(as_uuid=True), ForeignKey("clientes_emisor.id", ondelete="SET NULL"), nullable=True)
     api_key_id  = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)
-    created_by  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)  # ← agregar
+    created_by  = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)
 
     # Tipo e identificación SRI
     tipo_doc                = Column(String(5), nullable=False)     # FAC | LIQ | NCR | NDB | RET
@@ -423,10 +442,16 @@ class DocumentoEmitido(Base):
     mensajes_sri            = Column(JSONB)
     fecha_envio_sri         = Column(TIMESTAMP(timezone=True))
     fecha_autorizacion      = Column(TIMESTAMP(timezone=True))
-    fecha_anulacion         = Column(TIMESTAMP(timezone=True), nullable=True)   # ← añadir
-    motivo_anulacion        = Column(String(100), nullable=True)             
+    fecha_anulacion         = Column(TIMESTAMP(timezone=True), nullable=True)
+    motivo_anulacion        = Column(String(100), nullable=True)
     retry_count             = Column(Integer, default=0)
     last_retry              = Column(TIMESTAMP(timezone=True))
+    ultimo_error_tecnico    = Column(Text, nullable=True)                       # detalle de la última falla técnica
+    sri_verificado_at       = Column(TIMESTAMP(timezone=True), nullable=True)   # última consulta al SRI
+
+    # Crédito e inventario (para revertir/reaplicar con exactitud)
+    credito_estado          = Column(String(10), nullable=True)     # COBRADO | DEVUELTO | NULL
+    stock_estado            = Column(String(10), nullable=True)     # APLICADO | REVERTIDO | SIN_STOCK | NULL
 
     # Estado de cobro — solo FAC y LIQ
     estado_cobro            = Column(String(20), nullable=True)     # PENDIENTE | PAGADO | PARCIAL | ANULADO
@@ -465,6 +490,34 @@ class DocumentoEmitido(Base):
     doc_origen_emitido      = relationship("DocumentoEmitido", remote_side="DocumentoEmitido.id", foreign_keys=[doc_origen_emitido_id])
     doc_origen_recibido     = relationship("DocumentoRecibido", back_populates="retencion_emitida", foreign_keys=[doc_origen_recibido_id])
     documentos_derivados    = relationship("DocumentoEmitido", foreign_keys=[doc_origen_emitido_id])
+    movimientos_stock       = relationship("MovimientoStock", back_populates="documento", cascade="all, delete-orphan")
+
+
+class MovimientoStock(Base):
+    """
+    Movimiento de inventario causado por un documento emitido.
+    Registra EXACTAMENTE lo que se movió, para revertir y reaplicar sin descuadres.
+
+    cantidad: negativo = salida (FAC), positivo = entrada (LIQ / reverso)
+    tipo:     EMISION | REVERSO | REAPLICACION
+    """
+    __tablename__ = "movimientos_stock"
+    __table_args__ = (
+        Index("ix_movimientos_stock_documento", "documento_id"),
+        Index("ix_movimientos_stock_item", "catalogo_item_id"),
+    )
+
+    id               = Column(BigInteger, primary_key=True, autoincrement=True)
+    emisor_id        = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    documento_id     = Column(UUID(as_uuid=True), ForeignKey("documentos_emitidos.id", ondelete="CASCADE"), nullable=False)
+    catalogo_item_id = Column(UUID(as_uuid=True), ForeignKey("catalogo_items.id", ondelete="SET NULL"), nullable=True)
+    codigo           = Column(Text, nullable=False)
+    cantidad         = Column(Integer, nullable=False)
+    tipo             = Column(String(15), nullable=False)
+    created_at       = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+    documento        = relationship("DocumentoEmitido", back_populates="movimientos_stock")
+    catalogo_item    = relationship("CatalogoItem", back_populates="movimientos")
 
 
 # =============================================================================
@@ -649,7 +702,7 @@ class CuentaAbono(Base):
     fecha       = Column(Date, nullable=False, server_default=func.current_date())
     forma_pago  = Column(String(30), nullable=True)
     notas       = Column(Text, nullable=True)
-    tipo        = Column(String(10), nullable=False, server_default="ABONO")  # ← agregar esta línea
+    tipo        = Column(String(10), nullable=False, server_default="ABONO")
     created_at  = Column(TIMESTAMP(timezone=True), server_default=func.now())
     cuenta      = relationship("CuentaMovimiento", back_populates="abonos")
 
@@ -662,20 +715,11 @@ class DeclaracionSRI(Base):
     """
     Control de declaraciones tributarias por período.
 
-    tipo:    104 (IVA mensual) | 102 (Renta anual) | ATS (Anexo Transaccional)
-    periodo: primer día del mes/año declarado
+    tipo:    104 (IVA) | 102 / 101 (Renta anual) | ATS (Anexo Transaccional)
+    periodo: primer día del mes/semestre/año declarado
 
-    totales JSONB — cifras precalculadas del período para preparar la declaración:
-    {
-        "ventas_gravadas": 0,
-        "ventas_0": 0,
-        "iva_cobrado": 0,
-        "compras_deducibles": 0,
-        "credito_tributario": 0,
-        "retenciones_recibidas": 0,
-        "iva_a_pagar": 0,
-        "saldo_a_favor": 0
-    }
+    Las filas se crean por calendario (services/declaraciones/registro.py),
+    no dependen de que haya documentos en el periodo.
     """
     __tablename__ = "declaraciones_sri"
     __table_args__ = (
@@ -685,7 +729,7 @@ class DeclaracionSRI(Base):
     id              = Column(Integer, primary_key=True, autoincrement=True)
     emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
     tipo            = Column(String(10), nullable=False)            # 104 | 102 | ATS
-    periodo         = Column(Date, nullable=False)                  # primer día del mes
+    periodo         = Column(Date, nullable=False)                  # primer día del periodo
     vencimiento     = Column(Date, nullable=False)                  # guardado al crear, no recalcular
     declarado       = Column(Boolean, default=False)
     fecha_declarado = Column(TIMESTAMP(timezone=True))
@@ -713,12 +757,12 @@ class AuthChallenge(Base):
     whatsapp_number = Column(String(20))
     pin             = Column(String(10), nullable=False)
     tipo_accion     = Column(String(30), nullable=False)  # LOGIN | CAMBIO_EMAIL | NUKE | CREAR_TOKEN | ELIMINAR_TOKEN | ACTIVAR_PRODUCCION
-    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=True)  # ← agregar
+    emisor_id       = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=True)
     extra_data      = Column(JSONB)
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=False)
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
-    
+
 class EmailRateLimit(Base):
     """Anti-spam para envío de correos."""
     __tablename__ = "email_rate_limits"
@@ -782,8 +826,10 @@ class AuditLog(Base):
 class ReporteTributario(Base):
     """
     Reportes fiscales generados — IVA (104) | Renta (102) | ATS.
-    Una vez generado para un período cerrado, se guarda y no se recalcula.
-    El período actual siempre se recalcula en tiempo real.
+
+    IVA: mientras el periodo NO esté declarado se calcula en vivo (sus documentos
+    todavía pueden cambiar). Al marcarlo como declarado se congela esta foto, que
+    es lo que se presentó al SRI. Regenerar = declaración sustitutiva.
 
     tipo:         IVA | RENTA | ATS
     tipo_periodo: MENSUAL | SEMESTRAL | ANUAL

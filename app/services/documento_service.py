@@ -1,7 +1,6 @@
 # app/services/documento_service.py
 #
 # Core unificado de emisión de comprobantes electrónicos.
-# Reemplaza factura_service.py y nc_service.py.
 #
 # Tipos soportados:
 #   FAC (01) — Factura
@@ -16,7 +15,18 @@
 #   Bloque 2 — Calcular totales y reservar secuencial
 #   Bloque 3 — Construir XML según tipo
 #   Bloque 4 — Firmar XML
-#   Bloque 5 — Persistir, subir a R2 (solo Prod), encolar (solo Prod)
+#   Bloque 5 — Persistir (documento + movimientos de stock)
+#   Después del commit — contador de uso y cola del SRI
+#
+# Cambios respecto a la versión anterior:
+#   - Se encola al SRI DESPUÉS del commit (antes el worker podía tomar el documento
+#     antes de que existiera en la base y lo descartaba).
+#   - Stock vía stock_service: sandbox no mueve inventario, la LIQ SUMA stock
+#     (es una compra) y cada documento registra exactamente lo que movió.
+#   - credito_estado = 'COBRADO' cuando se descuenta crédito: solo eso se devuelve
+#     si el SRI rechaza el documento.
+#   - El contador de uso se incrementa solo si la emisión quedó confirmada.
+#   - NC y ND heredan el email del documento origen.
 
 import json
 import pytz
@@ -35,6 +45,7 @@ from app.utils.sri_core import (
     firmar_xml,
 )
 from app.services.storage_service import upload_file
+from app.services import stock_service
 from app.core.cache import get_redis
 from app.services.notification_service import (
     crear_notificacion,
@@ -220,14 +231,16 @@ async def emitir_documento_core(
             doc_origen_recibido = doc_origen_recibido,
             es_sandbox          = es_sandbox,
             created_by          = created_by,
-
             db                  = db,
         )
 
         await db.commit()
 
-        # Notificaciones diferidas (ej. stock bajo): solo ahora que la emisión
-        # quedó confirmada. Si fallan, NO afectan al documento ya emitido.
+        # ── Solo ahora que el documento existe en la base ──────────────────────
+        await _post_commit(doc_id, acceso)
+        await _invalidar_cache(emisor.id)
+
+        # Notificaciones diferidas (ej. stock bajo). Si fallan, NO afectan al documento.
         try:
             await despachar_notificaciones(db)
         except Exception as e:
@@ -254,13 +267,29 @@ async def emitir_documento_core(
         raise HTTPException(status_code=500, detail=f"Error generando comprobante: {str(e)}")
 
 
+async def _post_commit(doc_id: str, acceso: dict) -> None:
+    """Contador de uso y cola del SRI. Si Redis falla, la conciliación recoge el documento."""
+    try:
+        redis     = await get_redis()
+        redis_key = acceso.get("redis_key")
+        if redis_key:
+            nuevo = await redis.incr(redis_key)
+            if nuevo == 1:
+                ttl_dias = acceso.get("redis_ttl", 1)  # sandbox = 1 día, prod = 35 días
+                await redis.expire(redis_key, ttl_dias * 86400)
+        # Todos van al SRI — el worker decide la URL según es_sandbox
+        await redis.lpush("kipu:queue:emision", doc_id)
+    except Exception as e:
+        print(f"[Usage/Queue] ⚠️ Error Redis (la conciliación lo recogerá): {e}")
+
+
 # =============================================================================
 # BLOQUE 0 — VERIFICAR ACCESO
 # =============================================================================
 async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, db: AsyncSession):
     # ── Validar firma electrónica ─────────────────────────────────────────────
     res_firma = await db.execute(text("""
-        SELECT p12_path, p12_expiration 
+        SELECT p12_path, p12_expiration
         FROM emisores WHERE id = :eid
     """), {"eid": emisor_id})
     firma = res_firma.fetchone()
@@ -414,7 +443,7 @@ async def _cargar_doc_origen_emitido(data: dict, emisor_id: int, tipo_doc: str, 
     res = await db.execute(text("""
         SELECT
             d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
-            d.tipo_doc, d.cod_doc, d.datos,
+            d.tipo_doc, d.cod_doc, d.datos, d.email_comprador,
             d.punto_emision_id, d.cliente_id,
             e.id as emisor_db_id, e.ruc, e.razon_social, e.nombre_comercial,
             e.direccion_matriz, e.ambiente, e.p12_path, e.p12_pass,
@@ -458,7 +487,8 @@ async def _cargar_doc_origen_emitido(data: dict, emisor_id: int, tipo_doc: str, 
             info.get("razonSocialProveedor") or
             datos.get("legacy_razon_comprador")
         ),
-        "email":      datos.get("legacy_email_comprador"),
+        # Antes solo se leía el campo legacy: las NC/ND no le llegaban al cliente por correo
+        "email":      doc.email_comprador or datos.get("legacy_email_comprador"),
         "direccion": "S/N",
         "telefono":  "",
         "tipo_id": (
@@ -778,7 +808,6 @@ async def _construir_xml(
             "pagos":                        {"pago": pagos_xml},
         }
 
-
         return {
             "liquidacionCompra": {
                 "@id":                   "comprobante",
@@ -891,7 +920,6 @@ async def _construir_xml(
             "valorTotal":                  f"{valor_total_ndb:.2f}",
             "pagos":                       {"pago": pagos_xml},
         }
-
 
         return {
             "notaDebito": {
@@ -1024,7 +1052,7 @@ async def _construir_xml(
             "impuestosDocSustento":     {"impuestoDocSustento": impuestos_doc_xml},
             "retenciones":              {"retencion": retenciones_xml},
             "pagos":                    {"pago": [{
-                "formaPago": forma_pago_sust,   
+                "formaPago": forma_pago_sust,
                 "total":     f"{importe_total_sust:.2f}",
             }]},
         }
@@ -1067,6 +1095,7 @@ async def _persistir(
     es_sandbox: bool = False, created_by = None,
     db = None,
 ) -> str:
+    """Inserta el documento y sus movimientos de stock. NO encola ni hace commit."""
     carpeta  = _carpeta_por_tipo(tipo_doc)
     prefijo  = "sandbox/" if es_sandbox else ""
     xml_path = f"{emisor.ruc}/{prefijo}{carpeta}/{clave_acceso}.xml"
@@ -1106,6 +1135,7 @@ async def _persistir(
             es_sandbox, created_by,
             estado_cobro, forma_pago_cobro,
             numero_comprobante_pago, fecha_pago,
+            credito_estado,
             created_at, updated_at
         ) VALUES (
             gen_random_uuid(),
@@ -1119,6 +1149,7 @@ async def _persistir(
             :es_sandbox, :created_by,
             :estado_cobro, :forma_pago_cobro,
             :num_comp_pago, :fecha_pago_cobro,
+            :credito_estado,
             NOW(), NOW()
         ) RETURNING id
     """), {
@@ -1145,31 +1176,35 @@ async def _persistir(
         "forma_pago_cobro":       data.get("forma_pago_cobro"),
         "num_comp_pago":          data.get("numero_comprobante_pago"),
         "fecha_pago_cobro":       date.fromisoformat(data["fecha_pago"]) if data.get("fecha_pago") else None,
+        # Solo lo que se cobró se devuelve si el SRI rechaza
+        "credito_estado":         "COBRADO" if acceso["descontar_credito"] else None,
     })
     doc_id = str(res.scalar())
 
-    if tipo_doc in ("FAC", "LIQ") and calculos:
-        await _descontar_stock(datos_json, emisor.id, db)
+    # ── Inventario: FAC resta, LIQ suma, sandbox no mueve nada ────────────────
+    cruces = await stock_service.aplicar_emision(
+        db, doc_id=doc_id, emisor_id=emisor.id, tipo_doc=tipo_doc,
+        datos=datos_json, es_sandbox=es_sandbox,
+    )
+    for item in cruces:
+        # Diferida: se envía solo si la emisión hace commit
+        encolar_notificacion(
+            db         = db,
+            emisor_id  = emisor.id,
+            tipo       = "SISTEMA",
+            titulo     = f"⚠️ Stock bajo: {item['descripcion']}",
+            mensaje    = f"Quedan {item['stock']} unidades. Stock mínimo configurado: {item['stock_minimo']}.",
+            referencia = f"/productos/{item['id']}",
+        )
+    if cruces or tipo_doc in ("FAC", "LIQ"):
+        try:
+            from app.core.cache import cache_clear_prefix
+            await cache_clear_prefix(f"productos:{emisor.id}:")
+        except Exception as e:
+            print(f"[Stock] ⚠️ No se limpió la caché de productos: {e}")
 
     if tipo_doc in ("FAC", "LIQ") and data.get("items"):
         await _guardar_items_catalogo(data["items"], emisor.id, db)
-
-    await _invalidar_cache(emisor.id)
-
-    # ── Redis: contador de uso + cola SRI ─────────────────────────────────────
-    try:
-        redis     = await get_redis()
-        redis_key = acceso.get("redis_key")
-        if redis_key:
-            nuevo = await redis.incr(redis_key)
-            if nuevo == 1:
-                # Primera emisión del período — establecer TTL
-                ttl_dias = acceso.get("redis_ttl", 1)  # sandbox=1día, prod=35días
-                await redis.expire(redis_key, ttl_dias * 86400)
-        # Todos van al SRI — el worker decide la URL según es_sandbox
-        await redis.lpush("kipu:queue:emision", doc_id)
-    except Exception as e:
-        print(f"[Usage/Queue] ⚠️ Error Redis: {e}")
 
     return doc_id
 
@@ -1221,61 +1256,13 @@ def _adaptar_detalles_nc(detalles_xml: list) -> list:
         resultado.append(det_nc)
     return resultado
 
-async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
-    try:
-        detalles = datos_json.get("detalles", {}).get("detalle", [])
-        if not isinstance(detalles, list):
-            detalles = [detalles]
-
-        hubo_descuento = False
-
-        for det in detalles:
-            codigo  = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
-            if not codigo or codigo == "S/C":
-                continue
-            cantidad = int(float(det.get("cantidad", 0)))
-
-            res = await db.execute(text("""
-                UPDATE catalogo_items
-                SET stock = GREATEST(0, stock - :qty), updated_at = NOW()
-                WHERE emisor_id = :eid AND stock > 0 AND codigo = :cod
-                RETURNING id, descripcion, stock, stock_minimo
-            """), {"qty": cantidad, "eid": emisor_id, "cod": codigo})
-            item = res.fetchone()
-
-            if not item:
-                continue
-
-            hubo_descuento = True
-
-            # Avisar solo cuando ESTA venta cruza el mínimo (no en cada venta posterior)
-            stock_anterior = item.stock + cantidad
-            if item.stock_minimo > 0 and item.stock <= item.stock_minimo < stock_anterior:
-                # Diferida: se envía solo si la emisión hace commit
-                encolar_notificacion(
-                    db         = db,
-                    emisor_id  = emisor_id,
-                    tipo       = "SISTEMA",
-                    titulo     = f"⚠️ Stock bajo: {item.descripcion}",
-                    mensaje    = f"Quedan {item.stock} unidades. Stock mínimo configurado: {item.stock_minimo}.",
-                    referencia = f"/productos/{str(item.id)}",
-                )
-
-        if hubo_descuento:
-            from app.core.cache import cache_clear_prefix
-            await cache_clear_prefix(f"productos:{emisor_id}:")
-
-    except Exception as e:
-        print(f"[Stock] ⚠️ Error descontando stock: {e}")
-
 
 async def _invalidar_cache(emisor_id: int):
     try:
-        redis   = await get_redis()
-        pattern = f"kipu:cache:*:{emisor_id}:*"
-        keys    = await redis.keys(pattern)
-        if keys:
-            await redis.delete(*keys)
+        redis = await get_redis()
+        for patron in (f"kipu:cache:*:{emisor_id}:*", f"dashboard:{emisor_id}*", f"dashboard_docs:{emisor_id}:*"):
+            async for k in redis.scan_iter(patron):
+                await redis.delete(k)
     except Exception as e:
         print(f"[Cache] ⚠️ No invalidado: {e}")
 
@@ -1291,6 +1278,7 @@ def _tarifa_a_codigo_porcentaje(tarifa: str) -> str:
         "15": "4",
     }
     return MAPA.get(str(tarifa).split(".")[0], "0")
+
 
 def toArray_py(v):
     """Normaliza a lista — equivalente al toArray de helpers.js"""

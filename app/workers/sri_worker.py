@@ -1,550 +1,281 @@
 # app/workers/sri_worker.py
 #
 # Worker de emisión y autorización de comprobantes electrónicos.
-# Cola: kipu:queue:emision → SRI recepción → kipu:queue:autorizacion → SRI autorización
+#
+#   kipu:queue:emision      → recepción del SRI
+#   kipu:queue:autorizacion → autorización del SRI
+#   kipu:queue:diferida     → reintentos programados (ZSET), sin bloquear al worker
+#
+# Reglas (Ficha técnica SRI, secciones 7 y 8):
+#   1. El SRI es la fuente de verdad. Ante cualquier duda se consulta la autorización
+#      por clave de acceso ANTES de reenviar.
+#   2. Una falla técnica nunca se convierte en DEVUELTA. Tras varios intentos el
+#      documento pasa a EN_REVISION (no es un rechazo) y la conciliación lo sigue.
+#   3. Recepción 43 (clave ya registrada) o 45 (secuencial registrado) no son rechazos
+#      del contenido: se consulta la autorización.
+#   4. Después de RECIBIDA se espera un tiempo parametrizable antes de consultar
+#      la autorización, y se insiste hasta 24 horas.
+#   5. Las esperas van a la cola diferida: el semáforo solo cubre las llamadas de red.
 
-import hmac
-import hashlib
-import base64
 import asyncio
-import httpx
-import xmltodict
-import json
-import uuid
-from datetime import datetime
+import time
+from datetime import datetime, timezone
+
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.database import AsyncSessionLocal
+
 from app.core.cache import get_redis
-from app.services.storage_service import download_file, upload_file
-from app.services.mail_service import mail_service
-from app.services.notifier_service import notificar_cambio_estado
 from app.core.config import settings
-from app.services.notification_service import crear_notificacion
+from app.core.database import AsyncSessionLocal
+from app.services import sri_client as sri
+from app.services import comprobante_estado_service as svc
+from app.services.storage_service import download_file
+# Compatibilidad: otros módulos importaban disparar_webhooks desde aquí
+from app.services.comprobante_estado_service import disparar_webhooks  # noqa: F401
 
-QUEUE_EMISION      = "kipu:queue:emision"
-QUEUE_AUTORIZACION = "kipu:queue:autorizacion"
-QUEUE_PROC_EMISION = "kipu:queue:proc:emision"
-QUEUE_PROC_AUTH    = "kipu:queue:proc:auth"
+QUEUE_EMISION      = svc.QUEUE_EMISION
+QUEUE_AUTORIZACION = svc.QUEUE_AUTORIZACION
+QUEUE_DIFERIDA     = svc.QUEUE_DIFERIDA
 
-URLS_SRI = {
-    "1": {
-        "recepcion":    "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
-        "autorizacion": "https://celcer.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
-    },
-    "2": {
-        "recepcion":    "https://cel.sri.gob.ec/comprobantes-electronicos-ws/RecepcionComprobantesOffline?wsdl",
-        "autorizacion": "https://cel.sri.gob.ec/comprobantes-electronicos-ws/AutorizacionComprobantesOffline?wsdl"
-    }
-}
+MAX_CONCURRENT          = 3
+BRPOP_TIMEOUT           = 5
+MAX_INTENTOS_TECNICOS   = int(getattr(settings, "SRI_MAX_INTENTOS_TECNICOS", 8))
+ESPERA_AUTORIZACION_SEG = float(getattr(settings, "SRI_ESPERA_AUTORIZACION_SEG", 3))
+LIMITE_AUTORIZACION_H   = 24          # la ficha técnica da hasta 24 h desde RECIBIDA
+CONCILIACION_CADA_SEG   = 30 * 60
 
-TIPO_DOC_LABEL = {
-    "FAC": "Factura",
-    "LIQ": "Liquidación",
-    "NCR": "Nota de Crédito",
-    "NDB": "Nota de Débito",
-    "RET": "Retención",
-}
-
-NODE_PDF_URL   = f"{settings.NODE_SIGNER_URL}/api/pdf"
-MAX_CONCURRENT = 3
-BRPOP_TIMEOUT  = 5
 _sri_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+
+def _backoff(intento: int) -> float:
+    """10 s, 20 s, 40 s, 80 s, 160 s, 300 s…"""
+    return min(10 * (2 ** max(intento - 1, 0)), 300)
+
+
+def _backoff_autorizacion(intento: int) -> float:
+    """5 s, 10 s, 20 s, 30 s, 60 s, 120 s, 300 s…"""
+    pasos = [5, 10, 20, 30, 60, 120]
+    return pasos[intento] if intento < len(pasos) else 300
+
+
+async def _con_sri(coro):
+    async with _sri_semaphore:
+        return await coro
+
+
+async def _fallo_tecnico(db, doc, resp: sri.RespuestaSRI, cola: str) -> None:
+    detalle  = resp.resumen_tecnico()
+    intentos = await svc.registrar_error_tecnico(db, doc.id, detalle)
+    print(f"[SRI] ⚠️ Falla técnica ({doc.clave_acceso}) intento {intentos}: {detalle}")
+    if intentos >= MAX_INTENTOS_TECNICOS:
+        await svc.marcar_en_revision(db, doc, detalle)
+        return
+    await svc.programar(cola, doc.id, _backoff(intentos))
+
+
+# =============================================================================
+# EMISIÓN (recepción)
+# =============================================================================
+async def procesar_emision(doc_id: str):
+    async with AsyncSessionLocal() as db:
+        try:
+            doc = await svc.cargar_documento(db, doc_id)
+            if not doc or doc.estado_sri != "FIRMADO":
+                return
+            ambiente = svc.ambiente_efectivo(doc)
+
+            # 1) Si ya hubo un intento, el SRI pudo haberlo recibido: se pregunta primero
+            if (doc.retry_count or 0) > 0:
+                aut = await _con_sri(sri.consultar_autorizacion(doc.clave_acceso, ambiente))
+                if await svc.aplicar_respuesta_autorizacion(db, doc, aut):
+                    return
+                # NO_ENCONTRADO → es seguro enviar · TECNICO → se intenta enviar igual
+
+            # 2) Envío
+            xml_bytes = download_file(doc.xml_path)
+            rec = await _con_sri(sri.enviar_comprobante(xml_bytes, ambiente))
+
+            if rec.estado == sri.RECIBIDA:
+                await svc.marcar_recibida(db, doc)
+                await svc.programar(QUEUE_AUTORIZACION, doc.id, ESPERA_AUTORIZACION_SEG)
+                return
+
+            if rec.estado == sri.DEVUELTA:
+                ids = rec.ids
+                if sri.COD_EN_PROCESAMIENTO in ids:
+                    print(f"[SRI] ⏳ 70 en procesamiento — reintento en 20 s: {doc.clave_acceso}")
+                    await svc.programar(QUEUE_EMISION, doc.id, 20)
+                    return
+
+                if ids & {sri.COD_CLAVE_REGISTRADA, sri.COD_SECUENCIAL_REG}:
+                    # "Ya lo tengo": se le pregunta al SRI cómo está
+                    aut = await _con_sri(sri.consultar_autorizacion(doc.clave_acceso, ambiente))
+                    if await svc.aplicar_respuesta_autorizacion(db, doc, aut):
+                        return
+                    if aut.estado == sri.TECNICO:
+                        await _fallo_tecnico(db, doc, aut, QUEUE_EMISION)
+                        return
+                    if sri.COD_CLAVE_REGISTRADA in ids:
+                        # El SRI tiene la clave pero aún no la autoriza: esperar
+                        await svc.marcar_recibida(db, doc)
+                        await svc.programar(QUEUE_AUTORIZACION, doc.id, 10)
+                        return
+                    # 45 y el SRI no tiene esta clave: el secuencial es de OTRO comprobante
+
+                await svc.finalizar_devuelta(db, doc.id, rec)
+                return
+
+            # 3) Falla técnica: nunca es DEVUELTA
+            await _fallo_tecnico(db, doc, rec, QUEUE_EMISION)
+
+        except Exception as err:
+            await db.rollback()
+            print(f"[Emisión] ❌ Error inesperado ({doc_id}): {err}")
+            try:
+                async with AsyncSessionLocal() as db2:
+                    intentos = await svc.registrar_error_tecnico(db2, doc_id, f"Error interno: {err}")
+                await svc.programar(QUEUE_EMISION, doc_id, _backoff(intentos))
+            except Exception as e2:
+                print(f"[Emisión] ❌ No se pudo reprogramar {doc_id}: {e2}")
+
+
+# =============================================================================
+# AUTORIZACIÓN
+# =============================================================================
+async def procesar_autorizacion(doc_id: str):
+    async with AsyncSessionLocal() as db:
+        try:
+            doc = await svc.cargar_documento(db, doc_id)
+            if not doc or doc.estado_sri != "RECIBIDA":
+                return
+
+            aut = await _con_sri(sri.consultar_autorizacion(doc.clave_acceso, svc.ambiente_efectivo(doc)))
+            if aut.estado in (sri.AUTORIZADO, sri.NO_AUTORIZADO):
+                await svc.aplicar_respuesta_autorizacion(db, doc, aut)
+                return
+
+            # Todavía no hay respuesta (o falla técnica): se insiste hasta 24 h
+            enviado = doc.fecha_envio_sri or datetime.now(timezone.utc)
+            horas   = (datetime.now(timezone.utc) - enviado).total_seconds() / 3600
+            if horas >= LIMITE_AUTORIZACION_H:
+                await svc.marcar_en_revision(db, doc, f"El SRI no entregó la autorización en {LIMITE_AUTORIZACION_H} horas "
+                                                      f"(última respuesta: {aut.estado}).")
+                return
+
+            detalle  = aut.resumen_tecnico() if aut.estado == sri.TECNICO else f"Autorización: {aut.estado}"
+            intentos = await svc.registrar_error_tecnico(db, doc.id, detalle)
+            await svc.programar(QUEUE_AUTORIZACION, doc.id, _backoff_autorizacion(intentos))
+
+        except Exception as err:
+            await db.rollback()
+            print(f"[Auth] ❌ Error inesperado ({doc_id}): {err}")
+            try:
+                await svc.programar(QUEUE_AUTORIZACION, doc_id, 60)
+            except Exception as e2:
+                print(f"[Auth] ❌ No se pudo reprogramar {doc_id}: {e2}")
+
+
+# =============================================================================
+# CONCILIACIÓN: corrige estados preguntándole al SRI
+# =============================================================================
+async def conciliar() -> dict:
+    """
+    Revisa en el SRI:
+      - FIRMADO / RECIBIDA atascados más de 15 minutos
+      - EN_REVISION
+      - DEVUELTA de las últimas 72 h por clave ya registrada (43/45) o con falla técnica previa
+    """
+    async with AsyncSessionLocal() as db:
+        res = await db.execute(text("""
+            SELECT id, estado_sri FROM documentos_emitidos
+            WHERE (estado_sri IN ('FIRMADO', 'RECIBIDA')
+                   AND updated_at < NOW() - INTERVAL '15 minutes'
+                   AND created_at > NOW() - INTERVAL '30 days')
+               OR estado_sri = 'EN_REVISION'
+               OR (estado_sri = 'DEVUELTA'
+                   AND updated_at > NOW() - INTERVAL '72 hours'
+                   AND (mensajes_sri::text LIKE '%%"identificador": "43"%%'
+                        OR mensajes_sri::text LIKE '%%"identificador": "45"%%'
+                        OR ultimo_error_tecnico IS NOT NULL))
+            ORDER BY updated_at ASC
+            LIMIT 100
+        """))
+        pendientes = res.fetchall()
+
+    corregidos = 0
+    for fila in pendientes:
+        async with AsyncSessionLocal() as db:
+            try:
+                r = await _con_sri(svc.sincronizar_documento(db, fila.id))
+                if r.get("cambio"):
+                    corregidos += 1
+                # El SRI no lo tiene y está para enviarse: se encola
+                if r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri in ("FIRMADO", "EN_REVISION"):
+                    await db.execute(text("""
+                        UPDATE documentos_emitidos SET estado_sri = 'FIRMADO', updated_at = NOW()
+                        WHERE id = :did AND estado_sri IN ('FIRMADO', 'EN_REVISION')
+                    """), {"did": str(fila.id)})
+                    await db.commit()
+                    await svc.encolar(QUEUE_EMISION, fila.id)
+                elif r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri == "RECIBIDA":
+                    await svc.encolar(QUEUE_AUTORIZACION, fila.id)
+            except Exception as e:
+                await db.rollback()
+                print(f"[Conciliación] ⚠️ {fila.id}: {e}")
+
+    if pendientes:
+        print(f"[Conciliación] 🔄 {len(pendientes)} revisados · {corregidos} corregidos")
+    return {"revisados": len(pendientes), "corregidos": corregidos}
 
 
 # =============================================================================
 # RECOVERY AL ARRANCAR
 # =============================================================================
-
 async def recovery_al_arrancar():
     print("[Recovery] 🔍 Buscando comprobantes pendientes en DB...")
+    async with AsyncSessionLocal() as db:
+        res_e = await db.execute(text("""
+            SELECT id FROM documentos_emitidos WHERE estado_sri = 'FIRMADO' ORDER BY created_at ASC
+        """))
+        res_a = await db.execute(text("""
+            SELECT id FROM documentos_emitidos
+            WHERE estado_sri = 'RECIBIDA' AND fecha_autorizacion IS NULL
+            ORDER BY created_at ASC
+        """))
+        ids_e = [r.id for r in res_e.fetchall()]
+        ids_a = [r.id for r in res_a.fetchall()]
+
+    # Los reintentos ya programados en la cola diferida se respetan;
+    # solo se encola lo que no esté programado.
     redis = await get_redis()
-
-    async with AsyncSessionLocal() as db:
-        res_emision = await db.execute(text("""
-            SELECT id FROM documentos_emitidos
-            WHERE estado_sri = 'FIRMADO'
-            AND es_sandbox = false
-            ORDER BY created_at ASC
-        """))
-        ids_emision = res_emision.fetchall()
-
-        res_auth = await db.execute(text("""
-            SELECT id FROM documentos_emitidos
-            WHERE estado_sri = 'RECIBIDA'
-            AND fecha_autorizacion IS NULL
-            AND es_sandbox = false
-            ORDER BY created_at ASC
-        """))
-        ids_auth = res_auth.fetchall()
-
-    await redis.delete(QUEUE_PROC_EMISION)
-    await redis.delete(QUEUE_PROC_AUTH)
-
-    if ids_emision:
-        for row in ids_emision:
-            await redis.lpush(QUEUE_EMISION, str(row.id))
-        print(f"[Recovery] ✅ {len(ids_emision)} comprobantes FIRMADO → cola emisión")
-
-    if ids_auth:
-        for row in ids_auth:
-            await redis.lpush(QUEUE_AUTORIZACION, str(row.id))
-        print(f"[Recovery] ✅ {len(ids_auth)} comprobantes RECIBIDA → cola autorización")
-
-    if not ids_emision and not ids_auth:
-        print("[Recovery] ✅ Sin pendientes.")
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-async def httpx_with_retry(url: str, content: str, headers: dict, max_retries: int = 3):
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        for intento in range(1, max_retries + 1):
-            try:
-                return await client.post(url, content=content, headers=headers)
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as err:
-                if intento < max_retries:
-                    espera = intento * 2
-                    print(f"[SRI] ⚠️ Intento {intento}/{max_retries} fallido. Reintentando en {espera}s...")
-                    await asyncio.sleep(espera)
-                else:
-                    raise err
-
-
-async def _invalidar_cache(emisor_id: int):
-    try:
-        redis   = await get_redis()
-        pattern = f"kipu:cache:*:{emisor_id}:*"
-        keys    = await redis.keys(pattern)
-        if keys:
-            await redis.delete(*keys)
-    except Exception as e:
-        print(f"[Cache] ⚠️ No invalidado: {e}")
-
-
-def _es_origen_api(origen: str) -> bool:
-    return origen == "api"
-
-
-# =============================================================================
-# PROCESADOR DE EMISIÓN
-# =============================================================================
-
-async def procesar_emision(doc_id: str):
-    async with _sri_semaphore:
-        async with AsyncSessionLocal() as db:
-            try:
-                res = await db.execute(text("""
-                    SELECT
-                        d.id, d.xml_path, d.clave_acceso, d.numero_doc,
-                        d.api_key_id, d.origen, d.datos,
-                        d.tipo_doc, d.es_sandbox,
-                        e.ambiente, e.id as emisor_id,
-                        e.contribuyente_especial
-                    FROM documentos_emitidos d
-                    JOIN emisores e ON d.emisor_id = e.id
-                    WHERE d.id = :did AND d.estado_sri = 'FIRMADO'
-                """), {"did": doc_id})
-                doc = res.fetchone()
-                if not doc:
-                    print(f"[Emisión] ℹ️ {doc_id} ya no está en FIRMADO, se omite.")
-                    return
-
-                xml_bytes  = download_file(doc.xml_path)
-                xml_base64 = base64.b64encode(xml_bytes).decode("utf-8")
-                ambiente_efectivo = "1" if doc.es_sandbox else str(doc.ambiente)
-                urls = URLS_SRI[ambiente_efectivo]
-                soap_body = (
-                    f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-                    f'xmlns:ec="http://ec.gob.sri.ws.recepcion">'
-                    f'<soapenv:Body><ec:validarComprobante><xml>{xml_base64}</xml>'
-                    f'</ec:validarComprobante></soapenv:Body></soapenv:Envelope>'
-                )
-                res_sri  = await httpx_with_retry(urls["recepcion"], soap_body, {"Content-Type": "text/xml"})
-                json_res = xmltodict.parse(res_sri.text)
-                body     = json_res.get("soap:Envelope", {}).get("soap:Body", {})
-
-                if body.get("soap:Fault"):
-                    fault_msg = body["soap:Fault"].get("faultstring", "Error desconocido")
-                    print(f"[Emisión] ⚠️ SRI Fault — esperando 30s: {fault_msg}")
-                    await asyncio.sleep(30)
-                    raise Exception(f"SRI Fault: {fault_msg}")
-
-                resp     = body.get("ns2:validarComprobanteResponse", {}).get("RespuestaRecepcionComprobante")
-                doc_dict = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in doc._mapping.items()}
-
-                if resp and resp.get("estado") == "RECIBIDA":
-                    await db.execute(text("""
-                        UPDATE documentos_emitidos
-                        SET estado_sri = 'RECIBIDA', fecha_envio_sri = NOW()
-                        WHERE id = :id
-                    """), {"id": doc.id})
-                    await db.commit()
-                    redis = await get_redis()
-                    await redis.lpush(QUEUE_AUTORIZACION, str(doc.id))
-
-                else:
-                    msg_raw = (resp or {}).get("comprobantes", {}) \
-                                         .get("comprobante", {}) \
-                                         .get("mensajes", {}) \
-                                         .get("mensaje", {})
-                    ids_error = (
-                        [m.get("identificador") for m in msg_raw]
-                        if isinstance(msg_raw, list)
-                        else [msg_raw.get("identificador")]
-                    )
-
-                    if "70" in ids_error:
-                        print(f"[Emisión] ⏳ Código 70 (SRI en procesamiento) — reintentando en 20s: {doc.clave_acceso}")
-                        await asyncio.sleep(20)
-                        redis = await get_redis()
-                        await redis.lpush(QUEUE_EMISION, str(doc.id))
-                        return
-
-                    await db.execute(text("""
-                        UPDATE documentos_emitidos
-                        SET estado_sri = 'DEVUELTA',
-                            mensajes_sri = CAST(:msg AS jsonb)
-                        WHERE id = :id
-                    """), {"msg": json.dumps(resp), "id": doc.id})
-                    if _es_origen_api(doc.origen):
-                        await db.execute(text("""
-                            UPDATE user_credits
-                            SET balance = balance + 1, last_updated = NOW()
-                            WHERE emisor_id = :eid
-                        """), {"eid": doc.emisor_id})
-                    await db.commit()
-                    await _devolver_stock_si_aplica(doc, db)
-                    await _invalidar_cache(doc.emisor_id)
-                    await notificar_cambio_estado(doc_dict, "DEVUELTA", resp)
-
-                    tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
-                    numero     = doc.numero_doc or doc.clave_acceso[-10:]
-                    prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
-                    await crear_notificacion(
-                        db         = db,
-                        emisor_id  = doc.emisor_id,
-                        tipo       = "DOCUMENTO",
-                        titulo     = f"{prefijo}⚠️ {tipo_label} devuelto por el SRI",
-                        mensaje    = f"{prefijo}{tipo_label} {numero} fue devuelto. Revisa los errores en el detalle.",
-                        referencia = f"/documentos/{doc.id}",
-                    )
-                    print(f"[Emisión] ⚠️ DEVUELTA: {doc.clave_acceso}")
-
-            except Exception as err:
-                await db.rollback()
-                async with AsyncSessionLocal() as db2:
-                    res2 = await db2.execute(text("""
-                        UPDATE documentos_emitidos
-                        SET retry_count = CASE
-                            WHEN last_retry < NOW() - INTERVAL '1 hour' THEN 1
-                            ELSE COALESCE(retry_count, 0) + 1
-                        END,
-                        last_retry = NOW()
-                        WHERE id = :id
-                        RETURNING retry_count
-                    """), {"id": doc_id})
-                    nuevo_retry = res2.scalar()
-                    await db2.commit()
-                espera = min(2 ** nuevo_retry * 10, 300)
-                print(f"[Emisión] ❌ Error ({doc_id}): {str(err)} — retry #{nuevo_retry}, esperando {espera}s")
-                await asyncio.sleep(espera)
-                redis = await get_redis()
-                await redis.lpush(QUEUE_EMISION, doc_id)
-
-
-# =============================================================================
-# PROCESADOR DE AUTORIZACIÓN
-# =============================================================================
-
-async def procesar_autorizacion(doc_id: str):
-    async with _sri_semaphore:
-        async with AsyncSessionLocal() as db:
-            try:
-                res = await db.execute(text("""
-                    SELECT
-                        d.id, d.clave_acceso, d.xml_path, d.numero_doc,
-                        d.api_key_id, d.origen, d.datos,
-                        d.tipo_doc, d.secuencial, d.es_sandbox,
-                        d.email_comprador,
-                        e.ambiente, e.ruc, e.razon_social,
-                        e.contribuyente_especial, e.id as emisor_id
-                    FROM documentos_emitidos d
-                    JOIN emisores e ON d.emisor_id = e.id
-                    WHERE d.id = :did
-                      AND d.estado_sri = 'RECIBIDA'
-                      AND d.fecha_autorizacion IS NULL
-                """), {"did": doc_id})
-
-                doc = res.fetchone()
-                if not doc:
-                    print(f"[Auth] ℹ️ {doc_id} ya no está en RECIBIDA, se omite.")
-                    return
-
-                ambiente_efectivo = "1" if doc.es_sandbox else str(doc.ambiente)
-                urls = URLS_SRI[ambiente_efectivo]
-                soap_body = (
-                    f'<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
-                    f'xmlns:ec="http://ec.gob.sri.ws.autorizacion">'
-                    f'<soapenv:Body><ec:autorizacionComprobante>'
-                    f'<claveAccesoComprobante>{doc.clave_acceso}</claveAccesoComprobante>'
-                    f'</ec:autorizacionComprobante></soapenv:Body></soapenv:Envelope>'
-                )
-
-                res_sri   = await httpx_with_retry(urls["autorizacion"], soap_body, {"Content-Type": "text/xml"})
-                json_res  = xmltodict.parse(res_sri.text)
-                body      = json_res.get("soap:Envelope", {}).get("soap:Body", {})
-                resp_auth = body.get("ns2:autorizacionComprobanteResponse", {}).get("RespuestaAutorizacionComprobante")
-                doc_dict  = {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in doc._mapping.items()}
-
-                if not resp_auth or int(resp_auth.get("numeroComprobantes", 0)) == 0:
-                    await asyncio.sleep(10)
-                    redis = await get_redis()
-                    await redis.lpush(QUEUE_AUTORIZACION, doc_id)
-                    return
-
-                autorizaciones = resp_auth["autorizaciones"]["autorizacion"]
-                autorizacion   = autorizaciones[0] if isinstance(autorizaciones, list) else autorizaciones
-
-                tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
-                numero     = doc.numero_doc or doc.clave_acceso[-10:]
-                prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
-
-                if autorizacion.get("estado") == "AUTORIZADO":
-                    xml_autorizado = autorizacion["comprobante"]
-                    fecha_auth_str = autorizacion["fechaAutorizacion"]
-                    fecha_auth_obj = datetime.fromisoformat(fecha_auth_str.replace("Z", "+00:00"))
-
-                    upload_file(doc.xml_path, xml_autorizado.encode("utf-8"), "text/xml")
-                    pdf_bytes = await _generar_pdf(xml_autorizado, doc, fecha_auth_str)
-
-                    await db.execute(text("""
-                        UPDATE documentos_emitidos
-                        SET estado_sri = 'AUTORIZADO',
-                            fecha_autorizacion = :fecha
-                        WHERE id = :id
-                    """), {"fecha": fecha_auth_obj, "id": doc.id})
-                    await db.commit()
-
-                    await _invalidar_cache(doc.emisor_id)
-                    await disparar_webhooks(doc.id, doc.emisor_id, "documento.autorizado", doc_dict)
-
-                    await crear_notificacion(
-                        db         = db,
-                        emisor_id  = doc.emisor_id,
-                        tipo       = "DOCUMENTO",
-                        titulo     = f"{prefijo}✅ {tipo_label} autorizado",
-                        mensaje    = f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
-                        referencia = f"/documentos/{doc.id}",
-                    )
-
-                    if doc.tipo_doc in ("FAC", "LIQ"):
-                        if doc.es_sandbox:
-                            res_owner = await db.execute(text("""
-                                SELECT p.email, p.full_name FROM profiles p
-                                JOIN emisor_usuarios eu ON eu.profile_id = p.id
-                                WHERE eu.emisor_id = :eid
-                                ORDER BY eu.created_at ASC
-                                LIMIT 1
-                            """), {"eid": doc.emisor_id})
-                            owner = res_owner.fetchone()
-                            if owner:
-                                await _enviar_email_comprobante(
-                                    email              = owner.email,
-                                    razon_social       = doc.razon_social,
-                                    ruc                = doc.ruc,
-                                    tipo_doc           = doc.tipo_doc,
-                                    secuencial         = doc.secuencial,
-                                    clave_acceso       = doc.clave_acceso,
-                                    fecha_autorizacion = fecha_auth_str,
-                                    xml_str            = xml_autorizado,
-                                    pdf_bytes          = pdf_bytes,
-                                    es_sandbox         = True,
-                                )
-                        else:
-                            if doc.email_comprador:
-                                await _enviar_email_comprobante(
-                                    email              = doc.email_comprador,
-                                    razon_social       = doc.razon_social,
-                                    ruc                = doc.ruc,
-                                    tipo_doc           = doc.tipo_doc,
-                                    secuencial         = doc.secuencial,
-                                    clave_acceso       = doc.clave_acceso,
-                                    fecha_autorizacion = fecha_auth_str,
-                                    xml_str            = xml_autorizado,
-                                    pdf_bytes          = pdf_bytes,
-                                    es_sandbox         = False,
-                                )
-
-                elif autorizacion.get("estado") in ("RECHAZADO", "NO AUTORIZADO"):
-                    await db.execute(text("""
-                        UPDATE documentos_emitidos
-                        SET estado_sri = 'RECHAZADO',
-                            mensajes_sri = CAST(:msg AS jsonb)
-                        WHERE id = :id
-                    """), {"msg": json.dumps(autorizacion.get("mensajes")), "id": doc.id})
-
-                    if _es_origen_api(doc.origen):
-                        await db.execute(text("""
-                            UPDATE user_credits
-                            SET balance = balance + 1, last_updated = NOW()
-                            WHERE emisor_id = :eid
-                        """), {"eid": doc.emisor_id})
-
-                    await db.commit()
-                    await _devolver_stock_si_aplica(doc, db)
-                    await _invalidar_cache(doc.emisor_id)
-                    await notificar_cambio_estado(doc_dict, "RECHAZADO", autorizacion.get("mensajes"))
-
-                    await crear_notificacion(
-                        db         = db,
-                        emisor_id  = doc.emisor_id,
-                        tipo       = "DOCUMENTO",
-                        titulo     = f"{prefijo}❌ {tipo_label} rechazado por el SRI",
-                        mensaje    = f"{prefijo}{tipo_label} {numero} fue rechazado. Revisa los errores en el detalle.",
-                        referencia = f"/documentos/{doc.id}",
-                    )
-                    await disparar_webhooks(doc.id, doc.emisor_id, "documento.rechazado", doc_dict)
-                    print(f"[Auth] ⚠️ RECHAZADO: {doc.clave_acceso}")
-
-            except Exception as err:
-                await db.rollback()
-                print(f"[Auth] ❌ Error ({doc_id}): {str(err)}")
-                await asyncio.sleep(30)
-                redis = await get_redis()
-                await redis.lpush(QUEUE_AUTORIZACION, doc_id)
-
-
-# =============================================================================
-# WEBHOOKS
-# =============================================================================
-
-async def disparar_webhooks(doc_id, emisor_id: int, evento: str, payload: dict):
-    async with AsyncSessionLocal() as db:
-        try:
-            res = await db.execute(text("""
-                SELECT url, secret FROM webhooks
-                WHERE emisor_id = :eid
-                  AND activo = true
-                  AND eventos @> CAST(:evento AS jsonb)
-            """), {"eid": emisor_id, "evento": json.dumps([evento])})
-            webhooks = res.fetchall()
-            if not webhooks:
-                return
-
-            body = json.dumps({
-                "evento":    evento,
-                "doc_id":    str(doc_id),
-                "timestamp": datetime.utcnow().isoformat(),
-                "data":      payload,
-            }, default=str)
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                for wh in webhooks:
-                    try:
-                        headers = {"Content-Type": "application/json"}
-                        if wh.secret:
-                            firma = hmac.new(wh.secret.encode(), body.encode(), hashlib.sha256).hexdigest()
-                            headers["X-Kipu-Signature"] = f"sha256={firma}"
-                        await client.post(wh.url, content=body, headers=headers)
-                    except Exception as e:
-                        print(f"[Webhook] ⚠️ Error enviando a {wh.url}: {e}")
-        except Exception as e:
-            print(f"[Webhook] ❌ Error crítico: {e}")
-
-
-# =============================================================================
-# HELPERS INTERNOS
-# =============================================================================
-
-async def _generar_pdf(xml_autorizado: str, doc, fecha_auth_str: str) -> bytes | None:
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post(NODE_PDF_URL, json={
-                "xmlAutorizado":     xml_autorizado,
-                "emisor":            {"contribuyente_especial": doc.contribuyente_especial or ""},
-                "fechaAutorizacion": fecha_auth_str,
-            })
-            if res.status_code == 200 and res.json().get("ok"):
-                return base64.b64decode(res.json()["pdfBase64"])
-    except Exception as e:
-        print(f"[Auth] ⚠️ Error generando PDF: {e}")
-    return None
-
-
-async def _enviar_email_comprobante(
-    email: str,
-    razon_social: str,
-    ruc: str,
-    tipo_doc: str,
-    secuencial: str,
-    clave_acceso: str,
-    fecha_autorizacion: str,
-    xml_str: str,
-    pdf_bytes: bytes | None,
-    es_sandbox: bool = False,
-):
-    try:
-        await mail_service.send_comprobante(
-            email              = email,
-            razon_social       = razon_social,
-            ruc                = ruc,
-            tipo_doc           = tipo_doc,
-            secuencial         = secuencial,
-            clave_acceso       = clave_acceso,
-            fecha_autorizacion = fecha_autorizacion,
-            xml_str            = xml_str,
-            pdf_bytes          = pdf_bytes,
-            es_sandbox         = es_sandbox,
-        )
-    except Exception as e:
-        print(f"[Auth] ⚠️ Error enviando email: {e}")
-
-
-async def _devolver_stock_si_aplica(doc, db: AsyncSession):
-    if doc.tipo_doc not in ("FAC", "LIQ"):
-        return
-    try:
-        datos    = doc.datos or {}
-        detalles = datos.get("detalles", {}).get("detalle", [])
-        if not isinstance(detalles, list):
-            detalles = [detalles]
-        for det in detalles:
-            codigo = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
-            if not codigo or codigo == "S/C":
-                continue
-            cantidad = float(det.get("cantidad", 0))
-            await db.execute(text("""
-                UPDATE catalogo_items
-                SET stock = stock + :qty, updated_at = NOW()
-                WHERE emisor_id = :eid AND stock != -1 AND codigo = :cod
-            """), {"qty": int(cantidad), "eid": doc.emisor_id, "cod": codigo})
-        await db.commit()
-        print(f"[Stock] ↩️ Stock devuelto para documento {doc.id}")
-    except Exception as e:
-        print(f"[Stock] ⚠️ Error devolviendo stock: {e}")
+    programados = set(await redis.zrange(QUEUE_DIFERIDA, 0, -1))
+    n_e = n_a = 0
+    for doc_id in ids_e:
+        if f"{QUEUE_EMISION}|{doc_id}" not in programados:
+            await redis.lpush(QUEUE_EMISION, str(doc_id)); n_e += 1
+    for doc_id in ids_a:
+        if f"{QUEUE_AUTORIZACION}|{doc_id}" not in programados:
+            await redis.lpush(QUEUE_AUTORIZACION, str(doc_id)); n_a += 1
+    print(f"[Recovery] ✅ {n_e} → emisión · {n_a} → autorización (sandbox incluido)")
 
 
 # =============================================================================
 # LOOPS
 # =============================================================================
-
-async def loop_emision():
-    print("[Worker] 🚀 Loop de emisión iniciado.")
+async def _loop_cola(cola: str, procesar, nombre: str):
+    print(f"[Worker] 🚀 Loop de {nombre} iniciado.")
     redis = await get_redis()
     while True:
         try:
-            resultado = await redis.brpop(QUEUE_EMISION, timeout=BRPOP_TIMEOUT)
+            resultado = await redis.brpop(cola, timeout=BRPOP_TIMEOUT)
             if resultado is None:
                 continue
             doc_id = resultado[1]
-            asyncio.create_task(_procesar_y_limpiar_emision(doc_id, redis))
+            doc_id = doc_id.decode() if isinstance(doc_id, bytes) else doc_id
+            asyncio.create_task(procesar(doc_id))
         except (asyncio.TimeoutError, TimeoutError):
             continue
         except Exception as e:
-            print(f"[Worker Emisión] ❌ Error en loop: {e}")
+            print(f"[Worker {nombre}] ❌ Error en loop: {e}")
             await asyncio.sleep(3)
             try:
                 redis = await get_redis()
@@ -552,39 +283,40 @@ async def loop_emision():
                 pass
 
 
-async def _procesar_y_limpiar_emision(doc_id: str, redis):
-    try:
-        await procesar_emision(doc_id)
-    finally:
-        await redis.lrem(QUEUE_PROC_EMISION, 1, doc_id)
+async def loop_emision():
+    await _loop_cola(QUEUE_EMISION, procesar_emision, "emisión")
 
 
 async def loop_autorizacion():
-    print("[Worker] 🚀 Loop de autorización iniciado.")
-    redis = await get_redis()
+    await _loop_cola(QUEUE_AUTORIZACION, procesar_autorizacion, "autorización")
+
+
+async def loop_diferida():
+    """Mueve a su cola los reintentos cuya hora ya llegó. Seguro con varias instancias."""
+    print("[Worker] 🚀 Loop de reintentos diferidos iniciado.")
     while True:
         try:
-            resultado = await redis.brpop(QUEUE_AUTORIZACION, timeout=BRPOP_TIMEOUT)
-            if resultado is None:
-                continue
-            doc_id = resultado[1]
-            asyncio.create_task(_procesar_y_limpiar_auth(doc_id, redis))
-        except (asyncio.TimeoutError, TimeoutError):
-            continue
+            redis = await get_redis()
+            vencidos = await redis.zrangebyscore(QUEUE_DIFERIDA, 0, time.time(), start=0, num=100)
+            for miembro in vencidos:
+                miembro = miembro.decode() if isinstance(miembro, bytes) else miembro
+                if await redis.zrem(QUEUE_DIFERIDA, miembro):   # solo una instancia lo gana
+                    cola, doc_id = miembro.split("|", 1)
+                    await redis.lpush(cola, doc_id)
         except Exception as e:
-            print(f"[Worker Auth] ❌ Error en loop: {e}")
-            await asyncio.sleep(3)
-            try:
-                redis = await get_redis()
-            except Exception:
-                pass
+            print(f"[Worker diferida] ❌ {e}")
+        await asyncio.sleep(1)
 
 
-async def _procesar_y_limpiar_auth(doc_id: str, redis):
-    try:
-        await procesar_autorizacion(doc_id)
-    finally:
-        await redis.lrem(QUEUE_PROC_AUTH, 1, doc_id)
+async def loop_conciliacion():
+    print("[Worker] 🚀 Conciliación con el SRI iniciada (cada 30 min).")
+    await asyncio.sleep(60)   # deja que arranque todo primero
+    while True:
+        try:
+            await conciliar()
+        except Exception as e:
+            print(f"[Conciliación] ❌ {e}")
+        await asyncio.sleep(CONCILIACION_CADA_SEG)
 
 
 async def iniciar_workers():
@@ -592,4 +324,6 @@ async def iniciar_workers():
     await asyncio.gather(
         loop_emision(),
         loop_autorizacion(),
+        loop_diferida(),
+        loop_conciliacion(),
     )

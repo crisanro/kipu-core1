@@ -10,8 +10,8 @@ from app.core.config import settings
 # =============================================================================
 # MARCA — ajusta cuando tengas logo y colores definidos
 # =============================================================================
-KIPU_LOGO_URL   = "https://tudominio.com/logo-kipu.png"  # ← reemplazar
-KIPU_COLOR_MAIN = "#059669"                               # ← reemplazar
+KIPU_LOGO_URL   = "https://cdn1.kipu.ec/kipu/kipu-mail.png"  # ← reemplazar
+KIPU_COLOR_MAIN = "#1B9670"                               # ← reemplazar
 KIPU_WEBSITE    = "https://kipu.ec"
 
 TIPO_DOC_LABEL = {

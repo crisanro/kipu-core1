@@ -43,9 +43,12 @@ CASILLEROS_MANUALES_PERMITIDOS = {c["casillero"] for c in CAMPOS_MANUALES_104}
 
 # Impuestos de un comprobante emitido: resumenImpuestos (FAC, NC, LIQ) o, para las
 # notas de débito, infoNotaDebito.impuestos.impuesto (objeto o arreglo).
+# OJO: las ND se guardan con resumenImpuestos = [] (lista vacía), así que solo se
+# usa resumenImpuestos cuando trae elementos.
 _IMPUESTOS_EMITIDO = """
     CASE
         WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array'
+             AND jsonb_array_length(d.datos->'resumenImpuestos') > 0
             THEN d.datos->'resumenImpuestos'
         WHEN jsonb_typeof(d.datos->'infoNotaDebito'->'impuestos'->'impuesto') = 'array'
             THEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto'
