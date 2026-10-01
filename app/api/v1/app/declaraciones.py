@@ -10,6 +10,7 @@
 import json
 from datetime import date, timedelta
 from typing import Optional
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from sqlalchemy import text
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
+from app.core.cache import cache_get, cache_set, invalidate_emisor, TTL, CK
 from app.services.audit_service import audit_log
 from app.services.storage_service import upload_file, get_presigned_url
 
@@ -29,6 +31,7 @@ from app.services.declaraciones.iva_104 import (
 )
 from app.services.declaraciones.renta_102 import calcular_renta_102
 from app.services.declaraciones.ats import calcular_ats, generar_xml_ats
+from app.services.credito_tributario_service import registrar_lote_declaracion
 
 router = APIRouter()
 
@@ -146,7 +149,6 @@ async def obtener_declaracion_actual(
         "aplica": True,
         "data": {
             **item,
-            # compatibilidad con el widget: "periodo" era el nombre legible
             "periodo":     p.nombre,
             "periodo_iso": p.inicio.isoformat(),
         },
@@ -300,7 +302,7 @@ async def marcar_declarado(
                     {"accion": "declarado", "tipo": tipo, "periodo": p.key}, request)
     await db.commit()
 
-    # 104: se congela la foto en este momento = lo que se presentó al SRI
+    # 104: se congela la foto en este momento y se registra el lote de crédito tributario si aplica
     if tipo == "104":
         calc = await resultado_periodo(db, obl, p, forzar=True)
         await snapshots.guardar(
@@ -310,6 +312,12 @@ async def marcar_declarado(
             doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
             profile_id=profile_id, regenerar=False,
         )
+
+        # Registro o actualización del lote de crédito en credito_tributario_lotes
+        c602 = Decimal(str(calc["casilleros"]["resumen"].get("602", 0.0)))
+        if c602 > 0:
+            await registrar_lote_declaracion(db, emisor_id, p.inicio, c602)
+            await db.commit()
 
     await _invalidar_dashboard(emisor_id)
 
@@ -326,16 +334,11 @@ async def marcar_declarado(
 @router.get("/iva", summary="Casilleros formulario 104 — IVA")
 async def casilleros_iva(
     periodo:      str           = Query(..., description="Periodo YYYY-MM, ej: 2026-08"),
-    tipo_periodo: Optional[str] = Query(None, description="Obsoleto: se toma de la configuración de la empresa"),
-    regenerar:    bool          = Query(False, description="Recalcular aunque el periodo esté declarado (sustitutiva)"),
+    tipo_periodo: Optional[str] = Query(None),
+    regenerar:    bool          = Query(False, description="Recalcular aunque el periodo esté declarado"),
     auth_data:    dict          = Depends(verify_firebase_token),
     db:           AsyncSession  = Depends(get_db),
 ):
-    """
-    - Periodo NO declarado: se calcula en vivo (sus documentos todavía pueden cambiar).
-    - Periodo declarado: foto congelada al momento de declarar.
-    Los saldos 605/606 se toman del 615/617 del periodo anterior, o de lo ingresado a mano.
-    """
     emisor_id  = _emisor(auth_data)
     profile_id = auth_data.get("profile_id")
     _permiso(auth_data)
@@ -351,10 +354,16 @@ async def casilleros_iva(
     hoy = per.hoy_ec()
     en_curso = p.en_curso(hoy)
 
+    # 1. Intentar leer de Redis (si no viene la bandera ?regenerar=true)
+    cache_key = CK.fmt(CK.DECLARACION_IVA, eid=emisor_id, periodo=periodo)
+    if not regenerar:
+        cached = await cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+    # 2. Si no está en caché o pidió regenerar, calcular en vivo
     calc = await resultado_periodo(db, obl, p, forzar=regenerar)
 
-    # Se guarda la foto de periodos cerrados. Si está declarado y se regenera,
-    # la nueva foto reemplaza a la anterior (declaración sustitutiva).
     if not en_curso and not calc.get("congelado"):
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
@@ -380,7 +389,7 @@ async def casilleros_iva(
     if en_curso:
         notas.append("⚠️ Periodo en curso — los valores pueden cambiar.")
 
-    return {
+    response_payload = {
         "ok":            True,
         "cached":        bool(calc.get("congelado")),
         "en_curso":      en_curso,
@@ -398,6 +407,11 @@ async def casilleros_iva(
         },
     }
 
+    # 3. Guardar en Redis por 5 minutos
+    await cache_set(cache_key, response_payload, ttl=TTL.DECLARACION_IVA)
+
+    return response_payload
+
 
 # =============================================================================
 # PATCH /iva/campos-manuales — casilleros manuales del 104
@@ -408,7 +422,7 @@ async def guardar_campos_manuales_iva(
     periodo:   str          = Query(..., description="Periodo YYYY-MM, ej: 2026-08"),
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
-    body:      dict         = Body(..., example={"605": 150.00, "606": 0.00}),
+    body:      dict         = Body(..., example={"605": 150.00, "606": 0.00, "625": 0.00}),
 ):
     emisor_id  = _emisor(auth_data)
     profile_id = auth_data.get("profile_id")
@@ -435,6 +449,7 @@ async def guardar_campos_manuales_iva(
                     {"periodo": periodo, "accion": "campos_manuales", "casilleros": valores},
                     request)
     await db.commit()
+    await invalidate_emisor(emisor_id)
     await _invalidar_dashboard(emisor_id)
 
     return {"ok": True, "periodo": periodo, "valores": valores, "mensaje": "Valores guardados correctamente."}
@@ -498,8 +513,8 @@ async def casilleros_renta(
         )
 
     return {
-        "ok":       True,
-        "cached":   False,
+        "ok":        True,
+        "cached":    False,
         "en_curso": en_curso,
         "total_doc_emitidos":  len(calc["doc_emitidos_ids"]),
         "total_doc_recibidos": len(calc["doc_recibidos_ids"]),
@@ -587,8 +602,8 @@ async def casilleros_ats(
         )
 
     return {
-        "ok":       True,
-        "cached":   False,
+        "ok":        True,
+        "cached":    False,
         "en_curso": en_curso,
         "total_doc_emitidos":  len(calc["doc_emitidos_ids"]),
         "total_doc_recibidos": len(calc["doc_recibidos_ids"]),

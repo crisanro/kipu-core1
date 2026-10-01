@@ -81,6 +81,7 @@ class Emisor(Base):
     notificaciones = relationship("Notificacion", back_populates="emisor")
     proformas = relationship("Proforma")
     audit_logs = relationship("AuditLog", foreign_keys="AuditLog.emisor_id", backref="emisor_audit")
+    credito_tributario_lotes = relationship("CreditoTributarioLote", back_populates="emisor", cascade="all, delete-orphan")
 
 
 
@@ -885,3 +886,30 @@ class ReporteTributario(Base):
 
     # Relaciones
     emisor          = relationship("Emisor", back_populates="reportes_tributarios")
+
+
+
+# =============================================================================
+# BOLSAS / LOTES DE CRÉDITO TRIBUTARIO (Art. 66 LRTI)
+# =============================================================================
+
+class CreditoTributarioLote(Base):
+    """
+    Seguimiento por lotes (FIFO) del Crédito Tributario por compras de IVA.
+    Permite controlar la caducidad a los 5 años (60 meses) y sugerir el valor del Casillero 625.
+    """
+    __tablename__ = "credito_tributario_lotes"
+
+    id               = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    emisor_id        = Column(Integer, ForeignKey("emisores.id", ondelete="CASCADE"), nullable=False)
+    periodo_origen   = Column(Date, nullable=False)  # Primer día del mes de origen (ej. 2026-10-01)
+    monto_original   = Column(Numeric(12, 2), nullable=False)
+    monto_disponible = Column(Numeric(12, 2), nullable=False)
+    fecha_caducidad  = Column(Date, nullable=False)  # Exactamente 5 años después
+    origen           = Column(String(10), nullable=False, default="DECLARACION")  # DECLARACION | MIGRACION | MANUAL
+    notas            = Column(Text, nullable=True)
+    created_at       = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at       = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relaciones
+    emisor           = relationship("Emisor", back_populates="credito_tributario_lotes")

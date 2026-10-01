@@ -1,4 +1,5 @@
 # app/api/v1/app/documentos.py
+import math
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from sqlalchemy import text
@@ -6,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 from decimal import Decimal
 from datetime import date
+
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
@@ -20,11 +22,12 @@ from app.services.anulacion_service import (
     evaluar_anulacion, vencer_si_corresponde, aplicar_efectos_anulacion,
     hoy_ec, sumar_dias_habiles, fecha_sri, iso,
 )
+from app.core.cache import cache_get, cache_set, invalidate_emisor, TTL, CK
 
 router = APIRouter()
 
 # =============================================================================
-# SCHEMAS — sin cambios
+# SCHEMAS
 # =============================================================================
 class ClienteDoc(BaseModel):
     tipo_id:        str
@@ -35,13 +38,13 @@ class ClienteDoc(BaseModel):
     telefono:       Optional[str] = ""
 
 class ItemDoc(BaseModel):
-    codigo:          Optional[str]  = None
-    descripcion:     str
-    cantidad:        float          = 1
+    codigo:           Optional[str]  = None
+    descripcion:      str
+    cantidad:         float          = 1
     precio_unitario: float
-    descuento:       float          = 0
+    descuento:        float          = 0
     tipo_iva:        str            = "15"
-    unidad_medida:   Optional[str]  = "UNIDAD"
+    unidad_medida:    Optional[str]  = "UNIDAD"
     guardar_catalogo: Optional[bool] = False
 
 class PagoDoc(BaseModel):
@@ -74,26 +77,26 @@ class EmitirDocumentoRequest(BaseModel):
     impuestos:              Optional[list[dict]] = None
     periodo_fiscal:         Optional[str]        = None
     campos_adicionales:     Optional[list[CampoAdicional]] = None
-    cod_sustento:                   Optional[str]        = None   # Catálogo ATS tabla 5
-    pago_loc_ext:                   Optional[str]        = "01"   # 01=local 02=exterior
-    forma_pago_sustento:            Optional[str]        = "01"   # forma pago del doc sustento
+    cod_sustento:                   Optional[str]        = None
+    pago_loc_ext:                   Optional[str]        = "01"
+    forma_pago_sustento:            Optional[str]        = "01"
     total_sin_impuestos_sustento:   Optional[float]      = None
     importe_total_sustento:         Optional[float]      = None
-    num_aut_doc_sustento:           Optional[str]        = None   # clave acceso del doc sustento
-    impuestos_doc_sustento:         Optional[list[dict]] = None   # IVA/ICE del doc sustento
-    parte_rel:                      Optional[str]        = "NO"    # SI/NO — parte relacionada
-    tipo_sujeto_retenido:           Optional[str]        = None    # Tabla 14 ATS — solo si tipo_id=08
-    origen:                 Optional[str]                  = "web"
+    num_aut_doc_sustento:           Optional[str]        = None
+    impuestos_doc_sustento:         Optional[list[dict]] = None
+    parte_rel:                      Optional[str]        = "NO"
+    tipo_sujeto_retenido:           Optional[str]        = None
+    origen:                         Optional[str]        = "web"
     proforma_id: Optional[str] = None
     estado_cobro:            Optional[str]  = None
     forma_pago_cobro:        Optional[str]  = None
     numero_comprobante_pago: Optional[str]  = None
     fecha_pago:              Optional[str]  = None
-    tipo_regi:              Optional[str] = None   # Tabla 19 ATS: 01=General, 02=Paraíso, 03=Preferente
-    pais_efec_pago:         Optional[str] = None   # Código país (tabla 25 ficha técnica)
-    aplic_conv_dob_trib:    Optional[str] = "NO"   # SI/NO
-    pag_ext_suj_ret_nor_leg: Optional[str] = "SI"  # SI/NO (cuando aplicConvDobTrib=NO)
-    pago_reg_fis:           Optional[str] = "NO"   # SI/NO
+    tipo_regi:              Optional[str] = None
+    pais_efec_pago:         Optional[str] = None
+    aplic_conv_dob_trib:    Optional[str] = "NO"
+    pag_ext_suj_ret_nor_leg: Optional[str] = "SI"
+    pago_reg_fis:           Optional[str] = "NO"
 
 class ActualizarCobro(BaseModel):
     estado_cobro:            str
@@ -103,10 +106,10 @@ class ActualizarCobro(BaseModel):
 
 class AnulacionRequest(BaseModel):
     motivo:     str
-    confirmado: bool  # el usuario marcó "ya ingresé la solicitud en el SRI"
+    confirmado: bool
 
 class ResolverAnulacionRequest(BaseModel):
-    aceptada: bool    # True = el receptor aceptó en el SRI, False = la rechazó
+    aceptada: bool
 
 # =============================================================================
 # HELPERS
@@ -127,17 +130,6 @@ async def _cargar_doc_anulacion(db: AsyncSession, doc_id: str, emisor_id: int) -
     if not row:
         raise HTTPException(status_code=404, detail="Documento no encontrado.")
     return dict(row)
-
-
-async def _invalidar_cache_emisor(emisor_id: int):
-    try:
-        from app.core.cache import get_redis
-        redis = await get_redis()
-        for pattern in (f"dashboard:{emisor_id}*", f"dashboard_docs:{emisor_id}:*"):
-            async for key in redis.scan_iter(pattern):
-                await redis.delete(key)
-    except Exception as e:
-        print(f"[Cache] ⚠️ No invalidado: {e}")
 
 
 async def _notificar(db: AsyncSession, emisor_id: int, titulo: str, mensaje: str, doc_id: str):
@@ -199,7 +191,7 @@ async def emitir_documento(
     if result.get("ok"):
         await guardar_idempotency(emisor_id, x_idempotency_key, result)
         await audit_log(
-            db        = db,
+            db         = db,
             auth_data = auth_data,
             accion    = "CREATE",
             entidad   = "documento",
@@ -227,13 +219,14 @@ async def emitir_documento(
                 print(f"[Proforma] ⚠️ No se pudo marcar como facturada: {e}")
 
         await db.commit()
+        await invalidate_emisor(emisor_id)
 
     return result
 
 # =============================================================================
 # HISTORIAL — GET /
 # =============================================================================
-@router.get("", summary="Historial de documentos emitidos")
+@router.get("", summary="Historial de documentos emitidos con paginación")
 async def historial_documentos(
     auth_data:    dict          = Depends(verify_firebase_token),
     db:           AsyncSession  = Depends(get_db),
@@ -243,8 +236,8 @@ async def historial_documentos(
     fecha_fin:    Optional[str] = Query(None),
     q:            Optional[str] = Query(None),
     sandbox:      bool          = Query(False),
-    limit:        int           = Query(50, le=100),
-    offset:       int           = Query(0),
+    page:         int           = Query(1, ge=1, description="Número de página"),
+    limit:        int           = Query(25, ge=1, le=100, description="Registros por página"),
     _rl:          None          = Depends(RateLimit(RateLimitScope.GENERAL)),
 ):
     emisor_id = auth_data.get("emisor_id")
@@ -255,16 +248,35 @@ async def historial_documentos(
     if fecha_inicio and fecha_fin:
         fi = date.fromisoformat(fecha_inicio)
         ff = date.fromisoformat(fecha_fin)
-        if (ff - fi).days > 45:
-            raise HTTPException(status_code=400, detail="El rango máximo es 45 días.")
+        if (ff - fi).days > 365:
+            raise HTTPException(status_code=400, detail="El rango máximo de consulta es de 365 días (1 año).")
+    else:
+        fi = date.today()
+        ff = date.today()
 
+    tipo_clean   = (tipo_doc or "ALL").upper()
+    estado_clean = (estado_sri or "ALL").upper()
+    q_clean      = (q or "").strip().lower()
+
+    # 1. Buscar en caché
+    cache_key = CK.fmt(
+        CK.DOCS_EMITIDOS,
+        eid=emisor_id, fi=str(fi), ff=str(ff), sb=str(sandbox).lower(),
+        tipo=tipo_clean, estado=estado_clean, q=q_clean,
+        page=page, limit=limit
+    )
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 2. Consultar base de datos
     filtros = "WHERE emisor_id = :eid AND es_sandbox = :sandbox"
     params  = {"eid": emisor_id, "sandbox": sandbox}
 
-    if tipo_doc:
+    if tipo_doc and tipo_doc.upper() != "TODOS":
         filtros += " AND tipo_doc = :tipo_doc"
         params["tipo_doc"] = tipo_doc.upper()
-    if estado_sri:
+    if estado_sri and estado_sri.upper() != "TODOS":
         filtros += " AND estado_sri = :estado_sri"
         params["estado_sri"] = estado_sri.upper()
     if fecha_inicio:
@@ -289,6 +301,12 @@ async def historial_documentos(
         )"""
         params["q"] = f"%{q}%"
 
+    res_total = await db.execute(text(f"""
+        SELECT COUNT(*) FROM documentos_emitidos {filtros}
+    """), params)
+    total_items = res_total.scalar() or 0
+
+    offset = (page - 1) * limit
     params["limit"]  = limit
     params["offset"] = offset
 
@@ -317,7 +335,7 @@ async def historial_documentos(
             ) AS id_fac
         FROM documentos_emitidos
         {filtros}
-        ORDER BY created_at DESC
+        ORDER BY fecha_emision DESC, created_at DESC
         LIMIT :limit OFFSET :offset
     """), params)
     rows = res.fetchall()
@@ -327,25 +345,45 @@ async def historial_documentos(
         razon  = r.razon_fac or r.razon_comprador or ""
         id_com = r.id_fac or r.id_comprador or ""
         data.append({
-            "id":               str(r.id),
-            "tipo_doc":         r.tipo_doc,
-            "cod_doc":          r.cod_doc,
-            "clave_acceso":     r.clave_acceso,
-            "numero_doc":       r.numero_doc,
-            "fecha_emision":    str(r.fecha_emision),
-            "estado_sri":       r.estado_sri,
-            "estado_cobro":     r.estado_cobro,
+            "id":                str(r.id),
+            "tipo_doc":          r.tipo_doc,
+            "cod_doc":           r.cod_doc,
+            "clave_acceso":      r.clave_acceso,
+            "numero_doc":        r.numero_doc,
+            "fecha_emision":     str(r.fecha_emision),
+            "estado_sri":        r.estado_sri,
+            "estado_cobro":      r.estado_cobro,
             "anulacion_estado": r.anulacion_estado,
-            "importe_total":    float(r.importe_total),
-            "razon_social":     razon,
-            "identificacion":   id_com,
-            "origen":           r.origen,
-            "created_at":       iso(r.created_at),
+            "importe_total":    float(r.importe_total or 0),
+            "razon_social":      razon,
+            "identificacion":    id_com,
+            "origen":            r.origen,
+            "created_at":        r.created_at.isoformat() if r.created_at else None,
         })
-    return {"ok": True, "total": len(data), "data": data}
+
+    total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+
+    payload = {
+        "ok": True,
+        "data": data,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+        }
+    }
+
+    # 3. Guardar en caché
+    await cache_set(cache_key, payload, ttl=TTL.DOCUMENTOS_EMITIDOS)
+
+    return payload
+
 
 # =============================================================================
-# RESUMEN — GET /resumen
+# RESUMEN FISCAL — GET /resumen
 # =============================================================================
 @router.get("/resumen", summary="Resumen por tipo de comprobante para declaración")
 async def resumen_documentos(
@@ -364,9 +402,16 @@ async def resumen_documentos(
     fi  = date.fromisoformat(fecha_inicio) if fecha_inicio else hoy
     ff  = date.fromisoformat(fecha_fin)    if fecha_fin    else hoy
 
-    if (ff - fi).days > 45:
-        raise HTTPException(status_code=400, detail="El rango máximo es 45 días.")
+    if (ff - fi).days > 365:
+        raise HTTPException(status_code=400, detail="El rango máximo de consulta es de 365 días (1 año).")
 
+    # 1. Buscar en caché
+    cache_key = CK.fmt(CK.RESUMEN_EMITIDOS, eid=emisor_id, fi=str(fi), ff=str(ff))
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 2. Consultar base de datos
     res_iva = await db.execute(text("""
         SELECT
             d.tipo_doc,
@@ -378,12 +423,10 @@ async def resumen_documentos(
         FROM documentos_emitidos d,
              jsonb_array_elements(
                  CASE
-                     -- 1. Si existe resumenImpuestos directo (FAC / LIQ / NCR)
                      WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array' 
                           AND jsonb_array_length(d.datos->'resumenImpuestos') > 0
                      THEN d.datos->'resumenImpuestos'
 
-                     -- 2. FAC / LIQ / NCR fallback (totalConImpuestos -> totalImpuesto)
                      WHEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
                      THEN CASE 
                          WHEN jsonb_typeof(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto') = 'array'
@@ -405,7 +448,6 @@ async def resumen_documentos(
                          ELSE jsonb_build_array(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto')
                      END
 
-                     -- 3. NDB (infoNotaDebito -> impuestos -> impuesto)
                      WHEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto' IS NOT NULL
                      THEN CASE 
                          WHEN jsonb_typeof(d.datos->'infoNotaDebito'->'impuestos'->'impuesto') = 'array'
@@ -429,20 +471,18 @@ async def resumen_documentos(
         SELECT
             (imp->>'codigo')          AS codigo_impuesto,
             (imp->>'codigoRetencion') AS codigo_retencion,
-            SUM((imp->>'baseImponible')::numeric) AS base,
-            SUM((imp->>'valorRetenido')::numeric) AS valor_retenido,
-            COUNT(DISTINCT d.id)                  AS num_docs
+            SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
+            SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)) AS valor_retenido,
+            COUNT(DISTINCT d.id)                                AS num_docs
         FROM documentos_emitidos d,
              jsonb_array_elements(
                  CASE
-                     -- v2.0.0: docsSustento → docSustento → retenciones → retencion
                      WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL
                      THEN CASE
                          WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
                          THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
                          ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
                      END
-                     -- v1.0.0: impuestos → impuesto
                      WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
                      THEN d.datos->'impuestos'->'impuesto'
                      WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL
@@ -508,7 +548,7 @@ async def resumen_documentos(
         ret_agrupado[tipo]["valor_retenido"] += item["valor_retenido"]
         ret_agrupado[tipo]["detalle"].append(item)
 
-    return {
+    payload = {
         "ok": True,
         "data": {
             "periodo": {"desde": str(fi), "hasta": str(ff)},
@@ -527,6 +567,11 @@ async def resumen_documentos(
             },
         }
     }
+
+    # 3. Guardar en caché
+    await cache_set(cache_key, payload, ttl=TTL.RESUMEN_FISCAL)
+
+    return payload
 
 # =============================================================================
 # ANULAR — POST /{doc_id}/anular
@@ -562,11 +607,6 @@ async def anular_documento(
     if not ev["puede_anular"]:
         raise HTTPException(status_code=400, detail=ev["motivo_bloqueo"])
 
-    # -------------------------------------------------------------------------
-    # CONSULTA Y VERIFICACIÓN REAL EN EL SOAP DEL SRI
-    # -------------------------------------------------------------------------
-    # Si el SRI devuelve AUTORIZADO, esta función lanza HTTPException(422) 
-    # y la ejecución se detiene sin alterar la base de datos.
     from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
 
     res_anulacion = await verificar_sri_y_procesar_anulacion(db, doc, emisor_id, body.motivo)
@@ -594,7 +634,7 @@ async def anular_documento(
     )
     await db.commit()
 
-    await _invalidar_cache_emisor(emisor_id)
+    await invalidate_emisor(emisor_id)
     await _notificar(db, emisor_id, titulo, mensaje, doc_id)
 
     return {
@@ -622,10 +662,8 @@ async def sincronizar_anulacion_documento(
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "emitir")
 
-    # Cargar el doc ANTES de reservar el turno (así ya tenemos anulacion_estado)
     doc = await _cargar_doc_anulacion(db, doc_id, emisor_id)
 
-    # Reserva atómica del turno: solo avanza si pasaron >= 60 s desde la última verificación
     reserva = await db.execute(text("""
         UPDATE documentos_emitidos
         SET sri_verificado_at = NOW()
@@ -648,7 +686,7 @@ async def sincronizar_anulacion_documento(
             headers={"Retry-After": str(restante)},
         )
 
-    await db.commit()  # confirma la reserva aunque la consulta al SRI falle
+    await db.commit()
 
     from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
     res_sync = await verificar_sri_y_procesar_anulacion(
@@ -667,7 +705,7 @@ async def sincronizar_anulacion_documento(
             request=request,
         )
     await db.commit()
-    await _invalidar_cache_emisor(emisor_id)
+    await invalidate_emisor(emisor_id)
 
     return res_sync
 
@@ -743,11 +781,10 @@ async def resolver_anulacion(
     )
     await db.commit()
 
-    await _invalidar_cache_emisor(emisor_id)
+    await invalidate_emisor(emisor_id)
     await _notificar(db, emisor_id, titulo, mensaje, doc_id)
 
     return {"ok": True, "estado": "ANULADO" if body.aceptada else "RECHAZADA"}
-
 
 
 # =============================================================================
@@ -820,38 +857,38 @@ async def detalle_documento(
     return {
         "ok": True,
         "data": {
-            "id":                     str(doc["id"]),
-            "tipo_doc":               doc["tipo_doc"],
-            "cod_doc":                doc["cod_doc"],
-            "clave_acceso":           doc["clave_acceso"],
-            "numero_doc":             doc["numero_doc"],
-            "secuencial":             doc["secuencial"],
-            "fecha_emision":          iso(doc["fecha_emision"]),
-            "estado_sri":             doc["estado_sri"],
-            "mensajes_sri":           doc["mensajes_sri"],
-            "fecha_envio_sri":        iso(doc["fecha_envio_sri"]),
-            "fecha_autorizacion":     iso(doc["fecha_autorizacion"]),
-            "estado_cobro":           doc["estado_cobro"],
-            "forma_pago_cobro":       doc["forma_pago_cobro"],
+            "id":                      str(doc["id"]),
+            "tipo_doc":                doc["tipo_doc"],
+            "cod_doc":                 doc["cod_doc"],
+            "clave_acceso":            doc["clave_acceso"],
+            "numero_doc":              doc["numero_doc"],
+            "secuencial":              doc["secuencial"],
+            "fecha_emision":           iso(doc["fecha_emision"]),
+            "estado_sri":              doc["estado_sri"],
+            "mensajes_sri":            doc["mensajes_sri"],
+            "fecha_envio_sri":         iso(doc["fecha_envio_sri"]),
+            "fecha_autorizacion":      iso(doc["fecha_autorizacion"]),
+            "estado_cobro":            doc["estado_cobro"],
+            "forma_pago_cobro":        doc["forma_pago_cobro"],
             "numero_comprobante_pago": doc["numero_comprobante_pago"],
-            "fecha_pago":             iso(doc["fecha_pago"]),
-            "importe_total":          float(doc["importe_total"]),
-            "datos":                  doc["datos"],
-            "xml_path":               doc["xml_path"],
-            "pdf_path":               doc["pdf_path"],
-            "origen":                 doc["origen"],
-            "es_sandbox":             doc["es_sandbox"],
-            "email_comprador":        doc["email_comprador"],
-            "motivo_anulacion":       doc["motivo_anulacion"],
-            "fecha_anulacion":        iso(doc["fecha_anulacion"]),
-            "created_at":             iso(doc["created_at"]),
+            "fecha_pago":              iso(doc["fecha_pago"]),
+            "importe_total":           float(doc["importe_total"]),
+            "datos":                   doc["datos"],
+            "xml_path":                doc["xml_path"],
+            "pdf_path":                doc["pdf_path"],
+            "origen":                  doc["origen"],
+            "es_sandbox":              doc["es_sandbox"],
+            "email_comprador":         doc["email_comprador"],
+            "motivo_anulacion":        doc["motivo_anulacion"],
+            "fecha_anulacion":         iso(doc["fecha_anulacion"]),
+            "created_at":              iso(doc["created_at"]),
             "doc_origen_emitido_id":  str(doc["doc_origen_emitido_id"]) if doc["doc_origen_emitido_id"] else None,
             "doc_origen_recibido_id": str(doc["doc_origen_recibido_id"]) if doc["doc_origen_recibido_id"] else None,
-            "documentos_derivados":   doc["documentos_derivados"] or [],
-            "doc_origen_emitido":     doc["doc_origen_emitido"],
-            "doc_origen_recibido":    doc["doc_origen_recibido"],
-            "anulacion":              evaluar_anulacion(doc),
-            "ultimo_error_tecnico":   doc["ultimo_error_tecnico"],
+            "documentos_derivados":    doc["documentos_derivados"] or [],
+            "doc_origen_emitido":      doc["doc_origen_emitido"],
+            "doc_origen_recibido":     doc["doc_origen_recibido"],
+            "anulacion":               evaluar_anulacion(doc),
+            "ultimo_error_tecnico":    doc["ultimo_error_tecnico"],
             "sri_verificado_at":      iso(doc["sri_verificado_at"]),
         }
     }
@@ -866,11 +903,6 @@ async def sincronizar_documento(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    """
-    Le pregunta al SRI por la clave de acceso y corrige el estado si no coincide
-    (por ejemplo, un DEVUELTA que en realidad estaba AUTORIZADO). Si corrige un
-    falso rechazo, vuelve a aplicar el inventario y el crédito que se habían devuelto.
-    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
@@ -904,6 +936,7 @@ async def sincronizar_documento(
             request    = request,
         )
         await db.commit()
+        await invalidate_emisor(emisor_id)
 
     return {"ok": True, **resultado}
 
@@ -918,11 +951,6 @@ async def reintentar_documento(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    """
-    Antes de reenviar se le pregunta al SRI: si ya lo tiene (autorizado, rechazado o
-    en proceso) se corrige el estado y NO se reenvía. Solo si el SRI no lo tiene,
-    vuelve a la cola. Funciona también para documentos de prueba (sandbox).
-    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
@@ -939,19 +967,17 @@ async def reintentar_documento(
     if doc.estado_sri not in ("DEVUELTA", "RECHAZADO", "FIRMADO", "EN_REVISION"):
         raise HTTPException(status_code=400, detail=f"No se puede reintentar en estado {doc.estado_sri}.")
 
-    # 1) ¿El SRI ya lo tiene?
     consulta = await estado_svc.sincronizar_documento(db, doc_id)
     if not consulta.get("ok"):
         raise HTTPException(status_code=503, detail=consulta.get("mensaje", "No pudimos consultar al SRI."))
     if consulta.get("sri") != sri.NO_ENCONTRADO:
         return {
-            "ok":      True,
-            "mensaje": consulta.get("mensaje") or "El SRI ya tiene este comprobante; no se reenvió.",
-            "estado":  consulta.get("estado_actual"),
+            "ok":        True,
+            "mensaje":   consulta.get("mensaje") or "El SRI ya tiene este comprobante; no se reenvió.",
+            "estado":    consulta.get("estado_actual"),
             "reenviado": False,
         }
 
-    # 2) El SRI no lo tiene: se reenvía
     await db.execute(text("""
         UPDATE documentos_emitidos
         SET estado_sri = 'FIRMADO', mensajes_sri = NULL, ultimo_error_tecnico = NULL,
@@ -974,6 +1000,7 @@ async def reintentar_documento(
         request   = request,
     )
     await db.commit()
+    await invalidate_emisor(emisor_id)
     await estado_svc.encolar(estado_svc.QUEUE_EMISION, doc_id)
 
     return {"ok": True, "mensaje": "El SRI no lo tenía: se reenvió.", "estado": "FIRMADO", "reenviado": True}
@@ -1032,8 +1059,8 @@ async def actualizar_cobro(
         entidad   = "documento",
         entidad_id = doc_id,
         detalle   = {
-            "accion":         "cobro",
-            "numero_doc":     doc.numero_doc,
+            "accion":          "cobro",
+            "numero_doc":      doc.numero_doc,
             "estado_anterior": doc.estado_cobro,
             "estado_nuevo":    data.estado_cobro,
             "forma_pago":      data.forma_pago_cobro,
@@ -1043,6 +1070,8 @@ async def actualizar_cobro(
     )
 
     await db.commit()
+    await invalidate_emisor(emisor_id)
+
     return {"ok": True, "mensaje": f"Estado de cobro actualizado a {data.estado_cobro}."}
 
 # =============================================================================

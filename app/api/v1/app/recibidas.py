@@ -1,18 +1,23 @@
 # app/api/v1/app/recibidas.py
+
+import json
+import math
 from typing import Optional
 from datetime import date, timedelta, datetime
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, field_validator
-from decimal import Decimal
-import json
+
 from app.utils.xml_parser_recibidos import parsear_xml_recibido
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
 from app.services.storage_service import upload_file
 from app.services.audit_service import audit_log
+from app.core.cache import cache_get, cache_set, invalidate_emisor, TTL, CK
 
 router = APIRouter()
 
@@ -75,7 +80,6 @@ class DocumentoRecibidoUpdate(BaseModel):
 # HELPERS
 # =============================================================================
 def limpiar_detalle_item(det: dict) -> dict:
-    """Extrae solo los campos fiscalmente relevantes de cada ítem del XML."""
     return {
         "descripcion":            det.get("descripcion", ""),
         "cantidad":               det.get("cantidad", ""),
@@ -85,7 +89,6 @@ def limpiar_detalle_item(det: dict) -> dict:
     }
 
 def limpiar_datos_xml(datos_raw: dict) -> dict:
-    """Guarda solo el detalle crudo del XML — todo lo demás está desnormalizado."""
     detalles_raw   = datos_raw.get("detalles", {})
     detalles_items = detalles_raw.get("detalle", [])
     if isinstance(detalles_items, dict):
@@ -95,14 +98,13 @@ def limpiar_datos_xml(datos_raw: dict) -> dict:
     }
 
 def _calcular_totales_desde_items(items: list[dict]) -> tuple[Decimal, Decimal]:
-    """Calcula subtotal_base y valor_iva_total desde items_detalle."""
     subtotal_base   = sum(Decimal(str(i.get("subtotal",   0))) for i in items)
     valor_iva_total = sum(Decimal(str(i.get("valor_iva",  0))) for i in items)
     return subtotal_base, valor_iva_total
 
 
 # =============================================================================
-# POST / — Registrar documento recibido (manual/API)
+# POST / — Registrar documento recibido
 # =============================================================================
 @router.post("", summary="Registrar documento recibido", status_code=201)
 async def registrar_documento_recibido(
@@ -174,28 +176,28 @@ async def registrar_documento_recibido(
                 CAST(:datos AS jsonb), :xml_path, :fuente
             ) RETURNING id
         """), {
-            "eid":            emisor_id,
-            "ruc_prov":       data.ruc_proveedor,
-            "razon_prov":     data.razon_social_proveedor,
-            "tipo_doc":       data.tipo_doc.upper(),
-            "cod_doc":        data.cod_doc,
-            "clave":          data.clave_acceso,
-            "numero_doc":     data.numero_doc,
-            "fecha_emision":  data.fecha_emision,
-            "fecha_auth":     fecha_auth_parsed,
-            "subtotal_base":  data.subtotal_base,
+            "eid":             emisor_id,
+            "ruc_prov":        data.ruc_proveedor,
+            "razon_prov":      data.razon_social_proveedor,
+            "tipo_doc":        data.tipo_doc.upper(),
+            "cod_doc":         data.cod_doc,
+            "clave":           data.clave_acceso,
+            "numero_doc":      data.numero_doc,
+            "fecha_emision":   data.fecha_emision,
+            "fecha_auth":      fecha_auth_parsed,
+            "subtotal_base":   data.subtotal_base,
             "valor_iva_total": data.valor_iva_total,
-            "total":          data.importe_total,
-            "ded_renta":      data.deducible_renta,
-            "cred_iva":       data.credito_tributario_iva,
-            "notas":          data.notas,
-            "estado_pago":    data.estado_pago,
-            "forma_pago":     data.forma_pago,
-            "num_comp":       data.numero_comprobante_pago,
-            "fecha_pago":     data.fecha_pago,
-            "datos":          json.dumps(data.datos, default=str),
-            "xml_path":       xml_path,
-            "fuente":         data.fuente,
+            "total":           data.importe_total,
+            "ded_renta":       data.deducible_renta,
+            "cred_iva":        data.credito_tributario_iva,
+            "notas":           data.notas,
+            "estado_pago":     data.estado_pago,
+            "forma_pago":      data.forma_pago,
+            "num_comp":        data.numero_comprobante_pago,
+            "fecha_pago":      data.fecha_pago,
+            "datos":           json.dumps(data.datos, default=str),
+            "xml_path":        xml_path,
+            "fuente":          data.fuente,
         })
         doc_id = res.scalar()
         await audit_log(
@@ -214,6 +216,7 @@ async def registrar_documento_recibido(
             request    = request,
         )
         await db.commit()
+        await invalidate_emisor(emisor_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -225,14 +228,14 @@ async def registrar_documento_recibido(
 
 
 # =============================================================================
-# POST /fisico
+# POST /fisico — Registrar documento físico
 # =============================================================================
 @router.post("/fisico", summary="Registrar documento físico (sin XML)", status_code=201)
 async def registrar_documento_fisico(
     ruc_proveedor:          str                  = Form(...),
     razon_social_proveedor: str                  = Form(...),
     tipo_doc:               str                  = Form("FAC"),
-    numero_doc:             str                  = Form(...),
+    numero_doc:              str                  = Form(...),
     fecha_emision:          date                 = Form(...),
     subtotal_0:             Decimal              = Form(Decimal("0.00")),
     subtotal_iva:           Decimal              = Form(Decimal("0.00")),
@@ -293,10 +296,9 @@ async def registrar_documento_fisico(
             content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
             upload_file(imagen_path, img_bytes, content_type)
         except Exception as e:
-            print(f"⚠️ Error subiendo imagen: {e}")
+            print(f"⚠️️ Error subiendo imagen: {e}")
             imagen_path = None
 
-    # subtotal_base = subtotal_0 + subtotal_iva (base gravada)
     subtotal_base_calc = subtotal_0 + subtotal_iva
 
     datos = {
@@ -359,6 +361,7 @@ async def registrar_documento_fisico(
             request    = request,
         )
         await db.commit()
+        await invalidate_emisor(emisor_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -369,7 +372,7 @@ async def registrar_documento_fisico(
 
 
 # =============================================================================
-# POST /xml
+# POST /xml — Registrar desde XML
 # =============================================================================
 @router.post("/xml", summary="Registrar documento recibido desde XML", status_code=201)
 async def registrar_desde_xml(
@@ -378,14 +381,11 @@ async def registrar_desde_xml(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    # Leer emisor del header X-Emisor-ID si viene (extensión de Chrome)
-    # Si no, usar el del token (panel web)
     emisor_id_header = request.headers.get("X-Emisor-ID")
     emisor_id_token  = auth_data["emisor_id"]
 
     if emisor_id_header and emisor_id_header.isdigit():
         emisor_id_candidato = int(emisor_id_header)
-        # Verificar que el usuario tenga acceso a ese emisor
         profile_id = auth_data.get("profile_id")
         res_acceso = await db.execute(text("""
             SELECT emisor_id FROM emisor_usuarios
@@ -397,7 +397,6 @@ async def registrar_desde_xml(
             emisor_id = emisor_id_token
     else:
         emisor_id = emisor_id_token
-
 
     if emisor_id == emisor_id_token:
         verificar_permiso(auth_data, "documentos_recibidos")
@@ -423,12 +422,10 @@ async def registrar_desde_xml(
     res_emisor = await db.execute(text("SELECT ruc FROM emisores WHERE id = :eid"), {"eid": emisor_id})
     emisor = res_emisor.fetchone()
 
-    # Validar RUC — viene directo del parser
     ruc_comprador = parsed.get("ruc_comprador", "")
     if ruc_comprador and ruc_comprador != emisor.ruc:
         raise HTTPException(status_code=400, detail=f"Este documento no está dirigido a tu RUC ({emisor.ruc}).")
 
-    # Verificar duplicado
     clave = parsed.get("clave_acceso", "")
     if clave:
         res_dup = await db.execute(text("""
@@ -437,7 +434,6 @@ async def registrar_desde_xml(
         if res_dup.fetchone():
             raise HTTPException(status_code=409, detail="Este documento ya fue registrado.")
 
-    # Subir XML crudo a R2 — fuente de verdad para auditoría
     xml_path = None
     try:
         xml_path = f"{emisor.ruc}/recibidas/{clave}.xml"
@@ -445,7 +441,6 @@ async def registrar_desde_xml(
     except Exception as e:
         print(f"⚠️ Error guardando XML en R2: {e}")
 
-    # Parsear fechas
     fecha_emision_parsed = parsed["fecha_emision"]
     if isinstance(fecha_emision_parsed, str):
         fecha_emision_parsed = date.fromisoformat(fecha_emision_parsed[:10])
@@ -457,7 +452,6 @@ async def registrar_desde_xml(
         except Exception:
             fecha_auth_parsed = None
 
-    # Totales desde ítems parseados
     items = parsed["items_detalle"]
     subtotal_base, valor_iva_total = _calcular_totales_desde_items(items)
 
@@ -515,6 +509,7 @@ async def registrar_desde_xml(
             request    = request,
         )
         await db.commit()
+        await invalidate_emisor(emisor_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -536,9 +531,9 @@ async def registrar_desde_xml(
 
 
 # =============================================================================
-# GET / — Historial
+# GET / — Historial Paginado y Búsqueda (hasta 365 días)
 # =============================================================================
-@router.get("", summary="Historial de documentos recibidos")
+@router.get("", summary="Historial de documentos recibidos con paginación")
 async def historial_recibidos(
     auth_data:    dict          = Depends(verify_firebase_token),
     db:           AsyncSession  = Depends(get_db),
@@ -546,8 +541,9 @@ async def historial_recibidos(
     fecha_inicio: Optional[str] = Query(None),
     fecha_fin:    Optional[str] = Query(None),
     estado_pago:  Optional[str] = Query(None),
-    limit:        int           = Query(50, le=100),
-    offset:       int           = Query(0),
+    q:            Optional[str] = Query(None),
+    page:         int           = Query(1, ge=1),
+    limit:        int           = Query(25, ge=1, le=100),
 ):
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "documentos_recibidos")
@@ -556,54 +552,74 @@ async def historial_recibidos(
     fi  = date.fromisoformat(fecha_inicio) if fecha_inicio else hoy
     ff  = date.fromisoformat(fecha_fin)    if fecha_fin    else hoy
 
-    if (ff - fi).days > 45:
-        raise HTTPException(status_code=400, detail="El rango máximo es 45 días.")
+    if (ff - fi).days > 365:
+        raise HTTPException(status_code=400, detail="El rango máximo de consulta es de 365 días (1 año).")
 
-    filtros = "WHERE emisor_id = :eid AND fecha_emision BETWEEN :fi AND :ff"
+    tipo_clean   = (tipo_doc or "ALL").upper()
+    estado_clean = (estado_pago or "ALL").upper()
+    q_clean      = (q or "").strip().lower()
+
+    # 1. Intentar leer de caché
+    cache_key = CK.fmt(
+        CK.DOCS_RECIBIDOS,
+        eid=emisor_id, fi=str(fi), ff=str(ff),
+        tipo=tipo_clean, estado=estado_clean, q=q_clean,
+        page=page, limit=limit
+    )
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 2. Si no está en caché, consultar a PostgreSQL
+    filtros = ["emisor_id = :eid", "fecha_emision BETWEEN :fi AND :ff"]
     params  = {"eid": emisor_id, "fi": fi, "ff": ff}
 
-    if tipo_doc:
-        filtros += " AND tipo_doc = :tipo_doc"
+    if tipo_doc and tipo_doc.upper() != "TODOS":
+        filtros.append("tipo_doc = :tipo_doc")
         params["tipo_doc"] = tipo_doc.upper()
-    if estado_pago:
-        filtros += " AND estado_pago = :estado_pago"
+    if estado_pago and estado_pago.upper() != "TODOS":
+        filtros.append("estado_pago = :estado_pago")
         params["estado_pago"] = estado_pago.upper()
+    if q:
+        filtros.append("(numero_doc ILIKE :q OR razon_social_proveedor ILIKE :q OR ruc_proveedor ILIKE :q)")
+        params["q"] = f"%{q}%"
 
+    where_clause = " AND ".join(filtros)
+
+    res_count = await db.execute(text(f"SELECT COUNT(*) FROM documentos_recibidos WHERE {where_clause}"), params)
+    total_items = res_count.scalar() or 0
+
+    res_resumen = await db.execute(text(f"""
+        SELECT
+            COUNT(*)                                                                             AS total,
+            COALESCE(SUM(importe_total), 0)                                                      AS importe_total,
+            COALESCE(SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END), 0) AS total_deducible,
+            COALESCE(SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END), 0) AS iva_credito_tributario
+        FROM documentos_recibidos WHERE {where_clause}
+    """), params)
+    resumen_row = res_resumen.fetchone()
+
+    offset = (page - 1) * limit
     params["limit"]  = limit
     params["offset"] = offset
 
     res = await db.execute(text(f"""
         SELECT
-            id, razon_social_proveedor, tipo_doc,
+            id, ruc_proveedor, razon_social_proveedor, tipo_doc,
             numero_doc, fecha_emision,
             subtotal_base, valor_iva_total, importe_total,
             deducible_renta, credito_tributario_iva,
             estado_pago, notas, fuente
         FROM documentos_recibidos
-        {filtros}
+        WHERE {where_clause}
         ORDER BY fecha_emision DESC, created_at DESC
         LIMIT :limit OFFSET :offset
     """), params)
     rows = res.fetchall()
 
-    params_resumen  = {k: v for k, v in params.items() if k not in ("limit", "offset")}
-    filtros_resumen = "WHERE emisor_id = :eid AND fecha_emision BETWEEN :fi AND :ff"
-    if tipo_doc:
-        filtros_resumen += " AND tipo_doc = :tipo_doc"
-    if estado_pago:
-        filtros_resumen += " AND estado_pago = :estado_pago"
+    total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
 
-    res_resumen = await db.execute(text(f"""
-        SELECT
-            COUNT(*)                                                                           AS total,
-            COALESCE(SUM(importe_total), 0)                                                    AS importe_total,
-            COALESCE(SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END), 0) AS total_deducible,
-            COALESCE(SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END), 0) AS iva_credito_tributario
-        FROM documentos_recibidos {filtros_resumen}
-    """), params_resumen)
-    resumen_row = res_resumen.fetchone()
-
-    return {
+    payload = {
         "ok": True,
         "resumen": {
             "total_documentos":       int(resumen_row.total or 0),
@@ -611,16 +627,25 @@ async def historial_recibidos(
             "total_deducible":        float(resumen_row.total_deducible or 0),
             "iva_credito_tributario": float(resumen_row.iva_credito_tributario or 0),
         },
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1,
+        },
         "data": [
             {
                 "id":                     str(r.id),
+                "ruc_proveedor":          r.ruc_proveedor,
                 "razon_social_proveedor": r.razon_social_proveedor,
                 "tipo_doc":               r.tipo_doc,
                 "numero_doc":             r.numero_doc,
                 "fecha_emision":          str(r.fecha_emision),
-                "subtotal_base":          float(r.subtotal_base),
-                "valor_iva_total":        float(r.valor_iva_total),
-                "importe_total":          float(r.importe_total),
+                "subtotal_base":          float(r.subtotal_base or 0),
+                "valor_iva_total":        float(r.valor_iva_total or 0),
+                "importe_total":          float(r.importe_total or 0),
                 "deducible_renta":        r.deducible_renta,
                 "credito_tributario_iva": r.credito_tributario_iva,
                 "estado_pago":            r.estado_pago,
@@ -631,6 +656,11 @@ async def historial_recibidos(
         ],
         "periodo": {"desde": str(fi), "hasta": str(ff)},
     }
+
+    # 3. Guardar respuesta en caché por 3 minutos
+    await cache_set(cache_key, payload, ttl=TTL.DOCUMENTOS_RECIBIDOS)
+
+    return payload
 
 
 # =============================================================================
@@ -668,7 +698,7 @@ async def detalle_recibido(
     return {
         "ok": True,
         "data": {
-            "id":                      str(doc.id),
+            "id":                     str(doc.id),
             "ruc_proveedor":           doc.ruc_proveedor,
             "razon_social_proveedor":  doc.razon_social_proveedor,
             "tipo_doc":                doc.tipo_doc,
@@ -677,9 +707,9 @@ async def detalle_recibido(
             "numero_doc":              doc.numero_doc,
             "fecha_emision":           str(doc.fecha_emision),
             "fecha_autorizacion":      str(doc.fecha_autorizacion) if doc.fecha_autorizacion else None,
-            "subtotal_base":           float(doc.subtotal_base),
-            "valor_iva_total":         float(doc.valor_iva_total),
-            "importe_total":           float(doc.importe_total),
+            "subtotal_base":           float(doc.subtotal_base or 0),
+            "valor_iva_total":         float(doc.valor_iva_total or 0),
+            "importe_total":           float(doc.importe_total or 0),
             "items_detalle":           doc.items_detalle or [],
             "deducible_renta":         doc.deducible_renta,
             "credito_tributario_iva":  doc.credito_tributario_iva,
@@ -698,7 +728,7 @@ async def detalle_recibido(
 
 
 # =============================================================================
-# PATCH /{id}
+# PATCH /{id} — Actualizar documento recibido
 # =============================================================================
 @router.patch("/{doc_id}", summary="Actualizar documento recibido")
 async def actualizar_recibido(
@@ -735,13 +765,11 @@ async def actualizar_recibido(
     if data.items_detalle is not None:
         campos.append("items_detalle = CAST(:items AS jsonb)")
         params["items"] = json.dumps(data.items_detalle, default=str)
-        # Recalcular totales desnormalizados desde los ítems actualizados
         subtotal_base, valor_iva_total = _calcular_totales_desde_items(data.items_detalle)
         campos.append("subtotal_base = :subtotal_base")
         campos.append("valor_iva_total = :valor_iva_total")
         params["subtotal_base"]   = subtotal_base
         params["valor_iva_total"] = valor_iva_total
-        # Flags globales desde ítems si no vienen explícitos
         if data.deducible_renta is None:
             params["ded_renta"] = any(i.get("deducible_renta", False) for i in data.items_detalle)
             campos.append("deducible_renta = :ded_renta")
@@ -795,6 +823,7 @@ async def actualizar_recibido(
             request    = request,
         )
         await db.commit()
+        await invalidate_emisor(emisor_id)
     except HTTPException:
         raise
     except Exception as e:

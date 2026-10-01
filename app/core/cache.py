@@ -29,6 +29,10 @@ class TTL:
     CUENTAS_CLIENTE = 180   # 3 min — cuentas por cliente
     PROFORMAS_LISTA  = 180   # 3 min
     PROFORMA_DETALLE = 300   # 5 min
+    DOCUMENTOS_EMITIDOS = 180   # 3 min — historial de emitidos
+    DOCUMENTOS_RECIBIDOS = 180  # 3 min — historial de recibidos
+    RESUMEN_FISCAL       = 300  # 5 min — resumen por tipo / totales
+    DECLARACION_IVA = 300  # 5 minutos
 
 # ── Prefijos de clave ──────────────────────────────────────────────────────────
 class CK:
@@ -46,6 +50,11 @@ class CK:
     CUENTAS_CLIENTE = "cuentas:{eid}:{cid}"
     PROFORMAS_LISTA  = "proformas:{eid}"
     PROFORMA_DETALLE = "proforma:{eid}:{pid}"
+    DOCS_EMITIDOS = "documentos_emitidos:{eid}:{fi}:{ff}:{sb}:{tipo}:{estado}:{q}:{page}:{limit}"
+    DOCS_RECIBIDOS = "documentos_recibidos:{eid}:{fi}:{ff}:{tipo}:{estado}:{q}:{page}:{limit}"
+    RESUMEN_EMITIDOS = "resumen_emitidos:{eid}:{fi}:{ff}"
+    RESUMEN_RECIBIDOS = "resumen_recibidos:{eid}:{fi}:{ff}:{tipo}:{estado}:{q}"
+    DECLARACION_IVA = "declaracion:iva:{eid}:{periodo}"
 
     @staticmethod
     def fmt(template: str, **kwargs) -> str:
@@ -71,6 +80,10 @@ _FAMILIAS_EMISOR = (
     "notificaciones",
     "productos",
     "empresa",
+    "documentos_emitidos",   # ← Agregado
+    "documentos_recibidos",  # ← Agregado
+    "resumen_emitidos",      # ← Agregado
+    "resumen_recibidos",     # ← Agregado
 )
 
 _LOTE_BORRADO = 500

@@ -5,27 +5,19 @@
 #
 # Estructura (igual al formulario del SRI):
 #
-#   1. VENTAS            FAC + ND emitidas − NC emitidas               → 401…429
+#   1. VENTAS            FAC + ND emitidas − NC emitidas                 → 401…429
 #   2. COMPRAS           FAC + ND recibidas + LIQ EMITIDAS − NC recib.  → 500…529
-#   3. PROPORCIONALIDAD  (ventas gravadas / ventas totales) × crédito  → 563, 564, 565
-#   4. LIQUIDACIÓN       IVA ventas − crédito                          → 601 (causado) / 602 (a favor)
+#   3. PROPORCIONALIDAD  (ventas gravadas / ventas totales) × crédito   → 563, 564, 565
+#   4. LIQUIDACIÓN       IVA ventas − crédito                            → 601 (causado) / 602 (a favor)
 #   5. SALDOS            − saldo anterior por compras (605)
 #                        − saldo anterior por retenciones (606)
-#                        − retenciones que TE hicieron (609)           → 620 / saldo siguiente 615, 617
+#                        − retenciones que TE hicieron (609)            → 620 / saldo siguiente 615, 617
+#                        − ajuste por crédito caducado > 5 años (625)
 #   6. AGENTE RETENCIÓN  + retenciones que TÚ hiciste (721…731)        → 801
-#                                                           TOTAL A PAGAR → 859
-#
-# Validado contra una declaración real (enero 2026): 563 = 0,9764 · 564 = 44,04 ·
-# 602 = 0,60 · 615 = 1.374,41 · 617 = 484,48 · 859 = 0,00.
-#
-# Supuestos a confirmar con más casos reales:
-#   - Si el 601 > 0, se consume primero el saldo por compras (605) y después el de
-#     retenciones (606 + 609). Es el orden del formulario y conserva el crédito por
-#     retenciones, que es el único que se puede pedir en devolución.
-#   - Sin ventas en el periodo (419 = 0) el factor es 1: el crédito se acumula entero.
-#   - Todas las ventas 0% se tratan como "sin derecho a crédito" (403).
+#                                                               TOTAL A PAGAR → 859
 
 from datetime import date
+from decimal import Decimal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,16 +27,13 @@ from . import snapshots
 CAMPOS_MANUALES_104 = [
     {"casillero": "605", "descripcion": "Saldo crédito tributario mes anterior (adquisiciones)"},
     {"casillero": "606", "descripcion": "Saldo crédito tributario mes anterior (retenciones)"},
+    {"casillero": "625", "descripcion": "Ajuste por crédito tributario caducado (superior a 5 años)"},
     {"casillero": "402", "descripcion": "Ventas de activos fijos gravadas tarifa ≠ 0"},
     {"casillero": "501", "descripcion": "Adquisiciones de activos fijos con crédito tributario"},
     {"casillero": "504", "descripcion": "Importaciones de bienes gravados tarifa ≠ 0"},
 ]
 CASILLEROS_MANUALES_PERMITIDOS = {c["casillero"] for c in CAMPOS_MANUALES_104}
 
-# Impuestos de un comprobante emitido: resumenImpuestos (FAC, NC, LIQ) o, para las
-# notas de débito, infoNotaDebito.impuestos.impuesto (objeto o arreglo).
-# OJO: las ND se guardan con resumenImpuestos = [] (lista vacía), así que solo se
-# usa resumenImpuestos cuando trae elementos.
 _IMPUESTOS_EMITIDO = """
     CASE
         WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array'
@@ -91,7 +80,7 @@ def _val(dic: dict, clave, campo: str) -> float:
 # =============================================================================
 async def calcular_iva_104(
     db: AsyncSession, emisor_id: int, fi: date, ff: date,
-    saldo_605: float = 0.0, saldo_606: float = 0.0,
+    saldo_605: float = 0.0, saldo_606: float = 0.0, saldo_625_manual: float | None = None,
 ) -> dict:
     """
     Calcula el 104 de un rango, con los saldos del periodo anterior ya resueltos.
@@ -105,9 +94,9 @@ async def calcular_iva_104(
     # ── Comprobantes EMITIDOS: ventas (FAC, ND), NC y liquidaciones (compras) ──
     res = await db.execute(text(f"""
         SELECT d.id, d.tipo_doc,
-               COALESCE((imp->>'tarifa')::numeric, 0)            AS tarifa,
+               COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
                SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
-               SUM(COALESCE((imp->>'valor')::numeric, 0))         AS iva
+               SUM(COALESCE((imp->>'valor')::numeric, 0))          AS iva
         FROM documentos_emitidos d,
              jsonb_array_elements({_IMPUESTOS_EMITIDO}) AS imp
         WHERE d.emisor_id     = :eid
@@ -131,13 +120,13 @@ async def calcular_iva_104(
             _acumular(liq, t, r.base, r.iva)
             liq_ids.add(str(r.id))
 
-    # ── Comprobantes RECIBIDOS: por línea (items_detalle) o por cabecera si no hay detalle ──
+    # ── Comprobantes RECIBIDOS ──
     res = await db.execute(text("""
         SELECT d.id, d.tipo_doc,
                COALESCE((item->>'tarifa_iva')::numeric, 0)                    AS tarifa,
                COALESCE((item->>'credito_tributario_iva')::boolean, false)    AS credito,
                COALESCE((item->>'subtotal')::numeric, 0)                      AS base,
-               COALESCE((item->>'valor_iva')::numeric, 0)                     AS iva
+               COALESCE((item->>'valor_iva')::numeric, 0)                      AS iva
         FROM documentos_recibidos d,
              jsonb_array_elements(
                  CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
@@ -148,7 +137,6 @@ async def calcular_iva_104(
 
         UNION ALL
 
-        -- Registrados a mano sin detalle: se usa la cabecera (antes se perdían)
         SELECT d.id, d.tipo_doc,
                CASE WHEN COALESCE(d.subtotal_base, 0) > 0 AND COALESCE(d.valor_iva_total, 0) > 0
                     THEN ROUND(d.valor_iva_total / d.subtotal_base * 100)
@@ -180,16 +168,17 @@ async def calcular_iva_104(
     for t, v in liq.items():
         _acumular(compras_cc, t, v["base"], v["iva"])
 
-    # ── Retenciones de IVA que TE hicieron (609) ──
+    # ── Retenciones de IVA que TE hicieron (Casillero 609) ──
     res = await db.execute(text("""
-        SELECT d.id, COALESCE((item->>'total')::numeric, 0) AS valor
+        SELECT d.id, 
+               COALESCE((item->>'valor_iva')::numeric, (item->>'total')::numeric, (item->>'valorRetenido')::numeric, 0) AS valor
         FROM documentos_recibidos d,
              jsonb_array_elements(
                  CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
              ) AS item
         WHERE d.emisor_id = :eid AND d.tipo_doc = 'RET'
           AND d.fecha_emision BETWEEN :fi AND :ff
-          AND (item->>'codigo_impuesto') = '2'
+          AND (item->>'codigo_impuesto' = '2' OR item->>'codigo' = '2')
 
         UNION ALL
 
@@ -206,7 +195,8 @@ async def calcular_iva_104(
         c609 += float(r.valor)
     c609 = _r(c609)
 
-    # ── Retenciones de IVA que TÚ hiciste (721–731) ──
+    # ── Retenciones de IVA que TÚ hiciste (Casilleros 721–731 y 799) ──
+    # Soporta esquemas v1.0 y v2.0 del SRI en JSONB
     res = await db.execute(text("""
         SELECT d.id,
                COALESCE((imp->>'porcentajeRetener')::numeric, 0)  AS pct,
@@ -214,8 +204,20 @@ async def calcular_iva_104(
         FROM documentos_emitidos d,
              jsonb_array_elements(
                  CASE
-                     WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'  THEN d.datos->'impuestos'->'impuesto'
-                     WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'object' THEN jsonb_build_array(d.datos->'impuestos'->'impuesto')
+                     -- Esquema v2.0 SRI (docsSustento -> docSustento -> retenciones -> retencion)
+                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
+                         CASE 
+                             WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                             THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                             ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
+                         END
+                     -- Esquema v1.0 SRI (impuestos -> impuesto)
+                     WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
+                         CASE
+                             WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
+                             THEN d.datos->'impuestos'->'impuesto'
+                             ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto')
+                         END
                      ELSE '[]'::jsonb
                  END
              ) AS imp
@@ -224,9 +226,10 @@ async def calcular_iva_104(
           AND d.es_sandbox    = false
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      = 'RET'
-          AND (imp->>'codigo') = '2'
+          AND (imp->>'codigo') = '2' -- 2 = IVA
         GROUP BY d.id, COALESCE((imp->>'porcentajeRetener')::numeric, 0)
     """), params)
+
     PCT_CAS = {10: "721", 20: "723", 30: "725", 50: "727", 70: "729", 100: "731"}
     cas_ret = {c: 0.0 for c in PCT_CAS.values()}
     ret_e_desglose: dict[float, float] = {}
@@ -267,7 +270,6 @@ async def calcular_iva_104(
     c419 = _r(c411 + c420 + c435 + c413)
     c429 = _r(c421 + c430 + c445)
 
-    # Liquidación del IVA en el mes (todo a contado)
     c480 = _r(c411 + c420 + c435)
     c481 = 0.0
     c482 = c429
@@ -327,9 +329,9 @@ async def calcular_iva_104(
     # ═════════════════════════════════════════════════════════════════════════
     # 3. FACTOR DE PROPORCIONALIDAD
     # ═════════════════════════════════════════════════════════════════════════
-    ventas_con_derecho = c411 + c420 + c435          # + 412, 415–418 (no se calculan)
+    ventas_con_derecho = c411 + c420 + c435
     c563 = round(ventas_con_derecho / c419, 4) if c419 > 0 else 1.0
-    credito_bruto = c520 + c534 + c560               # + 521, 523–527 (no se calculan)
+    credito_bruto = c520 + c534 + c560
     c564 = _r(credito_bruto * c563)
     c565 = _r(credito_bruto - c564)
 
@@ -341,10 +343,24 @@ async def calcular_iva_104(
     c602 = _r(-dif) if dif < 0 else 0.0
 
     # ═════════════════════════════════════════════════════════════════════════
-    # 5. SALDOS ANTERIORES Y RETENCIONES QUE TE HICIERON
+    # 5. SALDOS ANTERIORES, CADUCIDAD (>5 AÑOS) Y RETENCIONES
     # ═════════════════════════════════════════════════════════════════════════
     c605 = _r(saldo_605)
     c606 = _r(saldo_606)
+
+    # Consulta de sugerencia automática para el Casillero 625 (Lotes > 5 años)
+    if saldo_625_manual is None:
+        res_625 = await db.execute(text("""
+            SELECT COALESCE(SUM(monto_disponible), 0)
+            FROM credito_tributario_lotes
+            WHERE emisor_id = :eid
+              AND monto_disponible > 0
+              AND fecha_caducidad <= :ff
+        """), {"eid": emisor_id, "ff": ff})
+        c625 = _r(res_625.scalar() or 0.0)
+    else:
+        c625 = _r(saldo_625_manual)
+
     credito_retenciones = _r(c606 + c609)
 
     if c601 > 0:
@@ -352,11 +368,11 @@ async def calcular_iva_104(
         restante  = _r(c601 - usa_605)
         usa_ret   = min(credito_retenciones, restante)
         c620      = _r(restante - usa_ret)
-        c615      = _r(c605 - usa_605)
+        c615      = max(_r(c605 - usa_605 - c625), 0.0)
         c617      = _r(credito_retenciones - usa_ret)
     else:
         c620 = 0.0
-        c615 = _r(c605 + c602)
+        c615 = max(_r(c605 + c602 - c625), 0.0)
         c617 = credito_retenciones
 
     c621 = 0.0
@@ -377,7 +393,7 @@ async def calcular_iva_104(
         "credito_tributario_renta": c522 > 0,
         "comercio_exterior":        False,
         "notas_credito":            bool(ncr_emit) or bool(ncr_recib),
-        "tarifa_turismo":           c410 > 0,
+        "tarifa_turismo":            c410 > 0,
         "ha_realizado_ventas":      c409 > 0,
         "ventas_tarifa_0":          c403 > 0,
         "ventas_activos_fijos":     False,
@@ -414,7 +430,7 @@ async def calcular_iva_104(
         "resumen": {
             "499": c499, "563": c563, "564": c564, "565": c565,
             "601": c601, "602": c602,
-            "605": c605, "606": c606, "609": c609,
+            "605": c605, "606": c606, "609": c609, "625": c625,
             "615": c615, "617": c617,
             "620": c620, "621": c621, "699": c699,
             "799": c799, "801": c801, "859": c859,
@@ -447,7 +463,7 @@ async def calcular_iva_104(
         "desglose":            desglose,
         "resumen":             resumen,
         "doc_emitidos_ids":    doc_emitidos_ids,
-        "doc_recibidos_ids":   doc_recibidos_ids,
+        "doc_recibidos_ids":    doc_recibidos_ids,
         "total_doc_emitidos":  len(doc_emitidos_ids),
         "total_doc_recibidos": len(doc_recibidos_ids),
     }
@@ -477,7 +493,7 @@ def _desde_snapshot(snap) -> dict:
         "desglose":            snap.desglose,
         "resumen":             snap.resumen,
         "doc_emitidos_ids":    None,
-        "doc_recibidos_ids":   None,
+        "doc_recibidos_ids":    None,
         "total_doc_emitidos":  snap.total_doc_emitidos,
         "total_doc_recibidos": snap.total_doc_recibidos,
         "congelado":           True,
@@ -488,24 +504,44 @@ def _desde_snapshot(snap) -> dict:
 
 async def saldos_anteriores(db: AsyncSession, obl, p: per.Periodo, memo: dict, profundidad: int = 0) -> dict:
     """
-    605/606 del periodo p, en este orden de prioridad:
-      1. Lo que el usuario ingresó a mano para p (p. ej. su primer mes en Kipu).
-      2. El 615/617 del periodo anterior calculado por Kipu (declarado = foto congelada).
+    605/606/625 del periodo p, en este orden de prioridad:
+      1. Lo que el usuario ingresó a mano para p.
+      2. El 615/617 del periodo anterior calculado por Kipu.
       3. Cero, si el periodo anterior es previo a su inicio en Kipu.
     """
     manual = await snapshots.leer_campos_manuales(db, obl.emisor_id, p.inicio)
-    if "605" in manual or "606" in manual:
-        return {"605": float(manual.get("605", 0)), "606": float(manual.get("606", 0)),
-                "origen": "MANUAL", "periodo_anterior": None}
+    c605_m = manual.get("605")
+    c606_m = manual.get("606")
+    c625_m = float(manual["625"]) if "625" in manual else None
+
+    if c605_m is not None or c606_m is not None:
+        return {
+            "605": float(c605_m or 0),
+            "606": float(c606_m or 0),
+            "625": c625_m,
+            "origen": "MANUAL",
+            "periodo_anterior": None,
+        }
 
     ant = periodo_anterior(p)
     if not ant.existe_para(obl.inicio, per.hoy_ec()) or profundidad >= 36:
-        return {"605": 0.0, "606": 0.0, "origen": "SIN_HISTORIAL", "periodo_anterior": ant.nombre}
+        return {
+            "605": 0.0,
+            "606": 0.0,
+            "625": c625_m,
+            "origen": "SIN_HISTORIAL",
+            "periodo_anterior": ant.nombre,
+        }
 
     calc_ant = await resultado_periodo(db, obl, ant, memo, profundidad=profundidad + 1)
     res_ant  = calc_ant["casilleros"].get("resumen", {})
-    return {"605": float(res_ant.get("615", 0)), "606": float(res_ant.get("617", 0)),
-            "origen": "KIPU", "periodo_anterior": ant.nombre}
+    return {
+        "605": float(res_ant.get("615", 0)),
+        "606": float(res_ant.get("617", 0)),
+        "625": c625_m,
+        "origen": "KIPU",
+        "periodo_anterior": ant.nombre,
+    }
 
 
 async def resultado_periodo(
@@ -515,7 +551,7 @@ async def resultado_periodo(
     """
     104 de un periodo con la cadena de saldos resuelta.
     - Declarado: devuelve la foto congelada (salvo forzar=True, para sustitutivas).
-    - No declarado: se calcula en vivo, porque sus documentos todavía pueden cambiar.
+    - No declarado: se calcula en vivo.
     """
     memo = {} if memo is None else memo
     if p.inicio in memo and not forzar:
@@ -523,13 +559,17 @@ async def resultado_periodo(
 
     if not forzar and await _declarado(db, obl.emisor_id, p):
         snap = await snapshots.leer(db, obl.emisor_id, "IVA", p.inicio)
-        # Fotos viejas (antes de la cadena de créditos) no traen el 615: se recalculan
         if snap and "615" in (snap.casilleros or {}).get("resumen", {}):
             memo[p.inicio] = _desde_snapshot(snap)
             return memo[p.inicio]
 
     saldos = await saldos_anteriores(db, obl, p, memo, profundidad)
-    calc   = await calcular_iva_104(db, obl.emisor_id, p.inicio, p.fin, saldos["605"], saldos["606"])
+    calc   = await calcular_iva_104(
+        db, obl.emisor_id, p.inicio, p.fin,
+        saldo_605=saldos["605"],
+        saldo_606=saldos["606"],
+        saldo_625_manual=saldos["625"]
+    )
     calc["resumen"]["saldos"] = {
         "origen":           saldos["origen"],
         "periodo_anterior": saldos["periodo_anterior"],

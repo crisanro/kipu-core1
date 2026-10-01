@@ -63,25 +63,36 @@ async def _get_access_token() -> str:
 # ── Helpers FCM ───────────────────────────────────────────────────────────────
 def _payload(token: str, titulo: str, cuerpo: str, url: Optional[str], tipo: Optional[str]) -> dict:
     """
-    Mensaje SOLO DE DATOS: el service worker decide cómo mostrarlo.
-    - Evita notificaciones duplicadas (SDK + onBackgroundMessage).
-    - Evita fcm_options.link, que exige URL HTTPS absoluta.
-    Todos los valores de 'data' deben ser strings.
+    Estructura FCM HTTP v1 compatible con primer plano, segundo plano y Service Worker.
+    Informa tanto 'notification' (para SO nativo) como 'data' (para la app Kipu).
     """
     return {
         "message": {
             "token": token,
+            "notification": {
+                "title": titulo or "Kipu",
+                "body": cuerpo or "",
+            },
             "data": {
                 "title": titulo or "Kipu",
-                "body":  cuerpo or "",
-                "url":   url or "/dashboard",
-                "tipo":  tipo or "",
+                "body": cuerpo or "",
+                "url": url or "/dashboard",
+                "tipo": tipo or "",
             },
             "webpush": {
                 "headers": {
                     "Urgency": "high",
-                    "TTL":     "86400",   # 24 h si el dispositivo está apagado
+                    "TTL": "86400",
                 },
+                "notification": {
+                    "title": titulo or "Kipu",
+                    "body": cuerpo or "",
+                    "icon": "/icon.svg",
+                    "badge": "/icon.svg",
+                },
+                "fcm_options": {
+                    "link": url or "/dashboard"
+                }
             },
         }
     }
