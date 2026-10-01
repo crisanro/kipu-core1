@@ -370,16 +370,49 @@ async def resumen_documentos(
     res_iva = await db.execute(text("""
         SELECT
             d.tipo_doc,
-            (imp->>'tarifa')::numeric             AS tarifa,
-            SUM((imp->>'baseImponible')::numeric) AS subtotal,
-            SUM((imp->>'valor')::numeric)         AS iva,
-            COUNT(DISTINCT d.id)                  AS num_docs,
-            SUM(d.importe_total)                  AS total
+            COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
+            SUM(COALESCE((imp->>'baseImponible')::numeric, 0))      AS subtotal,
+            SUM(COALESCE((imp->>'valor')::numeric, 0))              AS iva,
+            COUNT(DISTINCT d.id)                                    AS num_docs,
+            SUM(d.importe_total)                                    AS total
         FROM documentos_emitidos d,
              jsonb_array_elements(
                  CASE
-                     WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array'
+                     -- 1. Si existe resumenImpuestos directo (FAC / LIQ / NCR)
+                     WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array' 
+                          AND jsonb_array_length(d.datos->'resumenImpuestos') > 0
                      THEN d.datos->'resumenImpuestos'
+
+                     -- 2. FAC / LIQ / NCR fallback (totalConImpuestos -> totalImpuesto)
+                     WHEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                     THEN CASE 
+                         WHEN jsonb_typeof(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                         THEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto'
+                         ELSE jsonb_build_array(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto')
+                     END
+
+                     WHEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                     THEN CASE 
+                         WHEN jsonb_typeof(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                         THEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto'
+                         ELSE jsonb_build_array(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto')
+                     END
+
+                     WHEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                     THEN CASE 
+                         WHEN jsonb_typeof(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                         THEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto'
+                         ELSE jsonb_build_array(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto')
+                     END
+
+                     -- 3. NDB (infoNotaDebito -> impuestos -> impuesto)
+                     WHEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto' IS NOT NULL
+                     THEN CASE 
+                         WHEN jsonb_typeof(d.datos->'infoNotaDebito'->'impuestos'->'impuesto') = 'array'
+                         THEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto'
+                         ELSE jsonb_build_array(d.datos->'infoNotaDebito'->'impuestos'->'impuesto')
+                     END
+
                      ELSE '[]'::jsonb
                  END
              ) AS imp
@@ -388,7 +421,7 @@ async def resumen_documentos(
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.es_sandbox    = false
           AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        GROUP BY d.tipo_doc, (imp->>'tarifa')::numeric
+        GROUP BY d.tipo_doc, COALESCE((imp->>'tarifa')::numeric, 0)
         ORDER BY d.tipo_doc, tarifa
     """), {"eid": emisor_id, "fi": fi, "ff": ff})
 
@@ -575,6 +608,8 @@ async def anular_documento(
 # =============================================================================
 # SINCRONIZAR ANULACIÓN — POST /{doc_id}/anulacion/sincronizar
 # =============================================================================
+LIMITE_SEG = 60
+
 @router.post("/{doc_id}/anulacion/sincronizar", summary="Consultar estado de anulación directamente en el SRI")
 async def sincronizar_anulacion_documento(
     doc_id:    str,
@@ -582,42 +617,59 @@ async def sincronizar_anulacion_documento(
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
-    """
-    Re-consulta al SRI el estado de un documento. Si el receptor aceptó/rechazó
-    o el SRI ya procesó la anulación, actualiza la base de datos automáticamente.
-    """
     emisor_id = auth_data.get("emisor_id")
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
     verificar_permiso(auth_data, "emitir")
 
+    # Cargar el doc ANTES de reservar el turno (así ya tenemos anulacion_estado)
     doc = await _cargar_doc_anulacion(db, doc_id, emisor_id)
-    
-    from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
 
+    # Reserva atómica del turno: solo avanza si pasaron >= 60 s desde la última verificación
+    reserva = await db.execute(text("""
+        UPDATE documentos_emitidos
+        SET sri_verificado_at = NOW()
+        WHERE id = :did AND emisor_id = :eid
+          AND (sri_verificado_at IS NULL
+               OR sri_verificado_at < NOW() - make_interval(secs => :lim))
+        RETURNING 1
+    """), {"did": doc_id, "eid": emisor_id, "lim": LIMITE_SEG})
+
+    if reserva.first() is None:
+        r = await db.execute(text("""
+            SELECT GREATEST(1, CEIL(:lim - EXTRACT(EPOCH FROM (NOW() - sri_verificado_at))))::int AS restante
+            FROM documentos_emitidos WHERE id = :did AND emisor_id = :eid
+        """), {"did": doc_id, "eid": emisor_id, "lim": LIMITE_SEG})
+        restante = r.scalar() or LIMITE_SEG
+        await db.rollback()
+        raise HTTPException(
+            status_code=429,
+            detail=f"Debes esperar {restante} s antes de volver a consultar.",
+            headers={"Retry-After": str(restante)},
+        )
+
+    await db.commit()  # confirma la reserva aunque la consulta al SRI falle
+
+    from app.services.anulacion_service import verificar_sri_y_procesar_anulacion
     res_sync = await verificar_sri_y_procesar_anulacion(
         db, doc, emisor_id, motivo=doc.get("motivo_anulacion") or "ERROR EN EL COMPROBANTE"
     )
 
     if res_sync.get("cambio"):
         await audit_log(
-            db         = db,
-            auth_data  = auth_data,
-            accion     = "UPDATE",
-            entidad    = "documento",
-            entidad_id = doc_id,
-            detalle    = {
-                "accion":       "sincronizar_anulacion",
-                "numero_doc":   doc["numero_doc"],
+            db=db, auth_data=auth_data, accion="UPDATE", entidad="documento",
+            entidad_id=doc_id,
+            detalle={
+                "accion": "sincronizar_anulacion",
+                "numero_doc": doc["numero_doc"],
                 "nuevo_estado": res_sync["estado"],
             },
-            request    = request,
+            request=request,
         )
-        await db.commit()
-        await _invalidar_cache_emisor(emisor_id)
+    await db.commit()
+    await _invalidar_cache_emisor(emisor_id)
 
     return res_sync
-
 
 # =============================================================================
 # RESOLVER ANULACIÓN — POST /{doc_id}/anulacion/resolver

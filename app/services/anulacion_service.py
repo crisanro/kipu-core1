@@ -229,9 +229,7 @@ async def verificar_sri_y_procesar_anulacion(
     motivo: str = "ERROR EN EL COMPROBANTE"
 ) -> dict:
     """
-    Consulta al SRI. Si el SRI responde AUTORIZADO, SIGNIFICA QUE NO HA SIDO ANULADO
-    en el portal del SRI todavía (o el SRI aún no actualiza sus registros).
-    Por ende, RECHAZA la anulación en Kipu para evitar anulaciones falsas.
+    Consulta al SRI el estado de validez actual del comprobante.
     """
     ambiente = 1 if doc.get("es_sandbox") else doc.get("ambiente", 2)
     clave_acceso = doc["clave_acceso"]
@@ -273,8 +271,27 @@ async def verificar_sri_y_procesar_anulacion(
             "efectos": efectos,
         }
 
-    # 3. CASO PENDIENTE EN EL SRI (Retenciones / Notas de Crédito que esperan al receptor)
+    # 3. PENDIENTE EN EL SRI (espera al receptor)
     if res_sri.estado == sri.PENDIENTE_ANULAR:
+        ya_pendiente = doc.get("anulacion_estado") == "PENDIENTE"
+
+        if ya_pendiente:
+            # Solo refrescamos la marca de verificación; NO tocamos el límite
+            await db.execute(text("""
+                UPDATE documentos_emitidos
+                SET sri_verificado_at = NOW(), updated_at = NOW()
+                WHERE id = :did AND emisor_id = :eid
+            """), {"did": str(doc["id"]), "eid": emisor_id})
+
+            return {
+                "ok": True,
+                "estado": "PENDIENTE",
+                "sri_estado": "PENDIENTE_ANULAR",
+                "cambio": False,   # ← no cambió nada en BD
+                "mensaje": "El SRI aún no recibe respuesta del receptor.",
+                "efectos": {"cuentas_anuladas": 0, "cuentas_con_abonos": 0},
+            }
+
         limite_aceptacion = sumar_dias_habiles(hoy_ec(), DIAS_HABILES_ACEPTACION)
         await db.execute(text("""
             UPDATE documentos_emitidos
@@ -291,13 +308,41 @@ async def verificar_sri_y_procesar_anulacion(
             "ok": True,
             "estado": "PENDIENTE",
             "sri_estado": "PENDIENTE_ANULAR",
-            "cambio": True,
-            "mensaje": f"La anulación está registrada en el SRI en espera de aceptación del receptor.",
+            "cambio": True,         # primera vez que pasa a PENDIENTE
+            "mensaje": "La anulación está registrada en el SRI en espera de aceptación del receptor.",
             "efectos": {"cuentas_anuladas": 0, "cuentas_con_abonos": 0},
         }
 
-    # 4. PROTECCIÓN ESTRICTA: Si sigue AUTORIZADO en el SRI, BLOQUEAR la anulación
+    # 4. CASO AUTORIZADO: El comprobante sigue vigente en el SRI
     if res_sri.estado == sri.AUTORIZADO:
+        # Si en nuestra BD estaba como PENDIENTE, significa que la solicitud venció o fue rechazada en el SRI
+        if doc.get("anulacion_estado") == "PENDIENTE":
+            await db.execute(text("""
+                UPDATE documentos_emitidos
+                SET anulacion_estado        = NULL,
+                    anulacion_solicitada_at = NULL,
+                    anulacion_limite_aceptacion = NULL,
+                    motivo_anulacion        = NULL,
+                    sri_verificado_at       = NOW(),
+                    updated_at              = NOW()
+                WHERE id = :did AND emisor_id = :eid
+            """), {"did": str(doc["id"]), "eid": emisor_id})
+
+            return {
+                "ok": True,
+                "estado": "AUTORIZADO",
+                "sri_estado": "AUTORIZADO",
+                "cambio": True,  # Notifica al frontend que el estado en BD SÍ cambió (de PENDIENTE a NORMAL)
+                "mensaje": "El SRI informa que la solicitud no se concretó (fue rechazada o venció). El comprobante vuelve a estar AUTORIZADO.",
+            }
+
+        # Si el usuario intenta anularlo por primera vez pero el SRI reporta AUTORIZADO
+        await db.execute(text("""
+            UPDATE documentos_emitidos
+            SET sri_verificado_at = NOW()
+            WHERE id = :did AND emisor_id = :eid
+        """), {"did": str(doc["id"]), "eid": emisor_id})
+
         raise HTTPException(
             status_code=422,
             detail=(
@@ -311,6 +356,7 @@ async def verificar_sri_y_procesar_anulacion(
         status_code=400,
         detail=f"Estado del comprobante en el SRI no permite la anulación: {res_sri.estado}"
     )
+
 
 # =============================================================================
 # EFECTOS DE UNA ANULACIÓN CONFIRMADA
