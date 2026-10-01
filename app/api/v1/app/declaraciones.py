@@ -25,7 +25,7 @@ from app.services.declaraciones import periodos as per
 from app.services.declaraciones import registro, snapshots, demo
 from app.services.declaraciones.obligaciones import cargar_obligaciones, Obligaciones
 from app.services.declaraciones.iva_104 import (
-    calcular_iva_104, resumen_iva, CASILLEROS_MANUALES_PERMITIDOS,
+    calcular_iva_104, resultado_periodo, resumen_iva, CASILLEROS_MANUALES_PERMITIDOS,
 )
 from app.services.declaraciones.renta_102 import calcular_renta_102
 from app.services.declaraciones.ats import calcular_ats, generar_xml_ats
@@ -68,6 +68,17 @@ async def _verificar_suscripcion(emisor_id: int, db: AsyncSession) -> bool:
     res = await db.execute(text("SELECT estado FROM subscriptions WHERE emisor_id = :eid"), {"eid": emisor_id})
     sub = res.fetchone()
     return sub is not None and sub.estado in ("ACTIVO", "TRIAL")
+
+
+async def _invalidar_dashboard(emisor_id: int) -> None:
+    """El widget del dashboard vive en caché: al declarar, se limpia para que cambie al instante."""
+    try:
+        from app.core.cache import get_redis
+        redis = await get_redis()
+        async for key in redis.scan_iter(f"dashboard:{emisor_id}*"):
+            await redis.delete(key)
+    except Exception as e:
+        print(f"[Cache] ⚠️ No invalidado: {e}")
 
 
 def _parse_periodo(tipo: str, tipo_periodo: str, key: str) -> per.Periodo:
@@ -118,7 +129,7 @@ async def obtener_declaracion_actual(
 
     # Totales del 104 en vivo, con el mismo cálculo del reporte
     if tipo == "104":
-        calc    = await calcular_iva_104(db, emisor_id, p.inicio, p.fin)
+        calc    = await resultado_periodo(db, obl, p)
         totales = resumen_iva(calc)
         await db.execute(text("""
             UPDATE declaraciones_sri SET totales = CAST(:totales AS jsonb)
@@ -289,6 +300,19 @@ async def marcar_declarado(
                     {"accion": "declarado", "tipo": tipo, "periodo": p.key}, request)
     await db.commit()
 
+    # 104: se congela la foto en este momento = lo que se presentó al SRI
+    if tipo == "104":
+        calc = await resultado_periodo(db, obl, p, forzar=True)
+        await snapshots.guardar(
+            db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
+            casilleros=calc["casilleros"], preguntas=calc["preguntas"],
+            desglose=calc["desglose"], resumen=calc["resumen"],
+            doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
+            profile_id=profile_id, regenerar=False,
+        )
+
+    await _invalidar_dashboard(emisor_id)
+
     return {
         "ok":      True,
         "periodo": p.key,
@@ -303,10 +327,15 @@ async def marcar_declarado(
 async def casilleros_iva(
     periodo:      str           = Query(..., description="Periodo YYYY-MM, ej: 2026-08"),
     tipo_periodo: Optional[str] = Query(None, description="Obsoleto: se toma de la configuración de la empresa"),
-    regenerar:    bool          = Query(False, description="Forzar recálculo aunque esté guardado"),
+    regenerar:    bool          = Query(False, description="Recalcular aunque el periodo esté declarado (sustitutiva)"),
     auth_data:    dict          = Depends(verify_firebase_token),
     db:           AsyncSession  = Depends(get_db),
 ):
+    """
+    - Periodo NO declarado: se calcula en vivo (sus documentos todavía pueden cambiar).
+    - Periodo declarado: foto congelada al momento de declarar.
+    Los saldos 605/606 se toman del 615/617 del periodo anterior, o de lo ingresado a mano.
+    """
     emisor_id  = _emisor(auth_data)
     profile_id = auth_data.get("profile_id")
     _permiso(auth_data)
@@ -321,39 +350,12 @@ async def casilleros_iva(
     p   = _parse_periodo("104", tp, periodo)
     hoy = per.hoy_ec()
     en_curso = p.en_curso(hoy)
-    info_periodo = {"desde": p.inicio.isoformat(), "hasta": p.fin.isoformat(), "mes": periodo, "tipo": tp}
 
-    # Reporte guardado (solo periodos cerrados)
-    if not en_curso and not regenerar:
-        cached = await snapshots.leer(db, emisor_id, "IVA", p.inicio)
-        if cached:
-            return {
-                "ok":            True,
-                "cached":        True,
-                "generado_at":   cached.generado_at.isoformat() if cached.generado_at else None,
-                "regenerado_at": cached.regenerado_at.isoformat() if cached.regenerado_at else None,
-                "campos_manuales_valores": cached.campos_manuales_valores or {},
-                "total_doc_emitidos":  cached.total_doc_emitidos,
-                "total_doc_recibidos": cached.total_doc_recibidos,
-                "data": {
-                    "periodo":   info_periodo,
-                    "preguntas": cached.preguntas,
-                    "ventas":    cached.desglose.get("ventas", {}),
-                    "compras":   cached.desglose.get("compras", {}),
-                    "retenciones_emitidas":  cached.desglose.get("retenciones_emitidas", {}),
-                    "retenciones_recibidas": cached.desglose.get("retenciones_recibidas", {}),
-                    "resumen":   cached.resumen,
-                    "casilleros_completos": cached.casilleros,
-                    "notas": [
-                        "Reporte generado previamente — los datos corresponden al periodo cerrado.",
-                        "Usa ?regenerar=true para recalcular si corregiste documentos.",
-                    ],
-                },
-            }
+    calc = await resultado_periodo(db, obl, p, forzar=regenerar)
 
-    calc = await calcular_iva_104(db, emisor_id, p.inicio, p.fin)
-
-    if not en_curso:
+    # Se guarda la foto de periodos cerrados. Si está declarado y se regenera,
+    # la nueva foto reemplaza a la anterior (declaración sustitutiva).
+    if not en_curso and not calc.get("congelado"):
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
             casilleros=calc["casilleros"], preguntas=calc["preguntas"],
@@ -362,23 +364,37 @@ async def casilleros_iva(
             profile_id=profile_id, regenerar=regenerar,
         )
 
+    saldos = (calc["resumen"] or {}).get("saldos") or {}
+    notas  = []
+    if calc.get("congelado"):
+        notas.append("Periodo declarado: estos son los valores al momento de declarar. "
+                     "Usa «Regenerar» solo si vas a presentar una declaración sustitutiva.")
+    if saldos.get("origen") == "SIN_HISTORIAL":
+        notas.append("Es tu primer periodo en Kipu: ingresa los saldos 605 y 606 de tu última "
+                     "declaración para que el cálculo sea exacto.")
+    elif saldos.get("origen") == "KIPU":
+        notas.append(f"Los saldos 605 y 606 vienen de tu declaración de {saldos.get('periodo_anterior')}.")
+    if calc["casilleros"]["ventas"].get("419", 0) == 0:
+        notas.append("Sin ventas en el periodo: el crédito tributario se acumula completo (factor 1).")
+    notas.append("Activos fijos e importaciones requieren clasificación manual.")
+    if en_curso:
+        notas.append("⚠️ Periodo en curso — los valores pueden cambiar.")
+
     return {
-        "ok":       True,
-        "cached":   False,
-        "en_curso": en_curso,
-        "total_doc_emitidos":  len(calc["doc_emitidos_ids"]),
-        "total_doc_recibidos": len(calc["doc_recibidos_ids"]),
+        "ok":            True,
+        "cached":        bool(calc.get("congelado")),
+        "en_curso":      en_curso,
+        "generado_at":   calc.get("generado_at"),
+        "regenerado_at": calc.get("regenerado_at"),
+        "total_doc_emitidos":  calc["total_doc_emitidos"],
+        "total_doc_recibidos": calc["total_doc_recibidos"],
+        "campos_manuales_valores": await snapshots.leer_campos_manuales(db, emisor_id, p.inicio),
         "data": {
-            "periodo":   info_periodo,
+            "periodo":   {"desde": p.inicio.isoformat(), "hasta": p.fin.isoformat(), "mes": periodo, "tipo": tp},
             "preguntas": calc["preguntas"],
             **calc["desglose"],
             "resumen":   calc["resumen"],
-            "campos_manuales_valores": await snapshots.leer_campos_manuales(db, emisor_id, p.inicio),
-            "notas": [
-                "Los casilleros 605/606 (saldo mes anterior) deben ingresarse manualmente.",
-                "Activos fijos e importaciones requieren clasificación manual.",
-                "Las tarifas de IVA se calculan dinámicamente.",
-            ] + (["⚠️ Periodo en curso — los valores pueden cambiar."] if en_curso else []),
+            "notas":     notas,
         },
     }
 
@@ -419,6 +435,7 @@ async def guardar_campos_manuales_iva(
                     {"periodo": periodo, "accion": "campos_manuales", "casilleros": valores},
                     request)
     await db.commit()
+    await _invalidar_dashboard(emisor_id)
 
     return {"ok": True, "periodo": periodo, "valores": valores, "mensaje": "Valores guardados correctamente."}
 
