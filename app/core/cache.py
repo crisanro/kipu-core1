@@ -7,6 +7,7 @@ Servicio de caché Redis para Kipu.
 """
 import json
 import logging
+import re
 from typing import Any, Optional
 import redis.asyncio as aioredis
 from app.core.config import settings
@@ -51,6 +52,30 @@ class CK:
         return template.format(**kwargs)
 
 
+# Familias de claves que pertenecen a un emisor.
+# Formato esperado: "<familia>:<emisor_id>" o "<familia>:<emisor_id>:<lo que sea>"
+_FAMILIAS_EMISOR = (
+    "emisor",
+    "dashboard",
+    "dashboard_header",
+    "clientes",
+    "cliente",
+    "estructura",
+    "apikeys",
+    "status",
+    "factura",
+    "historial",
+    "cuentas",
+    "proformas",
+    "proforma",
+    "notificaciones",
+    "productos",
+    "empresa",
+)
+
+_LOTE_BORRADO = 500
+
+
 # ── Conexión singleton ─────────────────────────────────────────────────────────
 _redis_client: Optional[aioredis.Redis] = None
 
@@ -72,6 +97,16 @@ async def close_redis():
     if _redis_client:
         await _redis_client.aclose()
         _redis_client = None
+
+
+# ── Helpers internos ───────────────────────────────────────────────────────────
+
+async def _unlink_en_lotes(r: aioredis.Redis, keys: list[str]) -> int:
+    """UNLINK no bloquea Redis (libera memoria en segundo plano)."""
+    total = 0
+    for i in range(0, len(keys), _LOTE_BORRADO):
+        total += await r.unlink(*keys[i:i + _LOTE_BORRADO])
+    return total
 
 
 # ── Helpers públicos ───────────────────────────────────────────────────────────
@@ -100,6 +135,8 @@ async def cache_set(key: str, value: Any, ttl: int) -> bool:
 
 async def cache_delete(*keys: str) -> int:
     """Elimina una o más claves. Retorna el número borrado."""
+    if not keys:
+        return 0
     try:
         r = await get_redis()
         return await r.delete(*keys)
@@ -111,34 +148,36 @@ async def cache_delete(*keys: str) -> int:
 async def cache_clear_prefix(prefix: str) -> int:
     """
     Borra todas las claves que empiecen con 'prefix*'.
-    Usa SCAN para no bloquear Redis en producción.
+    Usa SCAN para no bloquear Redis y UNLINK en lotes.
+    OJO: termina el prefijo con ':' si no quieres que 'x:1' borre también 'x:10'.
     """
     try:
-        r = await get_redis()
-        deleted = 0
-        async for key in r.scan_iter(f"{prefix}*"):
-            await r.delete(key)
-            deleted += 1
-        return deleted
+        r    = await get_redis()
+        keys = [k async for k in r.scan_iter(match=f"{prefix}*", count=500)]
+        if not keys:
+            return 0
+        return await _unlink_en_lotes(r, keys)
     except Exception as e:
         logger.warning(f"[CACHE] CLEAR PREFIX error ({prefix}*): {e}")
         return 0
 
 
-async def invalidate_emisor(emisor_id: int):
+async def invalidate_emisor(emisor_id: int) -> int:
     """
-    Invalida TODO el cache relacionado a un emisor.
-    Llamar después de cualquier mutación (PATCH config, subir firma, etc.)
+    Invalida TODO el cache relacionado a un emisor, en un solo recorrido de Redis.
+    Coincidencia exacta del ID: invalidar el emisor 1 NO toca el 10 ni el 100.
+    Llamar después de cualquier mutación (PATCH config, subir firma, pagos, etc.)
     """
-    await cache_clear_prefix(f"emisor:{emisor_id}")
-    await cache_clear_prefix(f"dashboard:{emisor_id}")
-    await cache_clear_prefix(f"dashboard_header:{emisor_id}")
-    await cache_clear_prefix(f"clientes:{emisor_id}")
-    await cache_clear_prefix(f"estructura:{emisor_id}")
-    await cache_clear_prefix(f"apikeys:{emisor_id}")
-    await cache_clear_prefix(f"status:{emisor_id}")
-    await cache_clear_prefix(f"factura:{emisor_id}")
-    await cache_clear_prefix(f"historial:{emisor_id}")
-    await cache_clear_prefix(f"cuentas:{emisor_id}")
-    await cache_clear_prefix(f"proformas:{emisor_id}")
-    await cache_clear_prefix(f"proforma:{emisor_id}")
+    try:
+        eid    = int(emisor_id)
+        patron = re.compile(rf"^(?:{'|'.join(_FAMILIAS_EMISOR)}):{eid}(?::|$)")
+        r      = await get_redis()
+        keys   = [k async for k in r.scan_iter(match="*", count=1000) if patron.match(k)]
+        if not keys:
+            return 0
+        borradas = await _unlink_en_lotes(r, keys)
+        logger.info(f"[CACHE] Emisor {eid}: {borradas} claves invalidadas")
+        return borradas
+    except Exception as e:
+        logger.warning(f"[CACHE] INVALIDATE EMISOR error ({emisor_id}): {e}")
+        return 0

@@ -56,6 +56,7 @@ from app.api.v1.public import (
 
 # ─── ROUTERS ADMIN ────────────────────────────────────────────────────────────
 from app.api.v1.admin import (
+    diagnostico as diagnostico_router,
     integraciones as integraciones_admin,
     panel         as panel_admin,
     stripe_webhook,
@@ -387,6 +388,7 @@ app.include_router(dev_docs_public.router,      prefix="/api/v1/public",        
 app.include_router(integraciones_admin.router, prefix="/api/v1/admin",         tags=["🔧 Admin - Integraciones"])
 app.include_router(panel_admin.router,         prefix="/api/v1/admin/panel",   tags=["🔧 Admin - Panel"])
 app.include_router(stripe_webhook.router,      prefix="/api/v1/admin/stripe",  tags=["💳 Stripe"])
+app.include_router(diagnostico_router.router,  prefix="/api/v1/admin/panel",  tags=["🔧 Admin - Diagnóstico"])
 
 
 # =============================================================================

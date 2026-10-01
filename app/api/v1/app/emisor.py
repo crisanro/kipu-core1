@@ -440,7 +440,7 @@ async def update_config(
             update_data[k] = mayusculas(v)
         else:
             update_data[k] = v
-            
+
     if not update_data:
         return {"ok": True, "mensaje": "NO SE DETECTARON CAMBIOS."}
 
@@ -482,7 +482,8 @@ async def activar_produccion(
     verificar_admin(auth_data)
 
     res = await db.execute(text("""
-        SELECT ruc, ambiente, p12_path, p12_expiration FROM emisores WHERE id = :eid
+        SELECT ruc, ambiente, p12_path, p12_expiration, periodo_iva, regimen_rimpe
+        FROM emisores WHERE id = :eid
     """), {"eid": emisor_id})
     emisor = res.fetchone()
     if not emisor:
@@ -496,9 +497,12 @@ async def activar_produccion(
 
     await validar_y_quemar_pin(db, emisor_id, pin, "ACTIVAR_PRODUCCION")
 
-    try:
-        from app.workers.declaraciones_worker import calcular_vencimiento
+    from app.services.declaraciones import periodos as per
+    from app.services.declaraciones.obligaciones import normalizar_regimen, REGIMEN_RIMPE_POPULAR
 
+    hoy = per.hoy_ec()
+
+    try:
         await db.execute(text("""
             UPDATE user_credits SET balance = 25, last_updated = NOW() WHERE emisor_id = :eid
         """), {"eid": emisor_id})
@@ -506,18 +510,16 @@ async def activar_produccion(
             INSERT INTO credit_transactions (emisor_id, tipo, cantidad, precio_total, metodo_pago, notas)
             VALUES (:eid, 'BONO', 25, 0.00, 'SISTEMA', 'BONO DE BIENVENIDA A PRODUCCIÓN')
         """), {"eid": emisor_id})
-        await db.execute(text("""
-            UPDATE emisores SET ambiente = 2, updated_at = NOW() WHERE id = :eid
-        """), {"eid": emisor_id})
 
-        hoy            = date.today()
-        periodo_inicio = date(hoy.year, hoy.month, 1)
-        vencimiento    = calcular_vencimiento(emisor.ruc, periodo_inicio)
+        # Desde hoy existen sus periodos tributarios. Las filas de declaraciones
+        # se crean solas por calendario (ya no se inserta una fila suelta aquí).
         await db.execute(text("""
-            INSERT INTO declaraciones_sri (emisor_id, tipo, periodo, vencimiento, declarado)
-            VALUES (:eid, '104', :periodo, :vencimiento, false)
-            ON CONFLICT (emisor_id, tipo, periodo) DO NOTHING
-        """), {"eid": emisor_id, "periodo": periodo_inicio, "vencimiento": vencimiento})
+            UPDATE emisores
+            SET ambiente                = 2,
+                fecha_inicio_produccion = COALESCE(fecha_inicio_produccion, :hoy),
+                updated_at              = NOW()
+            WHERE id = :eid
+        """), {"eid": emisor_id, "hoy": hoy})
 
         await audit_log(
             db        = db,
@@ -537,12 +539,24 @@ async def activar_produccion(
 
         try:
             from app.services.notification_service import crear_notificacion
+
+            if normalizar_regimen(emisor.regimen_rimpe) == REGIMEN_RIMPE_POPULAR:
+                mensaje = "Tu cuenta está lista. Tienes 25 créditos para empezar."
+            else:
+                # Primer periodo de IVA: el que empieza hoy
+                primero = per.crear_periodo("104", emisor.periodo_iva or "MENSUAL", hoy)
+                vence   = per.vencimiento(emisor.ruc, primero)
+                mensaje = (
+                    f"Tu cuenta está lista. Tienes 25 créditos y tu primera declaración de IVA "
+                    f"({primero.nombre}) vence el {per.fecha_larga(vence)}."
+                )
+
             await crear_notificacion(
                 db        = db,
                 emisor_id = emisor_id,
                 tipo      = "SISTEMA",
                 titulo    = "🎉 ¡Bienvenido a Producción!",
-                mensaje   = f"Tu cuenta está lista. Tienes 25 créditos y tu primera declaración vence el {vencimiento.strftime('%d de %B')}.",
+                mensaje   = mensaje,
                 referencia = "/dashboard",
             )
         except Exception as e:

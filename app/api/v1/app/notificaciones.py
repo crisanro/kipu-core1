@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
@@ -10,9 +10,16 @@ from app.core.cache import cache_get, cache_set, cache_delete
 
 router = APIRouter()
 
+
 class FCMTokenRequest(BaseModel):
-    token:     str
+    token:     str           = Field(..., min_length=20, max_length=4096)
     device_id: Optional[str] = "default"
+
+
+class FCMBajaRequest(BaseModel):
+    device_id: Optional[str] = None
+    token:     Optional[str] = None
+
 
 @router.get("", summary="Listar notificaciones del emisor")
 async def listar_notificaciones(
@@ -56,7 +63,7 @@ async def listar_notificaciones(
             for r in rows
         ]
     }
-    
+
     await cache_set(cache_key, result, 60)  # 1 min
     return result
 
@@ -113,19 +120,27 @@ async def registrar_fcm_token(
     if not profile_id:
         raise HTTPException(status_code=400, detail="Perfil no encontrado.")
 
-    device_id = data.device_id or "default"
+    pid       = str(profile_id)
+    device_id = (data.device_id or "default")[:100]
+
+    # El token FCM es POR NAVEGADOR. Si otro usuario inició sesión antes en este
+    # mismo navegador, su registro con este token se elimina: así no recibe
+    # aquí las notificaciones de sus empresas.
+    res_ajenos = await db.execute(text("""
+        DELETE FROM fcm_tokens
+        WHERE token = :token AND profile_id <> :pid
+        RETURNING emisor_id
+    """), {"token": data.token, "pid": pid})
+    ajenos = res_ajenos.fetchall()
 
     # Obtener TODAS las empresas del usuario
     res = await db.execute(text("""
         SELECT emisor_id FROM emisor_usuarios
         WHERE profile_id = :pid
-    """), {"pid": str(profile_id)})
+    """), {"pid": pid})
     emisor_ids = [r.emisor_id for r in res.fetchall()]
 
-    if not emisor_ids:
-        return {"ok": True, "empresas_registradas": 0}
-
-    # Registrar token para cada empresa e invalidar su caché de notificaciones
+    # Registrar token para cada empresa
     for emisor_id in emisor_ids:
         await db.execute(text("""
             INSERT INTO fcm_tokens (profile_id, emisor_id, token, device_id, updated_at)
@@ -133,13 +148,48 @@ async def registrar_fcm_token(
             ON CONFLICT (profile_id, emisor_id, device_id)
             DO UPDATE SET token = :token, updated_at = NOW()
         """), {
-            "pid":   str(profile_id),
+            "pid":   pid,
             "eid":   emisor_id,
             "token": data.token,
             "did":   device_id,
         })
-        await cache_delete(f"notificaciones:{emisor_id}")
 
     await db.commit()
+
+    if ajenos:
+        print(f"[FCM] 🔄 Token reasignado: {len(ajenos)} registro(s) de otro usuario eliminados")
     print(f"[FCM] ✅ Token registrado en {len(emisor_ids)} empresas — device: {device_id[:8]}...")
     return {"ok": True, "empresas_registradas": len(emisor_ids)}
+
+
+@router.post("/fcm-token/baja", summary="Dar de baja el token FCM de este dispositivo (logout)")
+async def baja_fcm_token(
+    data:      FCMBajaRequest,
+    auth_data: dict          = Depends(verify_firebase_token),
+    db:        AsyncSession = Depends(get_db),
+):
+    profile_id = auth_data.get("profile_id")
+    if not profile_id:
+        return {"ok": True, "eliminados": 0}
+
+    if not data.device_id and not data.token:
+        raise HTTPException(status_code=400, detail="Se requiere device_id o token.")
+
+    res = await db.execute(text("""
+        DELETE FROM fcm_tokens
+        WHERE profile_id = :pid
+          AND (
+                (CAST(:did AS text)   IS NOT NULL AND device_id = :did)
+             OR (CAST(:token AS text) IS NOT NULL AND token     = :token)
+          )
+        RETURNING id
+    """), {
+        "pid":   str(profile_id),
+        "did":   data.device_id,
+        "token": data.token,
+    })
+    eliminados = len(res.fetchall())
+    await db.commit()
+
+    print(f"[FCM] 👋 Baja de dispositivo: {eliminados} registro(s) eliminados")
+    return {"ok": True, "eliminados": eliminados}

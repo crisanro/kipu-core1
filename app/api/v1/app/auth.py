@@ -5,6 +5,7 @@ import json
 import hashlib
 import zipfile
 import io
+import asyncio
 from datetime import datetime, date
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
@@ -24,6 +25,10 @@ from app.core.security import validar_y_quemar_pin
 
 router = APIRouter()
 
+# A dónde vuelve el usuario después de verificar / resetear
+VERIFY_CONTINUE_URL = "https://app.kipu.ec"
+RESET_CONTINUE_URL  = "https://app.kipu.ec/"
+
 
 # ── Send Verification ─────────────────────────────────────────────────────────
 @router.post("/send-verification")
@@ -33,7 +38,9 @@ async def send_verification(
     # Rate limit: 10 requests/min por IP (protege contra spam de emails)
     _rl: None = Depends(RateLimit(RateLimitScope.RESET, use_ip=True)),
 ):
-    email = auth_data["email"]
+    email = (auth_data.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="La cuenta no tiene correo asociado.")
 
     # Anti-spam en DB (1 por minuto)
     res = await db.execute(text("""
@@ -44,12 +51,38 @@ async def send_verification(
         raise HTTPException(status_code=429, detail="Ya enviamos un correo. Espera 1 minuto.")
 
     try:
-        user_record = auth.get_user_by_email(email)
-        if user_record.email_verified:
-            raise HTTPException(status_code=400, detail="El correo ya fue verificado.")
+        user_record = await asyncio.to_thread(auth.get_user_by_email, email)
     except auth.UserNotFoundError:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
 
+    if user_record.email_verified:
+        raise HTTPException(status_code=400, detail="El correo ya fue verificado.")
+
+    # Generar link
+    try:
+        link = await asyncio.to_thread(
+            auth.generate_email_verification_link,
+            email,
+            auth.ActionCodeSettings(url=VERIFY_CONTINUE_URL, handle_code_in_app=False),
+        )
+    except Exception as e:
+        print(f"[VERIFY] ❌ Error generando link para {email}: {e}")
+        raise HTTPException(status_code=502, detail="No se pudo generar el enlace de verificación.")
+
+    # Enviar — y ESTA VEZ revisamos el resultado
+    envio = await mail_service.send_link_verificacion(
+        email  = email,
+        link   = link,
+        nombre = user_record.display_name,
+    )
+    if not envio.get("exito"):
+        print(f"[VERIFY] ❌ SMTP falló para {email}: {envio}")
+        raise HTTPException(
+            status_code=502,
+            detail="No pudimos enviar el correo de verificación. Intenta de nuevo en unos minutos.",
+        )
+
+    # Rate limit solo cuando realmente se envió
     await db.execute(text("""
         INSERT INTO email_rate_limits (email, last_sent)
         VALUES (:email, NOW())
@@ -57,36 +90,8 @@ async def send_verification(
     """), {"email": email})
     await db.commit()
 
-    link = auth.generate_email_verification_link(
-        email,
-        auth.ActionCodeSettings(url="https://app.kipu.ec", handle_code_in_app=False)
-    )
-    html = f"""
-        <h2>Bienvenido a Kipu 👋</h2>
-        <p>Haz clic para verificar tu cuenta:</p>
-        <a href='{link}' style='background:#4F46E5;color:white;padding:12px 24px;
-        text-decoration:none;border-radius:6px;display:inline-block;'>
-        Verificar cuenta</a>
-        <p style='color:#666;font-size:12px;margin-top:16px;'>
-        Si no solicitaste esto, ignora este correo.</p>
-    """
-    await mail_service.send_mail(to=email, subject="Verifica tu cuenta en Kipu", html_content=html)
+    print(f"[VERIFY] 📧 Verificación enviada a {email}")
     return {"ok": True, "mensaje": "Correo de verificación enviado."}
-
-
-# ── Reset Password ─────────────────────────────────────────────────────────────
-@router.post("/reset")
-async def reset_password(
-    data: ResetPasswordRequest,
-    _rl: None = Depends(RateLimit(RateLimitScope.RESET, use_ip=True)),
-):
-    link = auth.generate_password_reset_link(
-        data.email,
-        auth.ActionCodeSettings(url="https://kipu.ec/login", handle_code_in_app=False)
-    )
-    html = f"<h2>Recuperación</h2><p>Haz clic para restablecer:</p><a href='{link}'>Restablecer</a>"
-    await mail_service.send_mail(to=data.email, subject="Recupera tu cuenta", html_content=html)
-    return {"ok": True}
 
 
 # ── Reset Password ─────────────────────────────────────────────────────────────
@@ -96,33 +101,24 @@ async def reset_password(
     request: Request,
     _rl: None = Depends(RateLimit(RateLimitScope.AUTH, use_ip=True)),
 ):
-    # Anti-spam adicional — 1 por minuto por IP a nivel de código
-    client_ip = request.client.host
-    # El rate limit de RateLimitScope.AUTH ya limita por IP
-    # Solo generamos el link sin verificar si el email existe
-    # (por seguridad no revelamos si el email está registrado o no)
+    # Por seguridad no revelamos si el email está registrado o no:
+    # siempre respondemos lo mismo, y los errores solo van al log.
+    email = (data.email or "").strip().lower()
     try:
-        link = auth.generate_password_reset_link(
-            data.email,
-            auth.ActionCodeSettings(url="https://app.kipu.ec/", handle_code_in_app=False)
+        link = await asyncio.to_thread(
+            auth.generate_password_reset_link,
+            email,
+            auth.ActionCodeSettings(url=RESET_CONTINUE_URL, handle_code_in_app=False),
         )
-        html = f"""
-            <h2>Recuperación de contraseña</h2>
-            <p>Haz clic para restablecer tu contraseña:</p>
-            <a href='{link}' style='background:#4F46E5;color:white;padding:12px 24px;
-            text-decoration:none;border-radius:6px;display:inline-block;'>
-            Restablecer contraseña</a>
-            <p style='color:#666;font-size:12px;margin-top:16px;'>
-            Si no solicitaste esto, ignora este correo.</p>
-        """
-        await mail_service.send_mail(
-            to=data.email,
-            subject="Recupera tu contraseña en Kipu",
-            html_content=html
-        )
+        envio = await mail_service.send_link_password(email=email, link=link)
+        if not envio.get("exito"):
+            print(f"[RESET] ❌ SMTP falló para {email}: {envio}")
+        else:
+            print(f"[RESET] 📧 Link de recuperación enviado a {email}")
+    except auth.UserNotFoundError:
+        print(f"[RESET] Email no registrado: {email}")
     except Exception as e:
-        # No revelamos si el email existe o no — siempre retornamos ok
-        print(f"[RESET] Error: {e}")
+        print(f"[RESET] ❌ Error: {e}")
 
     return {"ok": True, "mensaje": "Si el correo existe, recibirás un enlace en breve."}
 

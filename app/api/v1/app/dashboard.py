@@ -9,6 +9,9 @@ from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.services.dashboard_service import obtener_dashboard_core
 from app.core.cache import cache_get, cache_set, CK, TTL
+from app.services.declaraciones import periodos as per
+from app.services.declaraciones import registro
+from app.services.declaraciones.obligaciones import cargar_obligaciones
 
 router = APIRouter()
 
@@ -21,7 +24,6 @@ async def get_dashboard(
     auth_data:    dict         = Depends(verify_firebase_token),
     db:           AsyncSession = Depends(get_db),
 ):
-    #print(f"[Dashboard] sandbox={sandbox}, emisor_id={auth_data.get('emisor_id')}")
     emisor_id = auth_data.get("emisor_id")
 
     email_verificado = False
@@ -32,9 +34,7 @@ async def get_dashboard(
         pass
 
     cache_key = CK.fmt(CK.DASHBOARD, eid=emisor_id, fi=fecha_inicio, ff=fecha_fin, sb=sandbox)
-    #print(f"[Dashboard] cache_key={cache_key}")
     cached    = await cache_get(cache_key)
-    #print(f"[Dashboard] cache hit={cached is not None}")   
     if cached:
         return cached
 
@@ -45,14 +45,14 @@ async def get_dashboard(
         email_verificado = email_verificado,
         fecha_inicio     = fecha_inicio,
         fecha_fin        = fecha_fin,
-        sandbox          = sandbox, 
+        sandbox          = sandbox,
         db               = db,
     )
 
     if not result.get("ok"):
         return result
 
-    # Declaración actual — incluida en la misma llamada
+    # Declaración que toca declarar — incluida en la misma llamada
     declaracion = await _obtener_declaracion_actual(emisor_id, db)
     result["data"]["declaracion"] = declaracion
 
@@ -69,51 +69,46 @@ async def get_dashboard(
 # =============================================================================
 
 async def _obtener_declaracion_actual(emisor_id: int | None, db: AsyncSession):
-    """Declaración IVA del mes actual — mismo cálculo que /declaraciones/actual."""
+    """
+    IVA que toca declarar ahora (el último periodo cerrado), con el mismo servicio
+    que /reportes y /declaraciones/actual.
+
+    Antes buscaba la fila del mes EN CURSO, que solo existía si la empresa había
+    activado producción ese mes: por eso a unos les aparecía y a otros no.
+    """
     if not emisor_id:
         return None
     try:
-        hoy    = date.today()
-        primer = hoy.replace(day=1)
-        res    = await db.execute(text("""
-            SELECT
-                tipo, periodo, vencimiento, declarado,
-                fecha_declarado, totales
-            FROM declaraciones_sri
-            WHERE emisor_id = :eid
-              AND tipo      = '104'
-              AND periodo   = :periodo
-            LIMIT 1
-        """), {"eid": emisor_id, "periodo": primer})
-        row = res.fetchone()
-        if not row:
+        obl = await cargar_obligaciones(db, emisor_id)
+        if not obl or obl.motivo_no_aplica("104"):
             return None
-        venc           = row.vencimiento
-        dias_restantes = (venc - hoy).days if venc else 0
 
-        if row.declarado:
-            estado = "DECLARADO"
-        elif dias_restantes < 0:
-            estado = "VENCIDO"
-        elif dias_restantes <= 3:
-            estado = "URGENTE"
-        elif dias_restantes <= 10:
-            estado = "PROXIMO"
-        else:
-            estado = "PENDIENTE"
+        hoy = per.hoy_ec()
+        p   = per.periodo_a_declarar("104", obl.tipo_periodo("104"), hoy)
+        if not p.existe_para(obl.inicio, hoy):
+            return None   # entró a producción este mes: todavía no hay nada que declarar
 
+        await registro.asegurar_filas(db, obl, [p])
+        await db.commit()
+        filas = await registro.leer_filas(db, emisor_id, "104", [p])
+        item  = registro.serializar(p, filas[p.inicio], hoy)
+
+        venc = filas[p.inicio].vencimiento
         return {
             "aplica":          True,
-            "periodo":         row.periodo.strftime("%B %Y") if row.periodo else None,
-            "periodo_iso":     str(row.periodo),
-            "declarado":       row.declarado,
-            "fecha_declarado": str(row.fecha_declarado) if row.fecha_declarado else None,
-            "vencimiento":     str(venc),
-            "vencimiento_fmt": venc.strftime("%d/%m/%Y") if venc else None,
-            "dias_restantes":  dias_restantes,
-            "estado":          estado,
+            "tipo":            "104",
+            "periodo":         p.nombre,
+            "periodo_key":     p.key,
+            "periodo_iso":     p.inicio.isoformat(),
+            "declarado":       item["declarado"],
+            "fecha_declarado": item["fecha_declarado"],
+            "vencimiento":     item["vencimiento"],
+            "vencimiento_fmt": venc.strftime("%d/%m/%Y"),
+            "dias_restantes":  item["dias_restantes"],
+            "estado":          item["estado"],
         }
     except Exception as e:
+        await db.rollback()
         print(f"[Dashboard] ⚠️ Error declaración: {e}")
         return None
 

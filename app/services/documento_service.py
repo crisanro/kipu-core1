@@ -36,7 +36,12 @@ from app.utils.sri_core import (
 )
 from app.services.storage_service import upload_file
 from app.core.cache import get_redis
-from app.services.notification_service import crear_notificacion
+from app.services.notification_service import (
+    crear_notificacion,
+    encolar_notificacion,
+    despachar_notificaciones,
+    descartar_notificaciones,
+)
 
 
 TZ_EC = pytz.timezone("America/Guayaquil")
@@ -215,11 +220,18 @@ async def emitir_documento_core(
             doc_origen_recibido = doc_origen_recibido,
             es_sandbox          = es_sandbox,
             created_by          = created_by,
-            
+
             db                  = db,
         )
 
         await db.commit()
+
+        # Notificaciones diferidas (ej. stock bajo): solo ahora que la emisión
+        # quedó confirmada. Si fallan, NO afectan al documento ya emitido.
+        try:
+            await despachar_notificaciones(db)
+        except Exception as e:
+            print(f"[Notif] ⚠️ Error despachando notificaciones post-emisión: {e}")
 
         return {
             "ok":          True,
@@ -233,9 +245,11 @@ async def emitir_documento_core(
 
     except HTTPException:
         await db.rollback()
+        descartar_notificaciones(db)
         raise
     except Exception as e:
         await db.rollback()
+        descartar_notificaciones(db)
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error generando comprobante: {str(e)}")
 
@@ -1219,14 +1233,14 @@ async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
             codigo  = det.get("codigoPrincipal") or det.get("codigoAuxiliar")
             if not codigo or codigo == "S/C":
                 continue
-            cantidad = float(det.get("cantidad", 0))
+            cantidad = int(float(det.get("cantidad", 0)))
 
             res = await db.execute(text("""
                 UPDATE catalogo_items
                 SET stock = GREATEST(0, stock - :qty), updated_at = NOW()
                 WHERE emisor_id = :eid AND stock > 0 AND codigo = :cod
                 RETURNING id, descripcion, stock, stock_minimo
-            """), {"qty": int(cantidad), "eid": emisor_id, "cod": codigo})
+            """), {"qty": cantidad, "eid": emisor_id, "cod": codigo})
             item = res.fetchone()
 
             if not item:
@@ -1234,18 +1248,18 @@ async def _descontar_stock(datos_json: dict, emisor_id: int, db: AsyncSession):
 
             hubo_descuento = True
 
-            if item.stock_minimo > 0 and item.stock <= item.stock_minimo:
-                try:
-                    await crear_notificacion(
-                        db        = db,
-                        emisor_id = emisor_id,
-                        tipo      = "SISTEMA",
-                        titulo    = f"⚠️ Stock bajo: {item.descripcion}",
-                        mensaje   = f"Quedan {item.stock} unidades. Stock mínimo configurado: {item.stock_minimo}.",
-                        referencia = f"/productos/{str(item.id)}",
-                    )
-                except Exception as e:
-                    print(f"[Stock] ⚠️ Error notificando stock bajo: {e}")
+            # Avisar solo cuando ESTA venta cruza el mínimo (no en cada venta posterior)
+            stock_anterior = item.stock + cantidad
+            if item.stock_minimo > 0 and item.stock <= item.stock_minimo < stock_anterior:
+                # Diferida: se envía solo si la emisión hace commit
+                encolar_notificacion(
+                    db         = db,
+                    emisor_id  = emisor_id,
+                    tipo       = "SISTEMA",
+                    titulo     = f"⚠️ Stock bajo: {item.descripcion}",
+                    mensaje    = f"Quedan {item.stock} unidades. Stock mínimo configurado: {item.stock_minimo}.",
+                    referencia = f"/productos/{str(item.id)}",
+                )
 
         if hubo_descuento:
             from app.core.cache import cache_clear_prefix

@@ -63,6 +63,7 @@ class Emisor(Base):
     stripe_customer_id      = Column(String(50), nullable=True)
     created_at              = Column(TIMESTAMP(timezone=True), server_default=func.now())
     updated_at              = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+    fecha_inicio_produccion = Column(Date, nullable=True)
 
     subscription            = relationship("Subscription", back_populates="emisor", uselist=False)
     credits                 = relationship("UserCredits", back_populates="emisor", uselist=False)
@@ -691,6 +692,10 @@ class DeclaracionSRI(Base):
     declarado_por   = Column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True)
     totales         = Column(JSONB)                                 # cifras precalculadas
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    tipo_periodo        = Column(String(10), nullable=True)   # MENSUAL | SEMESTRAL | ANUAL
+    notif_disponible_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    notif_3dias_at      = Column(TIMESTAMP(timezone=True), nullable=True)
+    notif_hoy_at        = Column(TIMESTAMP(timezone=True), nullable=True)
 
     emisor          = relationship("Emisor", back_populates="declaraciones")
 
