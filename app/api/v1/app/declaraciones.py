@@ -111,7 +111,7 @@ async def obtener_obligaciones(
 @router.get("/actual", summary="Declaración que toca declarar ahora")
 async def obtener_declaracion_actual(
     tipo:      str          = Query("104", description="104 | 102 | ATS"),
-    auth_data: dict         = Depends(verify_firebase_token),
+    auth_data: dict          = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = _emisor(auth_data)
@@ -130,7 +130,6 @@ async def obtener_declaracion_actual(
 
     await registro.asegurar_filas(db, obl, [p])
 
-    # Totales del 104 en vivo, con el mismo cálculo del reporte
     if tipo == "104":
         calc    = await resultado_periodo(db, obl, p)
         totales = resumen_iva(calc)
@@ -302,23 +301,23 @@ async def marcar_declarado(
                     {"accion": "declarado", "tipo": tipo, "periodo": p.key}, request)
     await db.commit()
 
-    # 104: se congela la foto en este momento y se registra el lote de crédito tributario si aplica
     if tipo == "104":
         calc = await resultado_periodo(db, obl, p, forzar=True)
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
             casilleros=calc["casilleros"], preguntas=calc["preguntas"],
             desglose=calc["desglose"], resumen=calc["resumen"],
-            doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
+            doc_emitidos_ids=calc.get("doc_emitidos_ids") or set(), 
+            doc_recibidos_ids=calc.get("doc_recibidos_ids") or set(),
             profile_id=profile_id, regenerar=False,
         )
 
-        # Registro o actualización del lote de crédito en credito_tributario_lotes
         c602 = Decimal(str(calc["casilleros"]["resumen"].get("602", 0.0)))
         if c602 > 0:
             await registrar_lote_declaracion(db, emisor_id, p.inicio, c602)
             await db.commit()
 
+    await invalidate_emisor(emisor_id)
     await _invalidar_dashboard(emisor_id)
 
     return {
@@ -354,22 +353,23 @@ async def casilleros_iva(
     hoy = per.hoy_ec()
     en_curso = p.en_curso(hoy)
 
-    # 1. Intentar leer de Redis (si no viene la bandera ?regenerar=true)
     cache_key = CK.fmt(CK.DECLARACION_IVA, eid=emisor_id, periodo=periodo)
     if not regenerar:
         cached = await cache_get(cache_key)
         if cached is not None:
             return cached
 
-    # 2. Si no está en caché o pidió regenerar, calcular en vivo
     calc = await resultado_periodo(db, obl, p, forzar=regenerar)
+
+    doc_emitidos = calc.get("doc_emitidos_ids") or set()
+    doc_recibidos = calc.get("doc_recibidos_ids") or set()
 
     if not en_curso and not calc.get("congelado"):
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
             casilleros=calc["casilleros"], preguntas=calc["preguntas"],
             desglose=calc["desglose"], resumen=calc["resumen"],
-            doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
+            doc_emitidos_ids=doc_emitidos, doc_recibidos_ids=doc_recibidos,
             profile_id=profile_id, regenerar=regenerar,
         )
 
@@ -395,8 +395,8 @@ async def casilleros_iva(
         "en_curso":      en_curso,
         "generado_at":   calc.get("generado_at"),
         "regenerado_at": calc.get("regenerado_at"),
-        "total_doc_emitidos":  calc["total_doc_emitidos"],
-        "total_doc_recibidos": calc["total_doc_recibidos"],
+        "total_doc_emitidos":  calc.get("total_doc_emitidos", len(doc_emitidos)),
+        "total_doc_recibidos": calc.get("total_doc_recibidos", len(doc_recibidos)),
         "campos_manuales_valores": await snapshots.leer_campos_manuales(db, emisor_id, p.inicio),
         "data": {
             "periodo":   {"desde": p.inicio.isoformat(), "hasta": p.fin.isoformat(), "mes": periodo, "tipo": tp},
@@ -407,7 +407,6 @@ async def casilleros_iva(
         },
     }
 
-    # 3. Guardar en Redis por 5 minutos
     await cache_set(cache_key, response_payload, ttl=TTL.DECLARACION_IVA)
 
     return response_payload
@@ -456,7 +455,7 @@ async def guardar_campos_manuales_iva(
 
 
 # =============================================================================
-# GET /renta — Impuesto a la Renta anual
+# GET /renta — Impuesto a la Renta anual (Consolidado)
 # =============================================================================
 @router.get("/renta", summary="Impuesto a la Renta anual")
 async def casilleros_renta(
@@ -482,10 +481,18 @@ async def casilleros_renta(
     en_curso = p.en_curso(hoy)
     info_periodo = {"anio": anio, "desde": p.inicio.isoformat(), "hasta": p.fin.isoformat()}
 
+    # 1. Intentar leer de Redis (si no viene ?regenerar=true)
+    cache_key = f"declaracion:renta:{emisor_id}:{anio}"
+    if not regenerar:
+        cached_redis = await cache_get(cache_key)
+        if cached_redis is not None:
+            return cached_redis
+
+    # 2. Intentar responder desde snapshot congelado si no está en curso
     if not en_curso and not regenerar:
         cached = await snapshots.leer(db, emisor_id, "RENTA", p.inicio)
         if cached:
-            return {
+            response_payload = {
                 "ok":            True,
                 "cached":        True,
                 "generado_at":   cached.generado_at.isoformat() if cached.generado_at else None,
@@ -500,36 +507,46 @@ async def casilleros_renta(
                     "notas": ["Reporte generado previamente. Usa ?regenerar=true para recalcular."],
                 },
             }
+            await cache_set(cache_key, response_payload, ttl=300)
+            return response_payload
 
+    # 3. Recalcular consolidado anual
     calc = await calcular_renta_102(db, emisor_id, anio)
+
+    doc_emitidos = calc.get("doc_emitidos_ids") or set()
+    doc_recibidos = calc.get("doc_recibidos_ids") or set()
 
     if not en_curso:
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="RENTA", tipo_periodo="ANUAL", periodo_db=p.inicio,
-            casilleros=calc["casilleros"], preguntas=calc["preguntas"],
-            desglose=calc["desglose"], resumen=calc["resumen"],
-            doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
+            casilleros=calc.get("casilleros", {}), preguntas=calc.get("preguntas", {}),
+            desglose=calc.get("desglose", {}), resumen=calc.get("resumen", {}),
+            doc_emitidos_ids=doc_emitidos, doc_recibidos_ids=doc_recibidos,
             profile_id=profile_id, regenerar=regenerar,
         )
 
-    return {
+    response_payload = {
         "ok":        True,
         "cached":    False,
-        "en_curso": en_curso,
-        "total_doc_emitidos":  len(calc["doc_emitidos_ids"]),
-        "total_doc_recibidos": len(calc["doc_recibidos_ids"]),
+        "en_curso":  en_curso,
+        "total_doc_emitidos":  calc.get("total_doc_emitidos", len(doc_emitidos)),
+        "total_doc_recibidos": calc.get("total_doc_recibidos", len(doc_recibidos)),
         "data": {
             "periodo":   info_periodo,
-            "preguntas": calc["preguntas"],
-            **calc["desglose"],
-            "resumen":   calc["resumen"],
+            "preguntas": calc.get("preguntas", {}),
+            **calc.get("desglose", {}),
+            "resumen":   calc.get("resumen", {}),
             "notas": [
-                "La tabla de IR corresponde a personas naturales — verifica con la resolución SRI del año.",
-                "Los gastos personales (salud, educación, etc.) deben ingresarse manualmente.",
-                "Ingresos de otras fuentes (arrendamientos, relación de dependencia) no están incluidos.",
+                "Consolidado anual de facturación electrónica registrada en Kipu.",
+                "Los ingresos por relación de dependencia, arrendamientos u otros deben agregarse en el SRI.",
+                "Los gastos personales deben ingresarse manualmente en el portal del SRI.",
             ] + (["⚠️ Año en curso — los valores son preliminares."] if en_curso else []),
         },
     }
+
+    await cache_set(cache_key, response_payload, ttl=300)
+
+    return response_payload
 
 
 # =============================================================================
@@ -583,35 +600,38 @@ async def casilleros_ats(
                 "total_doc_emitidos":  cached.total_doc_emitidos,
                 "total_doc_recibidos": cached.total_doc_recibidos,
                 "data": {
-                    "periodo":  info_periodo,
+                    "periodo": info_periodo,
                     **cached.desglose,
-                    "resumen":  cached.resumen,
-                    "notas": ["Reporte generado previamente. Usa ?regenerar=true para recalcular."],
+                    "resumen": cached.resumen,
+                    "notas":   ["Reporte generado previamente. Usa ?regenerar=true para recalcular."],
                 },
             }
 
     calc = await calcular_ats(db, emisor, emisor_id, p.inicio, p.fin)
 
+    doc_emitidos = calc.get("doc_emitidos_ids") or set()
+    doc_recibidos = calc.get("doc_recibidos_ids") or set()
+
     if not en_curso:
         await snapshots.guardar(
             db, emisor_id=emisor_id, tipo="ATS", tipo_periodo="MENSUAL", periodo_db=p.inicio,
-            casilleros={}, preguntas=calc["preguntas"],
-            desglose=calc["desglose"], resumen=calc["resumen"],
-            doc_emitidos_ids=calc["doc_emitidos_ids"], doc_recibidos_ids=calc["doc_recibidos_ids"],
+            casilleros={}, preguntas=calc.get("preguntas", {}),
+            desglose=calc.get("desglose", {}), resumen=calc.get("resumen", {}),
+            doc_emitidos_ids=doc_emitidos, doc_recibidos_ids=doc_recibidos,
             profile_id=profile_id, regenerar=regenerar,
         )
 
     return {
         "ok":        True,
         "cached":    False,
-        "en_curso": en_curso,
-        "total_doc_emitidos":  len(calc["doc_emitidos_ids"]),
-        "total_doc_recibidos": len(calc["doc_recibidos_ids"]),
+        "en_curso":  en_curso,
+        "total_doc_emitidos":  calc.get("total_doc_emitidos", len(doc_emitidos)),
+        "total_doc_recibidos": calc.get("total_doc_recibidos", len(doc_recibidos)),
         "data": {
             "periodo":   info_periodo,
-            "preguntas": calc["preguntas"],
-            **calc["desglose"],
-            "resumen":   calc["resumen"],
+            "preguntas": calc.get("preguntas", {}),
+            **calc.get("desglose", {}),
+            "resumen":   calc.get("resumen", {}),
             "notas": [
                 "El ATS incluye todos los comprobantes del periodo — emitidos y recibidos.",
                 "Los documentos físicos (fuente=FISICO) están incluidos con clave sintética.",

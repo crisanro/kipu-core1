@@ -1,213 +1,217 @@
 # app/services/declaraciones/renta_102.py
 #
-# Impuesto a la Renta anual.
-#
-# FASE 1: fórmulas y numeración movidas SIN CAMBIOS desde el router.
-# Pendiente fase 3 (validado contra una declaración real 2025):
-#   - numeración real del 102 para persona natural no obligada:
-#     611/612/613 ingresos, 631 gastos, 749/832 base, 839 causado,
-#     845 retenciones, 855/856, 868 a pagar, 869 saldo a favor
-#   - LIQ emitidas no son ingresos
-#   - tabla IR por año (hoy fija 2025)
-#   - gastos personales 773–777 y rebaja 828
-#   - saldo a favor con vencimiento de 3 años (art. 47 LRTI)
+# Consolidado Anual Informativo para Impuesto a la Renta.
+# Muestra las cifras acumuladas de la facturación electrónica del año
+# sin asumir responsabilidades de cálculo completo de personas naturales.
 
 from datetime import date
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Tabla progresiva IR personas naturales 2025 (SRI)
-TABLA_IR = [
-    {"desde": 0,       "hasta": 11902,  "base": 0,     "porcentaje": 0},
-    {"desde": 11902,   "hasta": 15159,  "base": 0,     "porcentaje": 5},
-    {"desde": 15159,   "hasta": 19682,  "base": 163,   "porcentaje": 10},
-    {"desde": 19682,   "hasta": 26031,  "base": 615,   "porcentaje": 12},
-    {"desde": 26031,   "hasta": 34255,  "base": 1377,  "porcentaje": 15},
-    {"desde": 34255,   "hasta": 45407,  "base": 2611,  "porcentaje": 20},
-    {"desde": 45407,   "hasta": 60450,  "base": 4841,  "porcentaje": 25},
-    {"desde": 60450,   "hasta": 80605,  "base": 8602,  "porcentaje": 30},
-    {"desde": 80605,   "hasta": 107199, "base": 14648, "porcentaje": 35},
-    {"desde": 107199,  "hasta": float("inf"), "base": 23957, "porcentaje": 37},
-]
-
 
 async def calcular_renta_102(db: AsyncSession, emisor_id: int, anio: int) -> dict:
     """
-    Devuelve:
-      preguntas, casilleros, desglose, resumen, doc_emitidos_ids, doc_recibidos_ids
+    Consolidado Anual Informativo para Impuesto a la Renta.
+    Extrae los totales de comprobantes emitidos y recibidos del año.
+    Devuelve la estructura completa necesaria para el router y la UI.
     """
     fi = date(anio, 1, 1)
     ff = date(anio, 12, 31)
+    params = {"eid": emisor_id, "fi": fi, "ff": ff}
 
-    # INGRESOS — FAC + LIQ autorizados del año
-    res_ingresos = await db.execute(text("""
-        SELECT
-            d.id,
-            (imp->>'tarifa')::numeric                 AS tarifa,
-            SUM((imp->>'baseImponible')::numeric)     AS subtotal,
-            SUM(d.importe_total)                      AS total
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array'
-                     THEN d.datos->'resumenImpuestos'
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      IN ('FAC', 'LIQ')
-        GROUP BY d.id, (imp->>'tarifa')::numeric
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
-    ingresos_brutos  = 0.0
     doc_emitidos_ids = set()
-    for r in res_ingresos.fetchall():
+    doc_recibidos_ids = set()
+
+    # 1. VENTAS EMITIDAS (FAC + NDB)
+    res_vta = await db.execute(text("""
+        SELECT id, COALESCE(importe_total, 0) AS bruto
+        FROM documentos_emitidos
+        WHERE emisor_id     = :eid
+          AND estado_sri    = 'AUTORIZADO'
+          AND es_sandbox    = false
+          AND fecha_emision BETWEEN :fi AND :ff
+          AND tipo_doc      IN ('FAC', 'NDB')
+    """), params)
+    
+    ventas_brutas = 0.0
+    for r in res_vta.fetchall():
         doc_emitidos_ids.add(str(r.id))
-        ingresos_brutos += float(r.subtotal or 0)
+        ventas_brutas += float(r.bruto or 0)
 
-    # NCR emitidas — reducen ingresos
+    # 2. NOTAS DE CRÉDITO EMITIDAS
     res_ncr = await db.execute(text("""
-        SELECT
-            d.id,
-            SUM((imp->>'baseImponible')::numeric) AS subtotal
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array'
-                     THEN d.datos->'resumenImpuestos'
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      = 'NCR'
-        GROUP BY d.id
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
-    ncr_total = 0.0
+        SELECT id, COALESCE(importe_total, 0) AS ncr
+        FROM documentos_emitidos
+        WHERE emisor_id     = :eid
+          AND estado_sri    = 'AUTORIZADO'
+          AND es_sandbox    = false
+          AND fecha_emision BETWEEN :fi AND :ff
+          AND tipo_doc      = 'NCR'
+    """), params)
+    
+    ncr_emitidas = 0.0
     for r in res_ncr.fetchall():
         doc_emitidos_ids.add(str(r.id))
-        ncr_total += float(r.subtotal or 0)
+        ncr_emitidas += float(r.ncr or 0)
+        
+    ventas_netas = round(max(ventas_brutas - ncr_emitidas, 0.0), 2)
 
-    ingresos_netos = round(ingresos_brutos - ncr_total, 2)
-
-    # GASTOS DEDUCIBLES — columnas desnormalizadas
-    res_gastos = await db.execute(text("""
-        SELECT id, subtotal_base AS subtotal
+    # 3. COMPRAS RECIBIDAS (Deducibles)
+    res_compras = await db.execute(text("""
+        SELECT id, COALESCE(subtotal_base, 0) AS deducibles
         FROM documentos_recibidos
         WHERE emisor_id       = :eid
           AND fecha_emision   BETWEEN :fi AND :ff
           AND deducible_renta = true
-          AND tipo_doc        IN ('FAC', 'LIQ')
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
-    gastos_deducibles = 0.0
-    doc_recibidos_ids = set()
-    for r in res_gastos.fetchall():
+          AND tipo_doc        IN ('FAC', 'LIQ', 'NDB')
+    """), params)
+    
+    compras_recibidas = 0.0
+    for r in res_compras.fetchall():
         doc_recibidos_ids.add(str(r.id))
-        gastos_deducibles += float(r.subtotal or 0)
-    gastos_deducibles = round(gastos_deducibles, 2)
+        compras_recibidas += float(r.deducibles or 0)
 
-    # RETENCIONES DE RENTA recibidas — items_detalle
-    res_ret_renta = await db.execute(text("""
-        SELECT
-            d.id,
-            SUM((item->>'total')::numeric) AS valor
-        FROM documentos_recibidos d,
-             jsonb_array_elements(d.items_detalle) AS item
+    # 4. LIQUIDACIONES DE COMPRA EMITIDAS (Son gastos/compras de la empresa)
+    res_liq = await db.execute(text("""
+        SELECT id, COALESCE(importe_total, 0) AS total
+        FROM documentos_emitidos
+        WHERE emisor_id     = :eid
+          AND estado_sri    = 'AUTORIZADO'
+          AND es_sandbox    = false
+          AND fecha_emision BETWEEN :fi AND :ff
+          AND tipo_doc      = 'LIQ'
+    """), params)
+    
+    liquidaciones_emitidas = 0.0
+    for r in res_liq.fetchall():
+        doc_emitidos_ids.add(str(r.id))
+        liquidaciones_emitidas += float(r.total or 0)
+        
+    gastos_deducibles_totales = round(compras_recibidas + liquidaciones_emitidas, 2)
+
+    # 5. RETENCIONES DE RENTA RECIBIDAS (De tus clientes - Crédito Tributario)
+    res_ret_rec = await db.execute(text("""
+        SELECT d.id, COALESCE(
+            CASE 
+                WHEN tipo_doc = 'RET' THEN subtotal_base
+                ELSE COALESCE((item->>'valorRetenido')::numeric, 0)
+            END, 0) AS total
+        FROM documentos_recibidos d
+        LEFT JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
+        ) AS item ON true
         WHERE d.emisor_id     = :eid
+          AND d.tipo_doc      = 'RET'
+          AND d.fecha_emision BETWEEN :fi AND :ff
+          AND (item->>'codigo_impuesto' = '1' OR item->>'codigo' = '1' OR d.tipo_doc = 'RET')
+    """), params)
+    
+    retenciones_recibidas = 0.0
+    for r in res_ret_rec.fetchall():
+        doc_recibidos_ids.add(str(r.id))
+        retenciones_recibidas += float(r.total or 0)
+    retenciones_recibidas = round(retenciones_recibidas, 2)
+
+    # 6. RETENCIONES DE RENTA EMITIDAS (A tus proveedores)
+    res_ret_emi = await db.execute(text("""
+        SELECT d.id, COALESCE(SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)), 0) AS total
+        FROM documentos_emitidos d,
+             jsonb_array_elements(
+                 CASE
+                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
+                         CASE WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                              THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                              ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') END
+                     WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
+                         CASE WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
+                              THEN d.datos->'impuestos'->'impuesto'
+                              ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto') END
+                     ELSE '[]'::jsonb
+                 END
+             ) AS imp
+        WHERE d.emisor_id     = :eid
+          AND d.estado_sri    = 'AUTORIZADO'
+          AND d.es_sandbox    = false
           AND d.fecha_emision BETWEEN :fi AND :ff
           AND d.tipo_doc      = 'RET'
-          AND jsonb_array_length(COALESCE(d.items_detalle, '[]'::jsonb)) > 0
-          AND (item->>'codigo_impuesto') = '1'
+          AND (imp->>'codigo') = '1'
         GROUP BY d.id
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
+    """), params)
+    
+    retenciones_emitidas = 0.0
+    for r in res_ret_emi.fetchall():
+        doc_emitidos_ids.add(str(r.id))
+        retenciones_emitidas += float(r.total or 0)
+    retenciones_emitidas = round(retenciones_emitidas, 2)
 
-    retenciones_renta = 0.0
-    for r in res_ret_renta.fetchall():
-        doc_recibidos_ids.add(str(r.id))
-        retenciones_renta += float(r.valor or 0)
-    retenciones_renta = round(retenciones_renta, 2)
+    # Base Informativa
+    base_informativa = round(max(ventas_netas - gastos_deducibles_totales, 0.0), 2)
 
-    # CALCULAR
-    base_imponible = max(round(ingresos_netos - gastos_deducibles, 2), 0.0)
-
-    impuesto_causado = 0.0
-    tramo_aplicado   = None
-    for tramo in TABLA_IR:
-        if base_imponible > tramo["desde"]:
-            exceso           = min(base_imponible, tramo["hasta"]) - tramo["desde"]
-            impuesto_causado = tramo["base"] + (exceso * tramo["porcentaje"] / 100)
-            tramo_aplicado   = tramo
-    impuesto_causado = round(impuesto_causado, 2)
-
-    impuesto_a_pagar = round(max(impuesto_causado - retenciones_renta, 0), 2)
-    saldo_a_favor    = round(max(retenciones_renta - impuesto_causado, 0), 2)
-
+    # Casilleros formateados para evitar KeyError en el router
     casilleros = {
-        "501": round(ingresos_brutos, 2),
-        "502": round(ncr_total, 2),
-        "503": ingresos_netos,
-        "601": gastos_deducibles,
-        "699": base_imponible,
-        "701": base_imponible,
-        "801": impuesto_causado,
-        "841": retenciones_renta,
-        "859": impuesto_a_pagar,
-        "869": saldo_a_favor,
+        "501": round(ventas_brutas, 2),
+        "502": round(ncr_emitidas, 2),
+        "503": ventas_netas,
+        "601": gastos_deducibles_totales,
+        "699": base_informativa,
+        "849": base_informativa,
+        "855": retenciones_recibidas,
+        "841": retenciones_recibidas,
+        "859": 0.0,
     }
 
     preguntas = {
-        "tiene_ingresos":          ingresos_netos > 0,
-        "tiene_gastos_deducibles": gastos_deducibles > 0,
-        "tiene_retenciones":       retenciones_renta > 0,
-        "debe_pagar":              impuesto_a_pagar > 0,
-        "tiene_saldo_favor":       saldo_a_favor > 0,
-        "supera_fraccion_basica":  base_imponible > TABLA_IR[0]["hasta"],
+        "tiene_ingresos": ventas_netas > 0,
+        "tiene_gastos_deducibles": gastos_deducibles_totales > 0,
+        "tiene_retenciones": retenciones_recibidas > 0,
     }
 
     desglose = {
         "ingresos": {
-            "brutos": round(ingresos_brutos, 2),
-            "ncr":    round(ncr_total, 2),
-            "netos":  ingresos_netos,
+            "brutos": round(ventas_brutas, 2),
+            "ncr": round(ncr_emitidas, 2),
+            "netos": ventas_netas,
         },
-        "gastos": {"deducibles": gastos_deducibles},
-        "base_imponible": base_imponible,
-        "tabla_ir": {
-            "tramo":      tramo_aplicado,
-            "tabla_anio": anio,
-            "nota":       "Tabla personas naturales — verificar con resolución SRI vigente",
+        "gastos": {
+            "deducibles": compras_recibidas,
+            "liquidaciones": liquidaciones_emitidas,
+            "total_deducibles": gastos_deducibles_totales,
         },
+        "base_imponible": base_informativa,
+        "retenciones": {
+            "recibidas": retenciones_recibidas,
+            "emitidas": retenciones_emitidas,
+        }
     }
 
     resumen = {
         "casilleros": casilleros,
-        "campos_manuales": [
-            {"casillero": "504", "descripcion": "Otros ingresos (arrendamientos, intereses, etc.)"},
-            {"casillero": "602", "descripcion": "Gastos personales (salud, educación, alimentación, vivienda, vestimenta)"},
-            {"casillero": "603", "descripcion": "Rebaja por tercera edad o discapacidad"},
-            {"casillero": "842", "descripcion": "Anticipo pagado año anterior"},
-            {"casillero": "843", "descripcion": "Crédito tributario de años anteriores"},
-        ],
+        "resumen_anual": {
+            "ventas_brutas": round(ventas_brutas, 2),
+            "notas_credito_emitidas": round(ncr_emitidas, 2),
+            "ventas_netas": ventas_netas,
+            "compras_deducibles": round(compras_recibidas, 2),
+            "liquidaciones_compras": round(liquidaciones_emitidas, 2),
+            "total_gastos_deducibles": gastos_deducibles_totales,
+            "retenciones_renta_recibidas": retenciones_recibidas,
+            "retenciones_renta_emitidas": retenciones_emitidas,
+        },
         "resultado": {
-            "impuesto_causado": impuesto_causado,
-            "retenciones":      retenciones_renta,
-            "a_pagar":          impuesto_a_pagar,
-            "saldo_favor":      saldo_a_favor,
+            "impuesto_causado": 0.0,
+            "retenciones": retenciones_recibidas,
+            "a_pagar": 0.0,
+            "saldo_favor": 0.0,
         },
     }
 
     return {
-        "preguntas":         preguntas,
-        "casilleros":        casilleros,
-        "desglose":          desglose,
-        "resumen":           resumen,
-        "doc_emitidos_ids":  doc_emitidos_ids,
+        "anio": anio,
+        "preguntas": preguntas,
+        "casilleros": casilleros,
+        "desglose": desglose,
+        "resumen": resumen,
+        "doc_emitidos_ids": doc_emitidos_ids,
         "doc_recibidos_ids": doc_recibidos_ids,
+        "total_doc_emitidos": len(doc_emitidos_ids),
+        "total_doc_recibidos": len(doc_recibidos_ids),
     }
