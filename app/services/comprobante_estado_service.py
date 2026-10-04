@@ -15,6 +15,11 @@
 #
 # Stock y crédito de API solo se revierten ante un rechazo REAL del SRI, y se
 # reaplican si después resulta que el SRI sí lo autorizó.
+#
+# Notificaciones push:
+#   - AUTORIZADO: solo si se corrigió un falso rechazo o si tardó más de 60s
+#   - EN_REVISION: nunca (el sistema lo resuelve solo)
+#   - DEVUELTA / RECHAZADO: siempre
 
 import base64
 import hashlib
@@ -22,7 +27,7 @@ import hmac
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 from sqlalchemy import text
@@ -51,6 +56,8 @@ TIPO_DOC_LABEL = {
     "RET": "Retención",
 }
 
+UMBRAL_NOTIF_AUTORIZADO = 60  # segundos desde created_at para notificar AUTORIZADO
+
 
 # =============================================================================
 # CARGA Y COLAS
@@ -60,7 +67,7 @@ _SELECT_DOC = """
         d.id, d.clave_acceso, d.xml_path, d.numero_doc, d.secuencial,
         d.api_key_id, d.origen, d.datos, d.tipo_doc, d.es_sandbox,
         d.email_comprador, d.estado_sri, d.retry_count, d.fecha_envio_sri,
-        d.stock_estado, d.credito_estado,
+        d.stock_estado, d.credito_estado, d.created_at,
         e.ambiente, e.ruc, e.razon_social, e.contribuyente_especial, e.id AS emisor_id
     FROM documentos_emitidos d
     JOIN emisores e ON d.emisor_id = e.id
@@ -80,6 +87,16 @@ def ambiente_efectivo(doc) -> str:
 
 def _doc_dict(doc) -> dict:
     return {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in doc._mapping.items()}
+
+
+def _tardo_mucho(doc) -> bool:
+    """True si el doc lleva más de UMBRAL_NOTIF_AUTORIZADO seg desde que se creó."""
+    ref = doc.created_at
+    if not ref:
+        return False
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ref).total_seconds() > UMBRAL_NOTIF_AUTORIZADO
 
 
 async def programar(cola: str, doc_id, segundos: float) -> None:
@@ -156,8 +173,8 @@ async def registrar_error_tecnico(db: AsyncSession, doc_id, detalle: str) -> int
 
 
 async def marcar_en_revision(db: AsyncSession, doc, detalle: str) -> None:
-    """Falla técnica que no se pudo resolver sola. No toca stock ni crédito."""
-    previo = doc.estado_sri
+    """Falla técnica que no se pudo resolver sola. No toca stock ni crédito.
+    No envía notificación push: el sistema lo resuelve solo vía conciliación."""
     await db.execute(text("""
         UPDATE documentos_emitidos
         SET estado_sri = 'EN_REVISION', ultimo_error_tecnico = :detalle, updated_at = NOW()
@@ -165,20 +182,6 @@ async def marcar_en_revision(db: AsyncSession, doc, detalle: str) -> None:
     """), {"did": str(doc.id), "detalle": (detalle or "")[:1000]})
     await db.commit()
     await invalidar_cache(doc.emisor_id)
-
-    if previo != "EN_REVISION":
-        tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
-        numero     = doc.numero_doc or doc.clave_acceso[-10:]
-        prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
-        await crear_notificacion(
-            db         = db,
-            emisor_id  = doc.emisor_id,
-            tipo       = "DOCUMENTO",
-            titulo     = f"{prefijo}🔎 {tipo_label} en revisión",
-            mensaje    = f"{prefijo}No pudimos confirmar con el SRI el estado de {tipo_label.lower()} {numero}. "
-                         "Lo seguimos verificando automáticamente; no es un rechazo del SRI.",
-            referencia = f"/documentos/{doc.id}",
-        )
     print(f"[SRI] 🔎 EN_REVISION: {doc.clave_acceso} — {detalle}")
 
 
@@ -217,16 +220,27 @@ async def finalizar_autorizado(db: AsyncSession, doc_id, resp: sri.RespuestaSRI)
     doc_dict   = _doc_dict(doc)
 
     await disparar_webhooks(doc.id, doc.emisor_id, "documento.autorizado", doc_dict)
-    await crear_notificacion(
-        db         = db,
-        emisor_id  = doc.emisor_id,
-        tipo       = "DOCUMENTO",
-        titulo     = f"{prefijo}✅ {tipo_label} autorizado" + (" (corregido)" if corregido else ""),
-        mensaje    = (f"{prefijo}{tipo_label} {numero} sí está autorizado por el SRI. "
-                      "Corregimos el estado, el inventario y los créditos.") if corregido else
-                     f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
-        referencia = f"/documentos/{doc.id}",
-    )
+
+    # ── Notificación push: solo si se corrigió un falso rechazo o si tardó mucho ──
+    if corregido:
+        await crear_notificacion(
+            db         = db,
+            emisor_id  = doc.emisor_id,
+            tipo       = "DOCUMENTO",
+            titulo     = f"{prefijo}✅ {tipo_label} autorizado (corregido)",
+            mensaje    = f"{prefijo}{tipo_label} {numero} sí está autorizado por el SRI. "
+                         "Corregimos el estado, el inventario y los créditos.",
+            referencia = f"/documentos/{doc.id}",
+        )
+    elif _tardo_mucho(doc):
+        await crear_notificacion(
+            db         = db,
+            emisor_id  = doc.emisor_id,
+            tipo       = "DOCUMENTO",
+            titulo     = f"{prefijo}✅ {tipo_label} autorizado",
+            mensaje    = f"{prefijo}{tipo_label} {numero} autorizado por el SRI{' de pruebas' if doc.es_sandbox else ''}.",
+            referencia = f"/documentos/{doc.id}",
+        )
 
     # PDF y correo (fuera de la transacción)
     if doc.tipo_doc in ("FAC", "LIQ") and resp.comprobante:
