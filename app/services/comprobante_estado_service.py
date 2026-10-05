@@ -20,6 +20,9 @@
 #   - AUTORIZADO: solo si se corrigió un falso rechazo o si tardó más de 60s
 #   - EN_REVISION: nunca (el sistema lo resuelve solo)
 #   - DEVUELTA / RECHAZADO: siempre
+#
+# Invalidación de caché:
+#   Usa invalidate_emisor de app.core.cache — la fuente única de verdad.
 
 import base64
 import hashlib
@@ -33,7 +36,7 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.cache import get_redis
+from app.core.cache import get_redis, invalidate_emisor
 from app.core.config import settings
 from app.services import sri_client as sri
 from app.services import stock_service
@@ -111,13 +114,9 @@ async def encolar(cola: str, doc_id) -> None:
 
 
 async def invalidar_cache(emisor_id: int) -> None:
-    try:
-        redis = await get_redis()
-        for patron in (f"kipu:cache:*:{emisor_id}:*", f"dashboard:{emisor_id}*", f"dashboard_docs:{emisor_id}:*"):
-            async for k in redis.scan_iter(patron):
-                await redis.delete(k)
-    except Exception as e:
-        print(f"[Cache] ⚠️ No invalidado: {e}")
+    """Wrapper para mantener compatibilidad con imports existentes.
+    Delega a invalidate_emisor de app.core.cache."""
+    await invalidate_emisor(emisor_id)
 
 
 # =============================================================================
@@ -204,9 +203,6 @@ async def finalizar_autorizado(db: AsyncSession, doc_id, resp: sri.RespuestaSRI)
         WHERE id = :did
     """), {"fecha": fecha, "msg": json.dumps(resp.mensajes or []), "did": str(doc.id)})
 
-    # Era un falso rechazo: se vuelve a aplicar lo que se había devuelto.
-    # Se decide por lo que realmente se revirtió (no por el estado previo, que pudo
-    # pasar por RECIBIDA en el camino). Ambas funciones son idempotentes.
     corregido = (previo in ("DEVUELTA", "RECHAZADO")
                  or doc.stock_estado == "REVERTIDO" or doc.credito_estado == "DEVUELTO")
     await stock_service.reaplicar(db, doc)

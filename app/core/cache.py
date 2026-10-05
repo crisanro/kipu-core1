@@ -4,10 +4,10 @@ Servicio de caché Redis para Kipu.
 - Conexión lazy (se crea al primer uso)
 - TTLs centralizados para consistencia
 - Helpers tipados: get_json / set_json / delete / clear_prefix
+- Invalidación por emisor eficiente: SCAN por familia (no SCAN *)
 """
 import json
 import logging
-import re
 from typing import Any, Optional
 import redis.asyncio as aioredis
 from app.core.config import settings
@@ -62,11 +62,12 @@ class CK:
 
 
 # Familias de claves que pertenecen a un emisor.
-# Formato esperado: "<familia>:<emisor_id>" o "<familia>:<emisor_id>:<lo que sea>"
+# Cada familia genera un SCAN "familia:emisor_id:*" — mucho más eficiente que SCAN *.
 _FAMILIAS_EMISOR = (
     "emisor",
     "dashboard",
     "dashboard_header",
+    "dashboard_docs",
     "clientes",
     "cliente",
     "estructura",
@@ -80,10 +81,11 @@ _FAMILIAS_EMISOR = (
     "notificaciones",
     "productos",
     "empresa",
-    "documentos_emitidos",   # ← Agregado
-    "documentos_recibidos",  # ← Agregado
-    "resumen_emitidos",      # ← Agregado
-    "resumen_recibidos",     # ← Agregado
+    "documentos_emitidos",
+    "documentos_recibidos",
+    "resumen_emitidos",
+    "resumen_recibidos",
+    "declaracion",
 )
 
 _LOTE_BORRADO = 500
@@ -177,20 +179,47 @@ async def cache_clear_prefix(prefix: str) -> int:
 
 async def invalidate_emisor(emisor_id: int) -> int:
     """
-    Invalida TODO el cache relacionado a un emisor, en un solo recorrido de Redis.
-    Coincidencia exacta del ID: invalidar el emisor 1 NO toca el 10 ni el 100.
+    Invalida TODO el caché relacionado a un emisor.
+
+    En lugar de SCAN * (recorre TODAS las keys de Redis), hace un SCAN por
+    cada familia con el patrón "familia:emisor_id:*". Redis filtra del lado
+    del servidor, lo que es órdenes de magnitud más rápido cuando hay
+    muchas keys de otros emisores.
+
+    Coincidencia exacta del ID: invalidar el emisor 1 NO toca el 10 ni el 100
+    porque el patrón es "familia:1:*" (requiere ":" después del ID).
+
     Llamar después de cualquier mutación (PATCH config, subir firma, pagos, etc.)
     """
     try:
-        eid    = int(emisor_id)
-        patron = re.compile(rf"^(?:{'|'.join(_FAMILIAS_EMISOR)}):{eid}(?::|$)")
-        r      = await get_redis()
-        keys   = [k async for k in r.scan_iter(match="*", count=1000) if patron.match(k)]
-        if not keys:
+        eid = int(emisor_id)
+        r   = await get_redis()
+        keys_to_delete: list[str] = []
+
+        for familia in _FAMILIAS_EMISOR:
+            # Patrón exacto: "dashboard:42:*" — Redis filtra server-side
+            patron = f"{familia}:{eid}:*"
+            async for k in r.scan_iter(match=patron, count=500):
+                keys_to_delete.append(k)
+
+            # También la key exacta sin sufijo: "emisor:42", "estructura:42"
+            patron_exacto = f"{familia}:{eid}"
+            if await r.exists(patron_exacto):
+                keys_to_delete.append(patron_exacto)
+
+        # Además, el patrón legacy de comprobante_estado_service
+        async for k in r.scan_iter(match=f"kipu:cache:*:{eid}:*", count=500):
+            keys_to_delete.append(k)
+
+        if not keys_to_delete:
             return 0
-        borradas = await _unlink_en_lotes(r, keys)
+
+        # Deduplicar (una key puede matchear en dos patrones)
+        keys_to_delete = list(set(keys_to_delete))
+        borradas = await _unlink_en_lotes(r, keys_to_delete)
         logger.info(f"[CACHE] Emisor {eid}: {borradas} claves invalidadas")
         return borradas
+
     except Exception as e:
         logger.warning(f"[CACHE] INVALIDATE EMISOR error ({emisor_id}): {e}")
         return 0

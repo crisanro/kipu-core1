@@ -44,6 +44,19 @@ class Settings(BaseSettings):
     R2_PUBLIC_URL:          str
     ENVIRONMENT:            str
 
+    # ── Pool de base de datos (horizontal scaling) ────────────────────────
+    DB_POOL_SIZE:       int = 5      # conexiones permanentes por instancia
+    DB_MAX_OVERFLOW:    int = 10     # conexiones extra bajo carga
+    DB_POOL_TIMEOUT:    int = 30     # segundos esperando conexión libre
+    DB_POOL_RECYCLE:    int = 1800   # reciclar conexiones cada 30 min
+
+    # ── Worker SRI ────────────────────────────────────────────────────────
+    SRI_MAX_CONCURRENT:          int = 3      # llamadas SOAP simultáneas al SRI
+    SRI_MAX_INTENTOS_TECNICOS:   int = 8      # reintentos antes de EN_REVISION
+    SRI_ESPERA_AUTORIZACION_SEG: float = 3.0  # espera tras RECIBIDA antes de consultar
+    SRI_CONCILIACION_CADA_SEG:   int = 1800   # cada 30 min
+    SRI_CONCILIACION_LOCK_SEG:   int = 1740   # TTL del lock (< intervalo)
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 try:

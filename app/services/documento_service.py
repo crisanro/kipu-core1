@@ -27,7 +27,7 @@
 #     si el SRI rechaza el documento.
 #   - El contador de uso se incrementa solo si la emisión quedó confirmada.
 #   - NC y ND heredan el email del documento origen.
-#   - Invalidación de caché unificada vía comprobante_estado_service.invalidar_cache.
+#   - Invalidación de caché unificada vía app.core.cache.invalidate_emisor.
 
 import json
 import pytz
@@ -48,7 +48,7 @@ from app.utils.sri_core import (
 from app.services.storage_service import upload_file
 from app.services import stock_service
 from app.core.cache import get_redis
-from app.services.comprobante_estado_service import invalidar_cache
+from app.core.cache import invalidate_emisor
 from app.services.notification_service import (
     crear_notificacion,
     encolar_notificacion,
@@ -240,7 +240,7 @@ async def emitir_documento_core(
 
         # ── Solo ahora que el documento existe en la base ──────────────────────
         await _post_commit(doc_id, acceso)
-        await invalidar_cache(emisor.id)
+        await invalidate_emisor(emisor.id)
 
         # Notificaciones diferidas (ej. stock bajo). Si fallan, NO afectan al documento.
         try:
