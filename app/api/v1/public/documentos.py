@@ -3,8 +3,16 @@
 # Endpoints públicos para consulta y descarga de comprobantes.
 # No requieren autenticación — solo clave de acceso válida.
 # Soporta todos los tipos: FAC | LIQ | NCR | NDB | RET
+#
+# PDF:
+#   - AUTORIZADO → RIDE oficial (con fecha y número de autorización)
+#   - FIRMADO / RECIBIDA / EN_REVISION → PDF provisional desde el XML firmado,
+#     sin fecha de autorización. El frontend o el Node de PDF debe mostrar
+#     "PENDIENTE DE AUTORIZACIÓN" como marca. Se cachea solo 30 seg (va a cambiar pronto).
+#   - DEVUELTA / RECHAZADO / ANULADO → no se genera PDF.
 
 import re
+import json
 import base64
 import httpx
 from typing import Optional
@@ -34,6 +42,16 @@ LABELS_TIPO_DOC = {
     "07": "Retención",
 }
 
+# Estados en los que el documento está en tránsito al SRI
+_ESTADOS_EN_PROCESO = ("FIRMADO", "RECIBIDA", "EN_REVISION")
+
+# Estados en los que se puede generar PDF (autorizado o en proceso)
+_ESTADOS_CON_PDF = ("AUTORIZADO", *_ESTADOS_EN_PROCESO)
+
+# Cache corto para PDFs provisionales (el estado va a cambiar pronto)
+_TTL_PDF_PROVISIONAL = 30    # 30 segundos
+_TTL_PDF_AUTORIZADO  = 7200  # 2 horas
+
 
 # =============================================================================
 # SCHEMAS
@@ -42,6 +60,32 @@ LABELS_TIPO_DOC = {
 class ConsultarRequest(BaseModel):
     captchaToken: str
     hpValue:      Optional[str] = None
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def _respuesta_no_descargable(estado_sri: str, tipo: str = "documento") -> JSONResponse:
+    """Respuesta cuando el documento NO puede generar PDF (rechazado/anulado)."""
+    if estado_sri in ("DEVUELTA", "RECHAZADO"):
+        return JSONResponse(status_code=422, content={
+            "error":   f"Comprobante {estado_sri.lower()} por el SRI.",
+            "estado":  estado_sri,
+            "mensaje": f"El {tipo} fue {estado_sri.lower()} por el SRI. "
+                       "Contacta al emisor para más información.",
+        })
+    if estado_sri == "ANULADO":
+        return JSONResponse(status_code=410, content={
+            "error":   "Comprobante anulado.",
+            "estado":  estado_sri,
+            "mensaje": f"El {tipo} fue anulado y ya no tiene validez tributaria.",
+        })
+    return JSONResponse(status_code=404, content={
+        "error":   f"Comprobante en estado: {estado_sri}.",
+        "estado":  estado_sri,
+        "mensaje": f"El {tipo} no está disponible para descarga en este momento.",
+    })
 
 
 # =============================================================================
@@ -77,7 +121,7 @@ async def get_pdf(
     try:
         res = await db.execute(text("""
             SELECT
-                d.estado_sri, d.xml_path, d.fecha_autorizacion, d.tipo_doc,
+                d.estado_sri, d.xml_path, d.fecha_autorizacion, d.tipo_doc, d.cod_doc,
                 e.contribuyente_especial
             FROM documentos_emitidos d
             JOIN emisores e ON d.emisor_id = e.id
@@ -88,12 +132,24 @@ async def get_pdf(
         if not doc:
             return JSONResponse(status_code=404, content={"error": "Documento no encontrado."})
 
-        if doc.estado_sri != "AUTORIZADO" or not doc.xml_path:
-            return JSONResponse(status_code=404, content={"error": "Documento no autorizado o sin XML."})
+        # Solo AUTORIZADO y estados en proceso pueden generar PDF
+        if doc.estado_sri not in _ESTADOS_CON_PDF:
+            tipo_label = LABELS_TIPO_DOC.get(doc.cod_doc, "comprobante").lower()
+            return _respuesta_no_descargable(doc.estado_sri, tipo_label)
+
+        if not doc.xml_path:
+            return JSONResponse(status_code=404, content={"error": "XML no disponible."})
+
+        es_autorizado = doc.estado_sri == "AUTORIZADO"
 
         xml_bytes  = download_file(doc.xml_path)
         xml_str    = xml_bytes.decode("utf-8")
-        fecha_auth = doc.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S") if doc.fecha_autorizacion else None
+
+        # AUTORIZADO → fecha real de autorización
+        # EN PROCESO → None, el generador de PDF debe mostrar "PENDIENTE DE AUTORIZACIÓN"
+        fecha_auth = None
+        if es_autorizado and doc.fecha_autorizacion:
+            fecha_auth = doc.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S")
 
         async with httpx.AsyncClient(timeout=15.0) as client:
             res_pdf = await client.post(NODE_PDF_URL, json={
@@ -101,6 +157,7 @@ async def get_pdf(
                 "emisor":            {"contribuyente_especial": doc.contribuyente_especial or ""},
                 "fechaAutorizacion": fecha_auth,
                 "formato":           formato,
+                "provisional":       not es_autorizado,
             })
 
         if res_pdf.status_code != 200 or not res_pdf.json().get("ok"):
@@ -108,20 +165,27 @@ async def get_pdf(
 
         pdf_bytes = base64.b64decode(res_pdf.json()["pdfBase64"])
 
-        # Guardar en cache
+        # Cachear: AUTORIZADO → 2 horas, EN PROCESO → 30 seg (va a cambiar)
+        ttl_cache = _TTL_PDF_AUTORIZADO if es_autorizado else _TTL_PDF_PROVISIONAL
         try:
-            await redis.setex(cache_key, 7200, pdf_bytes)
+            await redis.setex(cache_key, ttl_cache, pdf_bytes)
         except Exception as e:
             print(f"[PDF Cache] ⚠️ Error guardando: {e}")
+
+        # Headers distintos: el provisional no se cachea en el browser
+        cache_control = f"public, max-age={ttl_cache}" if es_autorizado else "no-cache, no-store"
+        extra_headers = {
+            "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
+            "Cache-Control":       cache_control,
+            "X-Cache":             "MISS",
+        }
+        if not es_autorizado:
+            extra_headers["X-Documento-Estado"] = doc.estado_sri
 
         return Response(
             content    = pdf_bytes,
             media_type = "application/pdf",
-            headers    = {
-                "Content-Disposition": f'inline; filename="{clave_acceso}.pdf"',
-                "Cache-Control":       "public, max-age=7200",
-                "X-Cache":             "MISS",
-            }
+            headers    = extra_headers,
         )
 
     except Exception as e:
@@ -159,7 +223,7 @@ async def get_xml(
 
     try:
         res = await db.execute(text("""
-            SELECT estado_sri, xml_path
+            SELECT estado_sri, xml_path, cod_doc
             FROM documentos_emitidos
             WHERE clave_acceso = :clave
         """), {"clave": clave_acceso})
@@ -168,8 +232,20 @@ async def get_xml(
         if not doc:
             return JSONResponse(status_code=404, content={"error": "Documento no encontrado."})
 
-        if doc.estado_sri != "AUTORIZADO" or not doc.xml_path:
-            return JSONResponse(status_code=404, content={"error": "Documento no autorizado o sin XML."})
+        # XML: solo AUTORIZADO (el XML firmado sin autorización no tiene validez tributaria)
+        if doc.estado_sri != "AUTORIZADO":
+            tipo_label = LABELS_TIPO_DOC.get(doc.cod_doc, "comprobante").lower()
+            if doc.estado_sri in _ESTADOS_EN_PROCESO:
+                return JSONResponse(status_code=202, content={
+                    "error":   "Comprobante en proceso de autorización.",
+                    "estado":  doc.estado_sri,
+                    "mensaje": f"El {tipo_label} está en proceso de autorización. "
+                               "El XML estará disponible una vez autorizado.",
+                })
+            return _respuesta_no_descargable(doc.estado_sri, tipo_label)
+
+        if not doc.xml_path:
+            return JSONResponse(status_code=404, content={"error": "XML autorizado no disponible."})
 
         file_bytes = download_file(doc.xml_path)
 
@@ -236,7 +312,6 @@ async def consultar_comprobante(
         redis  = await get_redis()
         cached = await redis.get(cache_key)
         if cached:
-            import json
             return JSONResponse(content=json.loads(cached))
     except Exception as e:
         print(f"[Consulta Cache] ⚠️ {e}")
@@ -342,18 +417,18 @@ async def consultar_comprobante(
 
             # Cachear 2 horas
             try:
-                import json
                 await redis.setex(cache_key, 7200, json.dumps(response_data))
             except Exception as e:
                 print(f"[Consulta Cache] ⚠️ Error guardando: {e}")
 
             return response_data
 
-        elif estado in ("RECIBIDA", "FIRMADO"):
+        elif estado in _ESTADOS_EN_PROCESO:
             return JSONResponse(status_code=200, content={
                 "success":         False,
                 "estado":          estado,
-                "mensaje_usuario": "El comprobante fue enviado al SRI y está en proceso de autorización.",
+                "mensaje_usuario": f"El {tipo_label.lower()} fue enviado al SRI y está en proceso de autorización. "
+                                   "Intenta consultar de nuevo en unos minutos.",
             })
 
         elif estado in ("DEVUELTA", "RECHAZADO"):
@@ -363,6 +438,13 @@ async def consultar_comprobante(
                 "mensaje_usuario": f"El {tipo_label.lower()} presenta inconsistencias y fue {estado.lower()} por el SRI.",
                 "detalles_sri":    doc.mensajes_sri,
                 "sugerencia":      f"Contacta al emisor ({doc.emisor_nombre}) para resolver este inconveniente.",
+            })
+
+        elif estado == "ANULADO":
+            return JSONResponse(status_code=200, content={
+                "success":         False,
+                "estado":          estado,
+                "mensaje_usuario": f"El {tipo_label.lower()} fue anulado y ya no tiene validez tributaria.",
             })
 
         else:
