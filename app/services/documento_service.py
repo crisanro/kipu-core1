@@ -27,6 +27,7 @@
 #     si el SRI rechaza el documento.
 #   - El contador de uso se incrementa solo si la emisión quedó confirmada.
 #   - NC y ND heredan el email del documento origen.
+#   - Invalidación de caché unificada vía comprobante_estado_service.invalidar_cache.
 
 import json
 import pytz
@@ -47,6 +48,7 @@ from app.utils.sri_core import (
 from app.services.storage_service import upload_file
 from app.services import stock_service
 from app.core.cache import get_redis
+from app.services.comprobante_estado_service import invalidar_cache
 from app.services.notification_service import (
     crear_notificacion,
     encolar_notificacion,
@@ -238,7 +240,7 @@ async def emitir_documento_core(
 
         # ── Solo ahora que el documento existe en la base ──────────────────────
         await _post_commit(doc_id, acceso)
-        await _invalidar_cache(emisor.id)
+        await invalidar_cache(emisor.id)
 
         # Notificaciones diferidas (ej. stock bajo). Si fallan, NO afectan al documento.
         try:
@@ -1255,16 +1257,6 @@ def _adaptar_detalles_nc(detalles_xml: list) -> list:
         det_nc["impuestos"]              = d.get("impuestos", {})
         resultado.append(det_nc)
     return resultado
-
-
-async def _invalidar_cache(emisor_id: int):
-    try:
-        redis = await get_redis()
-        for patron in (f"kipu:cache:*:{emisor_id}:*", f"dashboard:{emisor_id}*", f"dashboard_docs:{emisor_id}:*"):
-            async for k in redis.scan_iter(patron):
-                await redis.delete(k)
-    except Exception as e:
-        print(f"[Cache] ⚠️ No invalidado: {e}")
 
 
 def _tarifa_a_codigo_porcentaje(tarifa: str) -> str:

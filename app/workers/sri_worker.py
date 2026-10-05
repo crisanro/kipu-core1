@@ -16,6 +16,12 @@
 #   4. Después de RECIBIDA se espera un tiempo parametrizable antes de consultar
 #      la autorización, y se insiste hasta 24 horas.
 #   5. Las esperas van a la cola diferida: el semáforo solo cubre las llamadas de red.
+#
+# Escalabilidad:
+#   - Múltiples instancias: BRPOP y ZREM son atómicos → safe con N workers.
+#   - Conciliación con lock distribuido: solo una instancia la ejecuta a la vez.
+#   - LIMIT dinámico: más backlog → más docs por ciclo (100–500).
+#   - Semáforo configurable: SRI_MAX_CONCURRENT ajusta sin redeploy.
 
 import asyncio
 import time
@@ -36,12 +42,17 @@ QUEUE_EMISION      = svc.QUEUE_EMISION
 QUEUE_AUTORIZACION = svc.QUEUE_AUTORIZACION
 QUEUE_DIFERIDA     = svc.QUEUE_DIFERIDA
 
-MAX_CONCURRENT          = 3
+# ── Configuración (ajustable sin redeploy vía env vars) ──────────────────────
+MAX_CONCURRENT          = int(getattr(settings, "SRI_MAX_CONCURRENT", 3))
 BRPOP_TIMEOUT           = 5
 MAX_INTENTOS_TECNICOS   = int(getattr(settings, "SRI_MAX_INTENTOS_TECNICOS", 8))
 ESPERA_AUTORIZACION_SEG = float(getattr(settings, "SRI_ESPERA_AUTORIZACION_SEG", 3))
-LIMITE_AUTORIZACION_H   = 24          # la ficha técnica da hasta 24 h desde RECIBIDA
-CONCILIACION_CADA_SEG   = 30 * 60
+LIMITE_AUTORIZACION_H   = 24
+CONCILIACION_CADA_SEG   = int(getattr(settings, "SRI_CONCILIACION_CADA_SEG", 30 * 60))
+CONCILIACION_LOCK_SEG   = int(getattr(settings, "SRI_CONCILIACION_LOCK_SEG", CONCILIACION_CADA_SEG - 60))
+CONCILIACION_LIMIT_MIN  = 100
+CONCILIACION_LIMIT_MAX  = 500
+CONCILIACION_BATCH      = 20   # docs por batch para no saturar el SRI
 
 _sri_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -177,55 +188,134 @@ async def procesar_autorizacion(doc_id: str):
 # =============================================================================
 # CONCILIACIÓN: corrige estados preguntándole al SRI
 # =============================================================================
+_CONCILIACION_WHERE = """
+    (estado_sri IN ('FIRMADO', 'RECIBIDA')
+     AND updated_at < NOW() - INTERVAL '15 minutes'
+     AND created_at > NOW() - INTERVAL '30 days')
+    OR estado_sri = 'EN_REVISION'
+    OR (estado_sri = 'DEVUELTA'
+        AND updated_at > NOW() - INTERVAL '72 hours'
+        AND (mensajes_sri::text LIKE '%%"identificador": "43"%%'
+             OR mensajes_sri::text LIKE '%%"identificador": "45"%%'
+             OR ultimo_error_tecnico IS NOT NULL))
+"""
+
+
+async def _contar_backlog(db) -> int:
+    """Cuenta cuántos documentos necesitan conciliación."""
+    res = await db.execute(text(f"SELECT COUNT(*) FROM documentos_emitidos WHERE {_CONCILIACION_WHERE}"))
+    return res.scalar() or 0
+
+
+def _calcular_limit(backlog: int) -> int:
+    """Más backlog → más docs por ciclo, entre LIMIT_MIN y LIMIT_MAX."""
+    if backlog <= CONCILIACION_LIMIT_MIN:
+        return CONCILIACION_LIMIT_MIN
+    return min(backlog, CONCILIACION_LIMIT_MAX)
+
+
+async def _adquirir_lock_conciliacion() -> bool:
+    """Lock distribuido con Redis SET NX EX. Solo una instancia concilia a la vez."""
+    try:
+        redis = await get_redis()
+        return await redis.set("kipu:lock:conciliacion", "1", nx=True, ex=CONCILIACION_LOCK_SEG)
+    except Exception as e:
+        print(f"[Conciliación] ⚠️ No se pudo adquirir lock: {e}")
+        return False
+
+
+async def _liberar_lock_conciliacion() -> None:
+    try:
+        redis = await get_redis()
+        await redis.delete("kipu:lock:conciliacion")
+    except Exception:
+        pass  # expira solo con el TTL
+
+
 async def conciliar() -> dict:
     """
     Revisa en el SRI:
       - FIRMADO / RECIBIDA atascados más de 15 minutos
       - EN_REVISION
       - DEVUELTA de las últimas 72 h por clave ya registrada (43/45) o con falla técnica previa
+
+    Mejoras de escalabilidad:
+      - Lock distribuido: solo una instancia ejecuta la conciliación a la vez.
+      - LIMIT dinámico: se ajusta al tamaño del backlog (100–500).
+      - Procesamiento en batches de CONCILIACION_BATCH para no saturar el SRI.
     """
-    async with AsyncSessionLocal() as db:
-        res = await db.execute(text("""
-            SELECT id, estado_sri, emisor_id FROM documentos_emitidos
-            WHERE (estado_sri IN ('FIRMADO', 'RECIBIDA')
-                   AND updated_at < NOW() - INTERVAL '15 minutes'
-                   AND created_at > NOW() - INTERVAL '30 days')
-               OR estado_sri = 'EN_REVISION'
-               OR (estado_sri = 'DEVUELTA'
-                   AND updated_at > NOW() - INTERVAL '72 hours'
-                   AND (mensajes_sri::text LIKE '%%"identificador": "43"%%'
-                        OR mensajes_sri::text LIKE '%%"identificador": "45"%%'
-                        OR ultimo_error_tecnico IS NOT NULL))
-            ORDER BY updated_at ASC
-            LIMIT 100
-        """))
-        pendientes = res.fetchall()
+    if not await _adquirir_lock_conciliacion():
+        return {"revisados": 0, "corregidos": 0, "msg": "otra instancia conciliando"}
 
-    corregidos = 0
-    for fila in pendientes:
+    try:
+        # 1) Contar backlog y decidir cuántos procesar
         async with AsyncSessionLocal() as db:
-            try:
-                r = await _con_sri(svc.sincronizar_documento(db, fila.id))
-                if r.get("cambio"):
-                    corregidos += 1
-                # El SRI no lo tiene y está para enviarse: se encola
-                if r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri in ("FIRMADO", "EN_REVISION"):
-                    await db.execute(text("""
-                        UPDATE documentos_emitidos SET estado_sri = 'FIRMADO', updated_at = NOW()
-                        WHERE id = :did AND estado_sri IN ('FIRMADO', 'EN_REVISION')
-                    """), {"did": str(fila.id)})
-                    await db.commit()
-                    await svc.invalidar_cache(fila.emisor_id)
-                    await svc.encolar(QUEUE_EMISION, fila.id)
-                elif r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri == "RECIBIDA":
-                    await svc.encolar(QUEUE_AUTORIZACION, fila.id)
-            except Exception as e:
-                await db.rollback()
-                print(f"[Conciliación] ⚠️ {fila.id}: {e}")
+            backlog = await _contar_backlog(db)
 
-    if pendientes:
-        print(f"[Conciliación] 🔄 {len(pendientes)} revisados · {corregidos} corregidos")
-    return {"revisados": len(pendientes), "corregidos": corregidos}
+        if backlog == 0:
+            return {"revisados": 0, "corregidos": 0}
+
+        limit = _calcular_limit(backlog)
+
+        # 2) Cargar los IDs a procesar
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(text(f"""
+                SELECT id, estado_sri, emisor_id FROM documentos_emitidos
+                WHERE {_CONCILIACION_WHERE}
+                ORDER BY updated_at ASC
+                LIMIT :limit
+            """), {"limit": limit})
+            pendientes = res.fetchall()
+
+        if not pendientes:
+            return {"revisados": 0, "corregidos": 0}
+
+        # 3) Procesar en batches para no saturar el SRI
+        corregidos = 0
+        total      = len(pendientes)
+
+        for i in range(0, total, CONCILIACION_BATCH):
+            batch = pendientes[i : i + CONCILIACION_BATCH]
+            tareas = [_conciliar_uno(fila) for fila in batch]
+            resultados = await asyncio.gather(*tareas, return_exceptions=True)
+            corregidos += sum(1 for r in resultados if r is True)
+
+            # Pequeña pausa entre batches para no ahogar el SRI
+            if i + CONCILIACION_BATCH < total:
+                await asyncio.sleep(1)
+
+        print(f"[Conciliación] 🔄 {total} revisados (backlog: {backlog}) · {corregidos} corregidos")
+        return {"revisados": total, "corregidos": corregidos, "backlog": backlog}
+
+    finally:
+        await _liberar_lock_conciliacion()
+
+
+async def _conciliar_uno(fila) -> bool:
+    """Concilia un solo documento. Devuelve True si hubo cambio."""
+    async with AsyncSessionLocal() as db:
+        try:
+            r = await _con_sri(svc.sincronizar_documento(db, fila.id))
+            if r.get("cambio"):
+                return True
+
+            # El SRI no lo tiene y está para enviarse: se encola
+            if r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri in ("FIRMADO", "EN_REVISION"):
+                await db.execute(text("""
+                    UPDATE documentos_emitidos SET estado_sri = 'FIRMADO', updated_at = NOW()
+                    WHERE id = :did AND estado_sri IN ('FIRMADO', 'EN_REVISION')
+                """), {"did": str(fila.id)})
+                await db.commit()
+                await svc.invalidar_cache(fila.emisor_id)
+                await svc.encolar(QUEUE_EMISION, fila.id)
+            elif r.get("sri") == sri.NO_ENCONTRADO and fila.estado_sri == "RECIBIDA":
+                await svc.encolar(QUEUE_AUTORIZACION, fila.id)
+
+            return False
+        except Exception as e:
+            await db.rollback()
+            print(f"[Conciliación] ⚠️ {fila.id}: {e}")
+            return False
 
 
 # =============================================================================
@@ -263,7 +353,7 @@ async def recovery_al_arrancar():
 # LOOPS
 # =============================================================================
 async def _loop_cola(cola: str, procesar, nombre: str):
-    print(f"[Worker] 🚀 Loop de {nombre} iniciado.")
+    print(f"[Worker] 🚀 Loop de {nombre} iniciado (concurrencia SRI: {MAX_CONCURRENT}).")
     redis = await get_redis()
     while True:
         try:
@@ -310,14 +400,15 @@ async def loop_diferida():
 
 
 async def loop_conciliacion():
-    print("[Worker] 🚀 Conciliación con el SRI iniciada (cada 30 min).")
+    intervalo = CONCILIACION_CADA_SEG
+    print(f"[Worker] 🚀 Conciliación con el SRI iniciada (cada {intervalo // 60} min, lock: {CONCILIACION_LOCK_SEG}s).")
     await asyncio.sleep(60)   # deja que arranque todo primero
     while True:
         try:
             await conciliar()
         except Exception as e:
             print(f"[Conciliación] ❌ {e}")
-        await asyncio.sleep(CONCILIACION_CADA_SEG)
+        await asyncio.sleep(intervalo)
 
 
 async def iniciar_workers():
