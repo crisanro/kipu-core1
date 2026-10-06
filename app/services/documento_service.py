@@ -67,6 +67,10 @@ TIPO_DOC_MAP = {
     "RET": {"cod_doc": "07", "xml_root": "comprobanteRetencion", "xml_version": "2.0.0"},
 }
 
+# Regla tributaria EC: >= $500 debe usar sistema financiero (no efectivo "01")
+LIMITE_EFECTIVO = Decimal("500.00")
+COD_EFECTIVO    = "01"
+
 MOTIVOS_NCR_VALIDOS = [
     "DEVOLUCION DE BIEN",
     "ANULACION DE COMPROBANTE",
@@ -174,6 +178,20 @@ async def emitir_documento_core(
                 Decimal(str(i.get("valorRetenido", i.get("valor", 0))))
                 for i in impuestos_ret
             )
+
+        # ── Validar regla $500: efectivo no permitido en >= $500 ──────────
+        if tipo_doc in ("FAC", "LIQ") and importe_total >= LIMITE_EFECTIVO:
+            pagos_raw = data.get("pagos", [])
+            tiene_efectivo = any(
+                str(p.get("forma_pago", "01")) == COD_EFECTIVO
+                for p in pagos_raw
+            )
+            if tiene_efectivo:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Transacciones ≥ ${LIMITE_EFECTIVO} deben utilizar el sistema financiero. "
+                           "Cambia la forma de pago a tarjeta, transferencia u otro medio financiero."
+                )
 
         clave_acceso = generar_clave_acceso(
             fecha            = fecha_clave,
