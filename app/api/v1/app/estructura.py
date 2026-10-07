@@ -25,7 +25,7 @@ async def listar_estructura(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
 
     cache_key = CK.fmt(CK.ESTRUCTURA, eid=emisor_id)
     cached    = await cache_get(cache_key)
@@ -85,7 +85,7 @@ async def crear_establecimiento(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id  = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
     codigo_fmt = str(data.codigo).zfill(3)
 
     try:
@@ -144,7 +144,7 @@ async def crear_punto_emision(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
     try:
         codigo_estab_fmt = str(data.establecimiento_codigo).zfill(3)
         res_estab = await db.execute(text("""
@@ -210,7 +210,7 @@ async def editar_establecimiento(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
 
     res = await db.execute(text("""
         UPDATE establecimientos
@@ -255,7 +255,7 @@ async def editar_punto_emision(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
 
     res = await db.execute(text("""
         UPDATE puntos_emision pe
@@ -295,7 +295,7 @@ async def editar_secuencial(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "configuracion")
+    verificar_permiso(auth_data, "estructura")
 
     nuevos_secs = data.get("secuenciales")
     if nuevos_secs:
