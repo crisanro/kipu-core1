@@ -173,7 +173,7 @@ async def registrar_error_tecnico(db: AsyncSession, doc_id, detalle: str) -> int
 
 async def marcar_en_revision(db: AsyncSession, doc, detalle: str) -> None:
     """Falla técnica que no se pudo resolver sola. No toca stock ni crédito.
-    No envía notificación push: el sistema lo resuelve solo vía conciliación."""
+    Notifica al usuario para que sepa que su comprobante está pendiente."""
     await db.execute(text("""
         UPDATE documentos_emitidos
         SET estado_sri = 'EN_REVISION', ultimo_error_tecnico = :detalle, updated_at = NOW()
@@ -181,6 +181,21 @@ async def marcar_en_revision(db: AsyncSession, doc, detalle: str) -> None:
     """), {"did": str(doc.id), "detalle": (detalle or "")[:1000]})
     await db.commit()
     await invalidar_cache(doc.emisor_id)
+
+    tipo_label = TIPO_DOC_LABEL.get(doc.tipo_doc, "Comprobante")
+    numero     = doc.numero_doc or doc.clave_acceso[-10:]
+    prefijo    = "🧪 [SANDBOX] " if doc.es_sandbox else ""
+
+    await crear_notificacion(
+        db         = db,
+        emisor_id  = doc.emisor_id,
+        tipo       = "DOCUMENTO",
+        titulo     = f"{prefijo}⏳ {tipo_label} pendiente de autorización",
+        mensaje    = f"{prefijo}{tipo_label} {numero}: el SRI no ha respondido. "
+                     "Seguiremos reintentando automáticamente.",
+        referencia = f"/documentos/{doc.id}",
+    )
+
     print(f"[SRI] 🔎 EN_REVISION: {doc.clave_acceso} — {detalle}")
 
 

@@ -63,32 +63,23 @@ async def _get_access_token() -> str:
 # ── Helpers FCM ───────────────────────────────────────────────────────────────
 def _payload(token: str, titulo: str, cuerpo: str, url: Optional[str], tipo: Optional[str]) -> dict:
     """
-    Estructura FCM HTTP v1 compatible con primer plano, segundo plano y Service Worker.
-    Informa tanto 'notification' (para SO nativo) como 'data' (para la app Kipu).
+    Estructura FCM HTTP v1 — SOLO DATA, sin bloque 'notification'.
+    El service worker (firebase-messaging-sw.js) se encarga de mostrar
+    la notificación desde el campo 'data', evitando duplicados.
     """
     return {
         "message": {
             "token": token,
-            "notification": {
-                "title": titulo or "Kipu",
-                "body": cuerpo or "",
-            },
             "data": {
                 "title": titulo or "Kipu",
-                "body": cuerpo or "",
-                "url": url or "/dashboard",
-                "tipo": tipo or "",
+                "body":  cuerpo or "",
+                "url":   url or "/dashboard",
+                "tipo":  tipo or "",
             },
             "webpush": {
                 "headers": {
                     "Urgency": "high",
                     "TTL": "86400",
-                },
-                "notification": {
-                    "title": titulo or "Kipu",
-                    "body": cuerpo or "",
-                    "icon": "/icon.svg",
-                    "badge": "/icon.svg",
                 },
                 "fcm_options": {
                     "link": url or "/dashboard"
@@ -96,6 +87,7 @@ def _payload(token: str, titulo: str, cuerpo: str, url: Optional[str], tipo: Opt
             },
         }
     }
+
 
 
 def _error_code(res: httpx.Response) -> str:

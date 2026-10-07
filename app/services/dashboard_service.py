@@ -287,6 +287,7 @@ async def obtener_dashboard_core(
                     "suscripcion_activa":            suscripcion_activa,
                     "suscripcion_plan":              data_header.get("sub_plan"),
                     "suscripcion_estado":            sub_estado,
+                    "en_produccion": data_header.get("ambiente") == 2,
                     "balance_api":                   data_header.get("balance_api") or 0,
                     "tipo_emisor":                   data_header.get("tipo_emisor"),
                     "usuario_nuevo":                 not current_emisor_id,
