@@ -191,7 +191,7 @@ async def marcar_en_revision(db: AsyncSession, doc, detalle: str) -> None:
         emisor_id  = doc.emisor_id,
         tipo       = "DOCUMENTO",
         titulo     = f"{prefijo}⏳ {tipo_label} pendiente de autorización",
-        mensaje    = f"{prefijo}{tipo_label} {numero}: el SRI no ha respondido. "
+        mensaje    = f"{prefijo}{tipo_label} {numero}: parece que el SRI esta caído. "
                      "Seguiremos reintentando automáticamente.",
         referencia = f"/documentos/{doc.id}",
     )

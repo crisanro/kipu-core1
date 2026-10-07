@@ -10,28 +10,32 @@ from fastapi import HTTPException
 PERMISOS_DEFAULT = {
     "admin": {},  # admin siempre tiene todo
     "contador": {
-        "emitir":        True,
-        "descargar":     True,
-        "clientes":      True,
-        "productos":     True,
-        "declaraciones": True,
-        "reportes":      True,
+        "emitir":               True,
+        "descargar":            True,
+        "clientes":             True,
+        "productos":            True,
+        "estructura":           True,
+        "declaraciones":        True,
+        "reportes":             True,
         "documentos_recibidos": True,
-        "configuracion": False,
-        "api_keys":      False,
-        "usuarios":      False,
+        "auditoria":            False,
+        "configuracion":        False,
+        "api_keys":             False,
+        "usuarios":             False,
     },
     "emisor": {
-        "emitir":        True,
-        "descargar":     True,
-        "clientes":      True,
-        "productos":     True,
+        "emitir":               True,
+        "descargar":            True,
+        "clientes":             True,
+        "productos":            True,
+        "estructura":           True,
         "documentos_recibidos": True,
-        "declaraciones": False,
-        "reportes":      False,
-        "configuracion": False,
-        "api_keys":      False,
-        "usuarios":      False,
+        "declaraciones":        False,
+        "reportes":             False,
+        "auditoria":            False,
+        "configuracion":        False,
+        "api_keys":             False,
+        "usuarios":             False,
     },
 }
 
@@ -40,12 +44,14 @@ PERMISOS_DISPONIBLES = [
     "descargar",            # descargar PDF/XML
     "clientes",             # ver y editar clientes
     "productos",            # ver y editar productos
+    "estructura",           # ver y editar establecimientos y puntos de emisión
     "declaraciones",        # ver declaraciones SRI
     "reportes",             # ver dashboard y reportes
-    "configuracion",        # ver y editar configuración del emisor
+    "documentos_recibidos", # registrar y editar documentos de proveedores
+    "auditoria",            # ver log de auditoría
+    "configuracion",        # ver y editar configuración del emisor (datos fiscales, firma, leyendas)
     "api_keys",             # crear y revocar API keys
     "usuarios",             # invitar y gestionar usuarios
-    "documentos_recibidos", # registrar y editar documentos de proveedores
 ]
 
 def permisos_para_rol(rol: str) -> dict:
