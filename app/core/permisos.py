@@ -3,12 +3,17 @@
 # Sistema de permisos granulares por usuario/empresa.
 # El rol es una etiqueta de referencia — los permisos JSONB son lo que controla el acceso.
 # Admin siempre tiene todo, sin restricciones.
+#
+# Filosofía:
+#   - "emitir" implica LECTURA de clientes, productos y estructura (necesarios para emitir)
+#   - "clientes", "productos", "estructura" controlan EDICIÓN (crear/editar/eliminar)
+#   - Endpoints GET usan verificar_algun_permiso(auth_data, ["emitir", "clientes"])
+#   - Endpoints POST/PUT/DELETE usan verificar_permiso(auth_data, "clientes")
 
 from fastapi import HTTPException
 
-# Permisos por defecto al invitar según rol
 PERMISOS_DEFAULT = {
-    "admin": {},  # admin siempre tiene todo
+    "admin": {},
     "contador": {
         "emitir":               True,
         "descargar":            True,
@@ -23,7 +28,7 @@ PERMISOS_DEFAULT = {
         "api_keys":             False,
         "usuarios":             False,
     },
-    "emisor": {
+    "asistente": {
         "emitir":               True,
         "descargar":            True,
         "clientes":             True,
@@ -37,62 +42,69 @@ PERMISOS_DEFAULT = {
         "api_keys":             False,
         "usuarios":             False,
     },
+    "emisor": {
+        "emitir":               True,
+        "descargar":            True,
+        "documentos_recibidos": True,
+        "clientes":             False,
+        "productos":            False,
+        "estructura":           False,
+        "declaraciones":        False,
+        "reportes":             False,
+        "auditoria":            False,
+        "configuracion":        False,
+        "api_keys":             False,
+        "usuarios":             False,
+    },
 }
 
 PERMISOS_DISPONIBLES = [
-    "emitir",               # crear comprobantes
+    "emitir",               # emitir comprobantes + lectura de clientes, productos, estructura
     "descargar",            # descargar PDF/XML
-    "clientes",             # ver y editar clientes
-    "productos",            # ver y editar productos
-    "estructura",           # ver y editar establecimientos y puntos de emisión
+    "clientes",             # crear, editar y eliminar clientes
+    "productos",            # crear, editar y eliminar productos
+    "estructura",           # crear y editar establecimientos y puntos de emisión
     "declaraciones",        # ver declaraciones SRI
     "reportes",             # ver dashboard y reportes
     "documentos_recibidos", # registrar y editar documentos de proveedores
     "auditoria",            # ver log de auditoría
-    "configuracion",        # ver y editar configuración del emisor (datos fiscales, firma, leyendas)
+    "configuracion",        # datos fiscales, firma, leyendas
     "api_keys",             # crear y revocar API keys
     "usuarios",             # invitar y gestionar usuarios
 ]
 
 def permisos_para_rol(rol: str) -> dict:
-    """Retorna los permisos por defecto para un rol."""
     return PERMISOS_DEFAULT.get(rol, PERMISOS_DEFAULT["emisor"]).copy()
 
 def tiene_permiso(rol: str, permisos: dict, permiso: str) -> bool:
-    """Verifica si un usuario tiene un permiso específico."""
     if rol == "admin":
-        return True  # admin siempre tiene todo
+        return True
     return bool(permisos.get(permiso, False))
 
+def tiene_algun_permiso(rol: str, permisos: dict, permisos_requeridos: list[str]) -> bool:
+    """True si el usuario tiene AL MENOS UNO de los permisos listados."""
+    if rol == "admin":
+        return True
+    return any(permisos.get(p, False) for p in permisos_requeridos)
+
 def verificar_permiso(auth_data: dict, permiso: str):
-    """
-    Lanza 403 si el usuario no tiene el permiso.
-    Uso: verificar_permiso(auth_data, "emitir")
-    """
     rol      = auth_data.get("emisor_rol", "emisor")
     permisos = auth_data.get("permisos", {})
     if not tiene_permiso(rol, permisos, permiso):
-        raise HTTPException(
-            status_code=403,
-            detail="No tienes permisos para realizar esta acción."
-        )
+        raise HTTPException(status_code=403, detail="No tienes permisos para realizar esta acción.")
+
+def verificar_algun_permiso(auth_data: dict, permisos_requeridos: list[str]):
+    """Lanza 403 si el usuario no tiene AL MENOS UNO de los permisos."""
+    rol      = auth_data.get("emisor_rol", "emisor")
+    permisos = auth_data.get("permisos", {})
+    if not tiene_algun_permiso(rol, permisos, permisos_requeridos):
+        raise HTTPException(status_code=403, detail="No tienes permisos para realizar esta acción.")
 
 def verificar_admin(auth_data: dict):
-    """
-    Lanza 403 si el usuario no es admin.
-    Uso: verificar_admin(auth_data)
-    """
     if auth_data.get("emisor_rol") != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Solo el administrador puede realizar esta acción."
-        )
+        raise HTTPException(status_code=403, detail="Solo el administrador puede realizar esta acción.")
 
 def verificar_email(auth_data: dict):
-    """
-    Lanza 403 si el email no está verificado.
-    Uso: verificar_email(auth_data)
-    """
     if not auth_data.get("email_verified", False):
         raise HTTPException(
             status_code=403,

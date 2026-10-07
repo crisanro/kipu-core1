@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
-from app.core.permisos import verificar_permiso
+from app.core.permisos import verificar_permiso, verificar_algun_permiso
 from app.services.audit_service import audit_log
 from app.schemas.estructura import (
     EstablecimientoCreate, PuntoEmisionCreate,
@@ -17,7 +17,7 @@ from app.core.cache import cache_get, cache_set, cache_delete, CK, TTL
 router = APIRouter()
 
 # =============================================================================
-# GET /
+# GET / — LECTURA: emitir O estructura
 # =============================================================================
 @router.get("", summary="Listar establecimientos y puntos de emisión")
 async def listar_estructura(
@@ -25,7 +25,7 @@ async def listar_estructura(
     db:        AsyncSession = Depends(get_db),
 ):
     emisor_id = auth_data["emisor_id"]
-    verificar_permiso(auth_data, "estructura")
+    verificar_algun_permiso(auth_data, ["emitir", "estructura"])
 
     cache_key = CK.fmt(CK.ESTRUCTURA, eid=emisor_id)
     cached    = await cache_get(cache_key)
@@ -75,7 +75,7 @@ async def _invalidar_estructura(emisor_id: int):
     await cache_delete(f"dashboard_header:{emisor_id}")
 
 # =============================================================================
-# POST /establecimientos
+# POST /establecimientos — ESCRITURA: requiere estructura
 # =============================================================================
 @router.post("/establecimientos", summary="Crear establecimiento")
 async def crear_establecimiento(
@@ -134,7 +134,7 @@ async def crear_establecimiento(
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
-# POST /puntos-emision
+# POST /puntos-emision — ESCRITURA: requiere estructura
 # =============================================================================
 @router.post("/puntos-emision", summary="Crear punto de emisión")
 async def crear_punto_emision(
@@ -199,7 +199,7 @@ async def crear_punto_emision(
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
-# PUT /establecimientos/{id}
+# PUT /establecimientos/{id} — ESCRITURA: requiere estructura
 # =============================================================================
 @router.put("/establecimientos/{estab_id}", summary="Editar establecimiento")
 async def editar_establecimiento(
@@ -244,7 +244,7 @@ async def editar_establecimiento(
     return {"ok": True, "mensaje": "Establecimiento actualizado.", "data": dict(updated._mapping)}
 
 # =============================================================================
-# PUT /puntos-emision/{id}
+# PUT /puntos-emision/{id} — ESCRITURA: requiere estructura
 # =============================================================================
 @router.put("/puntos-emision/{punto_id}", summary="Editar punto de emisión")
 async def editar_punto_emision(
@@ -284,7 +284,7 @@ async def editar_punto_emision(
     return {"ok": True, "mensaje": "Punto actualizado.", "data": dict(updated._mapping)}
 
 # =============================================================================
-# PATCH /puntos-emision/{id}/secuencial
+# PATCH /puntos-emision/{id}/secuencial — ESCRITURA: requiere estructura
 # =============================================================================
 @router.patch("/puntos-emision/{punto_id}/secuencial", summary="Corregir secuencial")
 async def editar_secuencial(
@@ -333,7 +333,6 @@ async def editar_secuencial(
         await _invalidar_estructura(emisor_id)
         return {"ok": True, "mensaje": "Secuenciales actualizados.", "data": dict(updated._mapping)}
 
-    # Caso legacy
     nuevo_sec = data.get("secuencial_actual")
     if nuevo_sec is None or int(nuevo_sec) < 1:
         raise HTTPException(status_code=400, detail="El secuencial debe ser mayor a 0.")
