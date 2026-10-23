@@ -1,5 +1,6 @@
 # app/services/dashboard_service.py
 import json
+import asyncio
 import calendar
 from datetime import date, datetime
 import pytz
@@ -126,92 +127,93 @@ async def obtener_dashboard_core(
         if current_emisor_id:
             meses = _meses_en_rango(fecha_inicio, fecha_fin)
 
-            for (año, mes) in meses:
+            async def _cargar_mes(año, mes):
                 cache_key_mes = f"dashboard_docs:{current_emisor_id}:{año}:{mes:02d}:{sandbox}"
-                docs_mes      = await cache_get(cache_key_mes)
+                docs_mes = await cache_get(cache_key_mes)
+                if docs_mes is not None:
+                    return docs_mes
 
-                if docs_mes is None:
-                    primer_dia = date(año, mes, 1)
-                    ultimo_dia = date(año, mes, calendar.monthrange(año, mes)[1])
+                primer_dia = date(año, mes, 1)
+                ultimo_dia = date(año, mes, calendar.monthrange(año, mes)[1])
 
-                    res_docs = await db.execute(text("""
-                        SELECT
-                            d.id, d.clave_acceso, d.secuencial, d.numero_doc,
-                            d.tipo_doc, d.cod_doc, d.estado_sri, d.estado_cobro,
-                            d.importe_total, d.fecha_emision, d.created_at,
-                            d.datos,
-                            est.codigo AS estab,
-                            p.codigo   AS punto
-                        FROM documentos_emitidos d
-                        LEFT JOIN puntos_emision p     ON d.punto_emision_id = p.id
-                        LEFT JOIN establecimientos est ON p.establecimiento_id = est.id
-                        WHERE d.emisor_id      = :eid
-                        AND d.fecha_emision  >= :fini
-                        AND d.fecha_emision  <= :ffin
-                        AND d.tipo_doc       IN ('FAC', 'LIQ')
-                        AND d.es_sandbox     = :sandbox
-                        ORDER BY d.fecha_emision DESC, d.created_at DESC
-                    """), {
-                        "eid":     current_emisor_id,
-                        "fini":    primer_dia,
-                        "ffin":    ultimo_dia,
-                        "sandbox": sandbox,
+                res_docs = await db.execute(text("""
+                    SELECT
+                        d.id, d.clave_acceso, d.secuencial, d.numero_doc,
+                        d.tipo_doc, d.cod_doc, d.estado_sri, d.estado_cobro,
+                        d.importe_total, d.fecha_emision, d.created_at,
+                        d.datos,
+                        est.codigo AS estab,
+                        p.codigo   AS punto
+                    FROM documentos_emitidos d
+                    LEFT JOIN puntos_emision p     ON d.punto_emision_id = p.id
+                    LEFT JOIN establecimientos est ON p.establecimiento_id = est.id
+                    WHERE d.emisor_id      = :eid
+                    AND d.fecha_emision  >= :fini
+                    AND d.fecha_emision  <= :ffin
+                    AND d.tipo_doc       IN ('FAC', 'LIQ')
+                    AND d.es_sandbox     = :sandbox
+                    ORDER BY d.fecha_emision DESC, d.created_at DESC
+                """), {
+                    "eid":     current_emisor_id,
+                    "fini":    primer_dia,
+                    "ffin":    ultimo_dia,
+                    "sandbox": sandbox,
+                })
+
+                docs_mes = []
+                for d in res_docs.mappings():
+                    # ... (todo el procesamiento de cada doc igual que antes) ...
+                    datos    = d.get("datos") or {}
+                    detalles = datos.get("detalles", {}).get("detalle", [])
+                    if not isinstance(detalles, list):
+                        detalles = [detalles] if detalles else []
+
+                    impuestos_por_tarifa = {}
+                    for detalle in detalles:
+                        if not isinstance(detalle, dict):
+                            continue
+                        imp      = detalle.get("impuestos", {}).get("impuesto", {})
+                        imp_list = imp if isinstance(imp, list) else ([imp] if imp else [])
+                        for i in imp_list:
+                            if not isinstance(i, dict):
+                                continue
+                            tarifa = str(i.get("tarifa", "0"))
+                            if tarifa not in impuestos_por_tarifa:
+                                impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
+                            impuestos_por_tarifa[tarifa]["base"] += float(i.get("baseImponible") or 0)
+                            impuestos_por_tarifa[tarifa]["iva"]  += float(i.get("valor") or 0)
+
+                    subtotal_15   = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k != "0")
+                    subtotal_0    = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k == "0")
+                    iva_calculado = sum(v["iva"]  for v in impuestos_por_tarifa.values())
+                    total = float(d["importe_total"] or 0)
+                    razon, id_com = _contraparte(d["tipo_doc"], datos)
+
+                    docs_mes.append({
+                        "id":                str(d["id"]),
+                        "clave_acceso":      d["clave_acceso"],
+                        "numero":            d["numero_doc"] or f"{d['estab']}-{d['punto']}-{d['secuencial']}",
+                        "tipo_doc":          d["tipo_doc"],
+                        "cliente_nombre":    razon,
+                        "cliente_id":        id_com,
+                        "subtotal_15":       subtotal_15,
+                        "subtotal_0":        subtotal_0,
+                        "iva":               iva_calculado,
+                        "total":             total,
+                        "estado":            d["estado_sri"],
+                        "estado_cobro":      d["estado_cobro"],
+                        "impuestos_totales": impuestos_por_tarifa,
+                        "fecha":             d["fecha_emision"].isoformat() if isinstance(d["fecha_emision"], (date, datetime)) else str(d["fecha_emision"]),
+                        "created_at":        d["created_at"].isoformat() if isinstance(d["created_at"], (date, datetime)) else str(d["created_at"] or ""),
                     })
 
-                    docs_mes = []
-                    for d in res_docs.mappings():
-                        datos    = d.get("datos") or {}
-                        detalles = datos.get("detalles", {}).get("detalle", [])
-                        if not isinstance(detalles, list):
-                            detalles = [detalles] if detalles else []
+                ttl = TTL_MES_ACTUAL if _es_mes_actual(año, mes) else TTL_MES_PASADO
+                await cache_set(cache_key_mes, docs_mes, ttl)
+                return docs_mes
 
-                        # Calcular impuestos desde JSONB
-                        impuestos_por_tarifa = {}
-                        for detalle in detalles:
-                            if not isinstance(detalle, dict):
-                                continue
-                            imp      = detalle.get("impuestos", {}).get("impuesto", {})
-                            imp_list = imp if isinstance(imp, list) else ([imp] if imp else [])
-                            for i in imp_list:
-                                if not isinstance(i, dict):
-                                    continue
-                                tarifa = str(i.get("tarifa", "0"))
-                                if tarifa not in impuestos_por_tarifa:
-                                    impuestos_por_tarifa[tarifa] = {"base": 0.0, "iva": 0.0}
-                                impuestos_por_tarifa[tarifa]["base"] += float(i.get("baseImponible") or 0)
-                                impuestos_por_tarifa[tarifa]["iva"]  += float(i.get("valor") or 0)
-
-                        # Totales y bases calculados desde impuestos_por_tarifa
-                        subtotal_15   = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k != "0")
-                        subtotal_0    = sum(v["base"] for k, v in impuestos_por_tarifa.items() if k == "0")
-                        iva_calculado = sum(v["iva"]  for v in impuestos_por_tarifa.values())
-
-                        total = float(d["importe_total"] or 0)
-
-                        # Contraparte: comprador (FAC) o proveedor (LIQ)
-                        razon, id_com = _contraparte(d["tipo_doc"], datos)
-
-                        docs_mes.append({
-                            "id":                str(d["id"]),
-                            "clave_acceso":      d["clave_acceso"],
-                            "numero":            d["numero_doc"] or f"{d['estab']}-{d['punto']}-{d['secuencial']}",
-                            "tipo_doc":          d["tipo_doc"],
-                            "cliente_nombre":    razon,
-                            "cliente_id":        id_com,
-                            "subtotal_15":       subtotal_15,
-                            "subtotal_0":        subtotal_0,
-                            "iva":               iva_calculado,
-                            "total":             total,
-                            "estado":            d["estado_sri"],
-                            "estado_cobro":      d["estado_cobro"],
-                            "impuestos_totales": impuestos_por_tarifa,
-                            "fecha":             d["fecha_emision"].isoformat() if isinstance(d["fecha_emision"], (date, datetime)) else str(d["fecha_emision"]),
-                            "created_at":        d["created_at"].isoformat() if isinstance(d["created_at"], (date, datetime)) else str(d["created_at"] or ""),
-                        })
-
-                    ttl = TTL_MES_ACTUAL if _es_mes_actual(año, mes) else TTL_MES_PASADO
-                    await cache_set(cache_key_mes, docs_mes, ttl)
-
+            # Paralelo — todas las queries de meses a la vez
+            resultados = await asyncio.gather(*[_cargar_mes(a, m) for a, m in meses])
+            for docs_mes in resultados:
                 todos_los_docs.extend(docs_mes)
 
             # Filtrar al rango exacto
@@ -327,6 +329,11 @@ async def consultar_detalle_documento_core(
     doc_id:    str,
     db:        AsyncSession
 ):
+    # Cache 60s — un documento autorizado no cambia
+    cache_key = f"doc:detalle:{emisor_id}:{doc_id}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
     try:
         res = await db.execute(text("""
             SELECT
@@ -375,7 +382,7 @@ async def consultar_detalle_documento_core(
         email  = (datos.get("legacy_email_comprador")
                   or row.get("email") or "")
 
-        return {
+        result = {
             "ok": True,
             "documento": {
                 "id":             str(row["id"]),
@@ -412,6 +419,9 @@ async def consultar_detalle_documento_core(
                 "telefono":       row.get("telefono"),
             }
         }
+        
+        await cache_set(cache_key, result, 60)
+        return result
 
     except HTTPException as he:
         raise he

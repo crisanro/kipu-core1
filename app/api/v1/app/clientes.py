@@ -14,6 +14,7 @@ from app.services.cliente_service import (
     verificar_existencia_cliente_core,
     consultar_todos_clientes_core,
     consultar_detalle_cliente_core,
+    consultar_facturas_cliente_core,
     actualizar_cliente_core,
     buscar_clientes_core
 )
@@ -78,10 +79,28 @@ async def verificar_cliente(
 async def consultar_detalle_cliente(
     cliente_id: str,
     auth_data:  dict         = Depends(verify_firebase_token),
-    db:         AsyncSession = Depends(get_db)
+    db:         AsyncSession = Depends(get_db),
+    facturas_limit: int      = QueryParam(5, ge=1, le=100, description="Máximo de facturas a devolver"),
 ):
     verificar_permiso(auth_data, "clientes")
-    return await consultar_detalle_cliente_core(auth_data["emisor_id"], cliente_id, db)
+    return await consultar_detalle_cliente_core(
+        auth_data["emisor_id"], cliente_id, db,
+        facturas_limit=facturas_limit,
+    )
+
+@router.get("/detalle/{cliente_id}/facturas", summary="Siguiente página de facturas del cliente")
+async def listar_facturas_cliente(
+    cliente_id: str,
+    auth_data:  dict         = Depends(verify_firebase_token),
+    db:         AsyncSession = Depends(get_db),
+    limit:      int          = QueryParam(5, ge=1, le=100),
+    cursor:     str | None   = QueryParam(None, description="ISO datetime del último created_at"),
+):
+    verificar_permiso(auth_data, "clientes")
+    return await consultar_facturas_cliente_core(
+        auth_data["emisor_id"], cliente_id, db,
+        cursor=cursor, limit=limit,
+    )
 
 @router.get("/{identificacion}")
 async def consultar_cliente(

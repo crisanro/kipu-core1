@@ -29,55 +29,31 @@
 #   - NC y ND heredan el email del documento origen.
 #   - Invalidación de caché unificada vía app.core.cache.invalidate_emisor.
 
-import json
-import pytz
-from datetime import datetime, date
+from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 from app.utils.calculadora import calcular_totales_e_impuestos
 from app.utils.crypto import generar_clave_acceso
-from app.utils.sri_core import (
-    resolver_cliente,
-    completar_items_catalogo,
-    resolver_pagos,
-    construir_campos_adicionales,
-    firmar_xml,
+from app.utils.sri_core import resolver_cliente, completar_items_catalogo, firmar_xml
+from app.core.cache import get_redis, invalidate_emisor
+from app.services.notification_service import despachar_notificaciones, descartar_notificaciones
+
+from app.services.documentos.helpers import (
+    TZ_EC, TIPO_DOC_MAP,
+    LIMITE_EFECTIVO, COD_EFECTIVO,
+    preparar_items_desde_raw,
 )
-from app.services.storage_service import upload_file
-from app.services import stock_service
-from app.core.cache import get_redis
-from app.core.cache import invalidate_emisor
-from app.services.notification_service import (
-    crear_notificacion,
-    encolar_notificacion,
-    despachar_notificaciones,
-    descartar_notificaciones,
+from app.services.documentos.acceso import verificar_acceso
+from app.services.documentos.origen import (
+    cargar_doc_origen_emitido,
+    cargar_ret_desde_emitido,
+    cargar_doc_origen_recibido,
 )
+from app.services.documentos.secuencial import reservar_secuencial
+from app.services.documentos.xml_builder import construir_xml
+from app.services.documentos.persistencia import persistir
 
-
-TZ_EC = pytz.timezone("America/Guayaquil")
-
-TIPO_DOC_MAP = {
-    "FAC": {"cod_doc": "01", "xml_root": "factura",              "xml_version": "1.1.0"},
-    "LIQ": {"cod_doc": "03", "xml_root": "liquidacionCompra",    "xml_version": "1.1.0"},
-    "NCR": {"cod_doc": "04", "xml_root": "notaCredito",          "xml_version": "1.1.0"},
-    "NDB": {"cod_doc": "05", "xml_root": "notaDebito",           "xml_version": "1.0.0"},
-    "RET": {"cod_doc": "07", "xml_root": "comprobanteRetencion", "xml_version": "2.0.0"},
-}
-
-# Regla tributaria EC: >= $500 debe usar sistema financiero (no efectivo "01")
-LIMITE_EFECTIVO = Decimal("500.00")
-COD_EFECTIVO    = "01"
-
-MOTIVOS_NCR_VALIDOS = [
-    "DEVOLUCION DE BIEN",
-    "ANULACION DE COMPROBANTE",
-    "REBAJA DE PRECIO",
-    "DESCUENTO COMERCIAL",
-    "OTROS",
-]
 
 # =============================================================================
 # FUNCIÓN PRINCIPAL
@@ -97,7 +73,7 @@ async def emitir_documento_core(
     tipo_info = TIPO_DOC_MAP[tipo_doc]
     try:
         # BLOQUE 0: Verificar acceso
-        emisor, acceso = await _verificar_acceso(emisor_id, api_key_id, es_sandbox, db)
+        emisor, acceso = await verificar_acceso(emisor_id, api_key_id, es_sandbox, db)
         ambiente_efectivo = 1 if es_sandbox else emisor.ambiente
 
         # BLOQUE 1: Resolver cliente / documento origen
@@ -108,7 +84,7 @@ async def emitir_documento_core(
         if tipo_doc in ("FAC", "LIQ"):
             cliente_final, cliente_id = await resolver_cliente(data, emisor_id, db)
         elif tipo_doc in ("NCR", "NDB"):
-            doc_origen_emitido, cliente_final = await _cargar_doc_origen_emitido(
+            doc_origen_emitido, cliente_final = await cargar_doc_origen_emitido(
                 data, emisor_id, tipo_doc, db
             )
 
@@ -121,21 +97,28 @@ async def emitir_documento_core(
             doc_origen_emitido_id  = data.get("doc_origen_emitido_id")
             doc_origen_recibido_id = data.get("doc_origen_recibido_id")
             if doc_origen_emitido_id or (data.get("doc_origen_numero") and data.get("doc_origen_cod_doc") == "03"):
-                doc_origen_emitido, cliente_final = await _cargar_ret_desde_emitido(
+                doc_origen_emitido, cliente_final = await cargar_ret_desde_emitido(
                     data, emisor_id, db
                 )
             else:
-                doc_origen_recibido, cliente_final = await _cargar_doc_origen_recibido(
+                doc_origen_recibido, cliente_final = await cargar_doc_origen_recibido(
                     data, emisor_id, db
                 )
 
         # BLOQUE 2: Calcular totales y reservar secuencial
-        punto_emision, secuencial = await _reservar_secuencial(
+        punto_emision, secuencial = await reservar_secuencial(
             data, emisor_id, tipo_doc, db, es_sandbox=es_sandbox
         )
         ahora_ec    = datetime.now(TZ_EC)
         fecha_sri   = ahora_ec.strftime("%d/%m/%Y")
         fecha_clave = ahora_ec.strftime("%Y-%m-%d")
+
+        # ── Default estado de cobro para FAC, LIQ, NDB ───────────────
+        if tipo_doc in ("FAC", "LIQ", "NDB"):
+            if not data.get("estado_cobro"):
+                data["estado_cobro"] = "PAGADO"
+                if not data.get("fecha_pago"):
+                    data["fecha_pago"] = data.get("fecha_emision") or ahora_ec.strftime("%Y-%m-%d")
 
         calculos      = None
         importe_total = Decimal("0.00")
@@ -161,13 +144,12 @@ async def emitir_documento_core(
             calculos        = calcular_totales_e_impuestos(items_completos)
             importe_total   = Decimal(str(calculos["totales"]["importeTotal"]))
         elif tipo_doc == "NCR":
-            items_completos = _preparar_items_desde_raw(data.get("items", []))
+            items_completos = preparar_items_desde_raw(data.get("items", []))
             calculos        = calcular_totales_e_impuestos(items_completos)
             importe_total   = Decimal(str(calculos["totales"]["importeTotal"]))
         elif tipo_doc == "NDB":
             motivos_raw   = data.get("motivos", [])
             importe_total = sum(Decimal(str(m.get("valor", 0))) for m in motivos_raw)
-            # Sumar IVA al total si viene desglose de impuestos
             impuestos_ndb_raw = data.get("impuestos", [])
             if impuestos_ndb_raw:
                 importe_total += sum(Decimal(str(i.get("valor", 0))) for i in impuestos_ndb_raw)
@@ -206,7 +188,7 @@ async def emitir_documento_core(
         direccion_est    = punto_emision.direccion_est or emisor.direccion_matriz
 
         # BLOQUE 3: Construir XML
-        xml_obj = await _construir_xml(
+        xml_obj = await construir_xml(
             tipo_doc            = tipo_doc,
             tipo_info           = tipo_info,
             data                = data,
@@ -229,7 +211,7 @@ async def emitir_documento_core(
         xml_firmado_str = await firmar_xml(xml_obj, emisor)
 
         # BLOQUE 5: Persistir
-        doc_id = await _persistir(
+        doc_id = await persistir(
             tipo_doc            = tipo_doc,
             cod_doc             = tipo_info["cod_doc"],
             xml_firmado_str     = xml_firmado_str,
@@ -260,7 +242,6 @@ async def emitir_documento_core(
         await _post_commit(doc_id, acceso)
         await invalidate_emisor(emisor.id)
 
-        # Notificaciones diferidas (ej. stock bajo). Si fallan, NO afectan al documento.
         try:
             await despachar_notificaciones(db)
         except Exception as e:
@@ -295,1042 +276,8 @@ async def _post_commit(doc_id: str, acceso: dict) -> None:
         if redis_key:
             nuevo = await redis.incr(redis_key)
             if nuevo == 1:
-                ttl_dias = acceso.get("redis_ttl", 1)  # sandbox = 1 día, prod = 35 días
+                ttl_dias = acceso.get("redis_ttl", 1)
                 await redis.expire(redis_key, ttl_dias * 86400)
-        # Todos van al SRI — el worker decide la URL según es_sandbox
         await redis.lpush("kipu:queue:emision", doc_id)
     except Exception as e:
         print(f"[Usage/Queue] ⚠️ Error Redis (la conciliación lo recogerá): {e}")
-
-
-# =============================================================================
-# BLOQUE 0 — VERIFICAR ACCESO
-# =============================================================================
-async def _verificar_acceso(emisor_id: int, api_key_id: int, es_sandbox: bool, db: AsyncSession):
-    # ── Validar firma electrónica ─────────────────────────────────────────────
-    res_firma = await db.execute(text("""
-        SELECT p12_path, p12_expiration
-        FROM emisores WHERE id = :eid
-    """), {"eid": emisor_id})
-    firma = res_firma.fetchone()
-    if not firma or not firma.p12_path:
-        raise HTTPException(
-            status_code=402,
-            detail="Debes cargar tu firma electrónica antes de emitir."
-        )
-    if not firma.p12_expiration or firma.p12_expiration <= date.today():
-        raise HTTPException(
-            status_code=402,
-            detail="Tu firma electrónica está vencida. Actualízala para continuar."
-        )
-    # ── Sandbox ───────────────────────────────────────────────────────────────
-    if es_sandbox:
-        res = await db.execute(text("""
-            SELECT e.* FROM emisores e WHERE e.id = :eid
-        """), {"eid": emisor_id})
-        emisor = res.fetchone()
-        if not emisor:
-            raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-        redis    = await get_redis()
-        hoy      = datetime.now(TZ_EC).strftime("%Y-%m-%d")
-        key_sand = f"kipu:usage:sandbox:{emisor_id}:{hoy}"
-        uso_hoy_raw = await redis.get(key_sand)
-        if uso_hoy_raw is None:
-            res_count = await db.execute(text("""
-                SELECT COUNT(*) FROM documentos_emitidos
-                WHERE emisor_id  = :eid
-                  AND es_sandbox = true
-                  AND DATE(created_at AT TIME ZONE 'America/Guayaquil') = CURRENT_DATE
-            """), {"eid": emisor_id})
-            uso_hoy = res_count.scalar() or 0
-            await redis.set(key_sand, uso_hoy, ex=86400)
-        else:
-            uso_hoy = int(uso_hoy_raw)
-        if uso_hoy >= 100:
-            raise HTTPException(
-                status_code=429,
-                detail="Límite de 100 documentos de prueba por día alcanzado."
-            )
-        return emisor, {"tipo": "sandbox", "descontar_credito": False, "redis_key": key_sand, "redis_ttl": 1}
-    # ── Producción ────────────────────────────────────────────────────────────
-    res = await db.execute(text("""
-        SELECT e.*,
-               COALESCE(uc.balance, 0) AS balance,
-               s.estado                AS sub_estado,
-               s.current_period_end,
-               s.api_limit_mensual
-        FROM emisores e
-        LEFT JOIN user_credits  uc ON e.id = uc.emisor_id
-        LEFT JOIN subscriptions s  ON e.id = s.emisor_id
-        WHERE e.id = :eid
-    """), {"eid": emisor_id})
-    emisor = res.fetchone()
-    if not emisor:
-        raise HTTPException(status_code=404, detail="Emisor no encontrado.")
-    sub_estado = getattr(emisor, "sub_estado", None)
-    balance    = getattr(emisor, "balance", 0) or 0
-    tiene_sub  = sub_estado in ("ACTIVO", "TRIAL")
-    if not tiene_sub and balance <= 0:
-        raise HTTPException(
-            status_code=402,
-            detail="Se requiere suscripción activa o créditos API para emitir."
-        )
-    # ── Suscriptor — verificar límite mensual ─────────────────────────────────
-    if tiene_sub:
-        limite   = getattr(emisor, "api_limit_mensual", 200) or 200
-        redis    = await get_redis()
-        mes      = datetime.now(TZ_EC).strftime("%Y-%m")
-        key_prod = f"kipu:usage:prod:{emisor_id}:{mes}"
-        uso_mes_raw = await redis.get(key_prod)
-        if uso_mes_raw is None:
-            res_count = await db.execute(text("""
-                SELECT COUNT(*) FROM documentos_emitidos
-                WHERE emisor_id  = :eid
-                  AND es_sandbox = false
-                  AND DATE_TRUNC('month', created_at AT TIME ZONE 'America/Guayaquil')
-                    = DATE_TRUNC('month', NOW() AT TIME ZONE 'America/Guayaquil')
-            """), {"eid": emisor_id})
-            uso_mes = res_count.scalar() or 0
-            await redis.set(key_prod, uso_mes, ex=35 * 86400)
-        else:
-            uso_mes = int(uso_mes_raw)
-        if uso_mes >= limite:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Límite de {limite} documentos por mes alcanzado. Adquiere créditos adicionales para continuar."
-            )
-        tipo = "api" if api_key_id else "web"
-        return emisor, {"tipo": tipo, "descontar_credito": False, "redis_key": key_prod, "redis_ttl": 35}
-    # ── Sin suscripción — usa créditos ────────────────────────────────────────
-    await db.execute(text("""
-        SELECT emisor_id FROM user_credits WHERE emisor_id = :eid FOR UPDATE
-    """), {"eid": emisor_id})
-    tipo = "api" if api_key_id else "credito"
-    return emisor, {"tipo": tipo, "descontar_credito": True, "redis_key": None}
-
-# =============================================================================
-# BLOQUE 1 — CARGAR DOCUMENTO ORIGEN
-# =============================================================================
-async def _cargar_doc_origen_emitido(data: dict, emisor_id: int, tipo_doc: str, db: AsyncSession):
-    doc_id = data.get("doc_origen_id")
-    numero = data.get("doc_origen_numero")
-    fecha  = data.get("doc_origen_fecha")
-
-    if not doc_id:
-        if not numero or not fecha:
-            raise HTTPException(
-                status_code=400,
-                detail="Debe proporcionar 'doc_origen_id' o 'doc_origen_numero' + 'doc_origen_fecha'."
-            )
-
-        cliente_origen = data.get("cliente_origen") or {}
-
-        if not cliente_origen.get("identificacion") or not cliente_origen.get("razon_social"):
-            raise HTTPException(
-                status_code=400,
-                detail="Para documentos externos debe proporcionar 'cliente_origen' con identificacion y razon_social."
-            )
-
-        try:
-            fecha_obj = datetime.strptime(fecha, "%d/%m/%Y").date()
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Formato de fecha inválido. Use dd/mm/yyyy."
-            )
-
-        class DocManual:
-            id            = None
-            numero_doc    = numero
-            clave_acceso  = None
-            fecha_emision = fecha_obj
-            tipo_doc      = "FAC"
-            cod_doc       = data.get("doc_origen_cod_doc", "01")
-            datos         = {}
-
-        cliente_final = {
-            "identificacion": cliente_origen.get("identificacion"),
-            "razon_social":   cliente_origen.get("razon_social"),
-            "email":          cliente_origen.get("email"),
-            "direccion":      cliente_origen.get("direccion", "S/N"),
-            "telefono":       "",
-            "tipo_id":        cliente_origen.get("tipo_id", "05"),
-        }
-        return DocManual(), cliente_final
-
-    tipos_validos = ("FAC",) if tipo_doc in ("NCR", "NDB") else ("FAC", "LIQ", "NCR")
-
-    res = await db.execute(text("""
-        SELECT
-            d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
-            d.tipo_doc, d.cod_doc, d.datos, d.email_comprador,
-            d.punto_emision_id, d.cliente_id,
-            e.id as emisor_db_id, e.ruc, e.razon_social, e.nombre_comercial,
-            e.direccion_matriz, e.ambiente, e.p12_path, e.p12_pass,
-            e.obligado_contabilidad, e.contribuyente_especial,
-            p.codigo as punto_codigo,
-            est.codigo as estab_codigo,
-            est.direccion as direccion_est,
-            est.nombre_comercial as nombre_est
-        FROM documentos_emitidos d
-        JOIN emisores e  ON d.emisor_id = e.id
-        JOIN puntos_emision p ON d.punto_emision_id = p.id
-        JOIN establecimientos est ON p.establecimiento_id = est.id
-        WHERE d.id = :did
-          AND d.emisor_id = :eid
-          AND d.estado_sri = 'AUTORIZADO'
-          AND d.tipo_doc = ANY(:tipos)
-        FOR UPDATE
-    """), {"did": doc_id, "eid": emisor_id, "tipos": list(tipos_validos)})
-
-    doc = res.fetchone()
-    if not doc:
-        raise HTTPException(
-            status_code=404,
-            detail="Documento origen no encontrado, no autorizado o tipo inválido."
-        )
-
-    datos = doc.datos or {}
-    info  = (
-        datos.get("infoFactura") or
-        datos.get("infoLiquidacionCompra") or
-        datos.get("infoNotaCredito") or {}
-    )
-    cliente_final = {
-        "identificacion": (
-            info.get("identificacionComprador") or
-            info.get("identificacionProveedor") or
-            datos.get("legacy_id_comprador")
-        ),
-        "razon_social": (
-            info.get("razonSocialComprador") or
-            info.get("razonSocialProveedor") or
-            datos.get("legacy_razon_comprador")
-        ),
-        # Antes solo se leía el campo legacy: las NC/ND no le llegaban al cliente por correo
-        "email":      doc.email_comprador or datos.get("legacy_email_comprador"),
-        "direccion": "S/N",
-        "telefono":  "",
-        "tipo_id": (
-            info.get("tipoIdentificacionComprador") or
-            info.get("tipoIdentificacionProveedor") or
-            "05"
-        ),
-    }
-    return doc, cliente_final
-
-
-async def _cargar_ret_desde_emitido(data: dict, emisor_id: int, db: AsyncSession):
-    doc_id = data.get("doc_origen_emitido_id") or data.get("doc_origen_id")
-    numero = data.get("doc_origen_numero")
-    fecha  = data.get("doc_origen_fecha")
-
-    if not doc_id:
-        if not numero or not fecha:
-            raise HTTPException(
-                status_code=400,
-                detail="Debe proporcionar 'doc_origen_emitido_id' o 'doc_origen_numero' + 'doc_origen_fecha'."
-            )
-        cliente_origen = data.get("cliente_origen") or data.get("proveedor_origen") or {}
-        if not cliente_origen.get("identificacion") or not cliente_origen.get("razon_social"):
-            raise HTTPException(
-                status_code=400,
-                detail="Para documentos externos debe proporcionar 'cliente_origen' o 'proveedor_origen'."
-            )
-        try:
-            fecha_obj = datetime.strptime(fecha, "%d/%m/%Y").date()
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Formato de fecha inválido. Use dd/mm/yyyy.")
-
-        class DocEmitidoManual:
-            id                     = None
-            numero_doc             = numero
-            clave_acceso           = None
-            fecha_emision          = fecha_obj
-            ruc_proveedor          = cliente_origen.get("identificacion")
-            razon_social_proveedor = cliente_origen.get("razon_social")
-            cod_doc                = data.get("doc_origen_cod_doc", "03")
-            datos                  = {}
-
-        cliente_final = {
-            "identificacion": cliente_origen.get("identificacion"),
-            "razon_social":   cliente_origen.get("razon_social"),
-            "email":          cliente_origen.get("email"),
-            "direccion":      cliente_origen.get("direccion", "S/N"),
-            "telefono":       "",
-            "tipo_id":        cliente_origen.get("tipo_id", "05"),
-        }
-        return DocEmitidoManual(), cliente_final
-
-    res = await db.execute(text("""
-        SELECT
-            d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
-            d.tipo_doc, d.cod_doc, d.datos,
-            e.contribuyente_especial, e.obligado_contabilidad
-        FROM documentos_emitidos d
-        JOIN emisores e ON d.emisor_id = e.id
-        WHERE d.id         = :did
-          AND d.emisor_id  = :eid
-          AND d.estado_sri = 'AUTORIZADO'
-          AND d.tipo_doc   = 'LIQ'
-        FOR UPDATE
-    """), {"did": doc_id, "eid": emisor_id})
-
-    doc = res.fetchone()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Liquidación no encontrada o no autorizada.")
-
-    datos = doc.datos or {}
-    info  = datos.get("infoLiquidacionCompra") or {}
-
-    cliente_final = {
-        "identificacion": info.get("identificacionProveedor"),
-        "razon_social":   info.get("razonSocialProveedor"),
-        "email":          None,
-        "direccion":      "S/N",
-        "telefono":       "",
-        "tipo_id":        info.get("tipoIdentificacionProveedor", "05"),
-    }
-
-    class DocLiqComoRecibido:
-        id                     = doc.id
-        numero_doc             = doc.numero_doc
-        clave_acceso           = doc.clave_acceso
-        fecha_emision          = doc.fecha_emision
-        ruc_proveedor          = info.get("identificacionProveedor")
-        razon_social_proveedor = info.get("razonSocialProveedor")
-        cod_doc                = doc.cod_doc
-        datos                  = doc.datos
-
-    return DocLiqComoRecibido(), cliente_final
-
-
-async def _cargar_doc_origen_recibido(data: dict, emisor_id: int, db: AsyncSession):
-    doc_id = data.get("doc_origen_recibido_id") or data.get("doc_origen_id")
-    numero = data.get("doc_origen_numero")
-    fecha  = data.get("doc_origen_fecha")
-
-    if not doc_id:
-        if not numero or not fecha:
-            raise HTTPException(
-                status_code=400,
-                detail="Debe proporcionar 'doc_origen_recibido_id' o 'doc_origen_numero' + 'doc_origen_fecha'."
-            )
-
-        cliente_origen = data.get("cliente_origen") or data.get("proveedor_origen") or {}
-
-        if not cliente_origen.get("identificacion") or not cliente_origen.get("razon_social"):
-            raise HTTPException(
-                status_code=400,
-                detail="Para documentos externos debe proporcionar 'cliente_origen' o 'proveedor_origen'."
-            )
-
-        try:
-            fecha_obj = datetime.strptime(fecha, "%d/%m/%Y").date()
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Formato de fecha inválido. Use dd/mm/yyyy."
-            )
-
-        class DocRecibidoManual:
-            id                     = None
-            numero_doc             = numero
-            clave_acceso           = None
-            fecha_emision          = fecha_obj
-            ruc_proveedor          = cliente_origen.get("identificacion")
-            razon_social_proveedor = cliente_origen.get("razon_social")
-            cod_doc                = data.get("doc_origen_cod_doc", "01")
-            datos                  = {}
-
-        cliente_final = {
-            "identificacion": cliente_origen.get("identificacion"),
-            "razon_social":   cliente_origen.get("razon_social"),
-            "email":          cliente_origen.get("email"),
-            "direccion":      cliente_origen.get("direccion", "S/N"),
-            "telefono":       "",
-            "tipo_id":        cliente_origen.get("tipo_id", "04"),
-        }
-        return DocRecibidoManual(), cliente_final
-
-    res = await db.execute(text("""
-        SELECT
-            d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
-            d.ruc_proveedor, d.razon_social_proveedor, d.datos,
-            d.cod_doc,
-            e.id as emisor_db_id, e.ruc, e.razon_social, e.nombre_comercial,
-            e.direccion_matriz, e.ambiente, e.p12_path, e.p12_pass,
-            e.contribuyente_especial, e.obligado_contabilidad
-        FROM documentos_recibidos d
-        JOIN emisores e ON d.emisor_id = e.id
-        WHERE d.id = :did AND d.emisor_id = :eid
-        FOR UPDATE
-    """), {"did": doc_id, "eid": emisor_id})
-
-    doc = res.fetchone()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Documento recibido no encontrado.")
-
-    res_ret = await db.execute(text("""
-        SELECT id FROM documentos_emitidos
-        WHERE doc_origen_recibido_id = :did AND tipo_doc = 'RET'
-    """), {"did": doc_id})
-    if res_ret.fetchone():
-        raise HTTPException(status_code=409, detail="Este documento ya tiene una retención emitida.")
-
-    cliente_final = {
-        "identificacion": doc.ruc_proveedor,
-        "razon_social":   doc.razon_social_proveedor,
-        "email":          None,
-        "direccion":      "S/N",
-        "telefono":       "",
-        "tipo_id":        "04",
-    }
-    return doc, cliente_final
-
-
-# =============================================================================
-# BLOQUE 2 — RESERVAR SECUENCIAL
-# =============================================================================
-async def _reservar_secuencial(data: dict, emisor_id: int, tipo_doc: str, db: AsyncSession, es_sandbox: bool = False):
-    """Reserva el siguiente secuencial del punto de emisión por tipo de documento y ambiente."""
-    estab = str(data.get("establecimiento", "001")).zfill(3)
-    pto   = str(data.get("punto_emision",   "001")).zfill(3)
-
-    res = await db.execute(text("""
-        SELECT
-            p.id as punto_id,
-            p.codigo as punto_codigo,
-            p.secuenciales,
-            est.codigo as estab_codigo,
-            est.direccion as direccion_est,
-            est.nombre_comercial as nombre_est
-        FROM puntos_emision p
-        JOIN establecimientos est ON p.establecimiento_id = est.id
-        WHERE est.codigo    = :estab
-          AND p.codigo      = :pto
-          AND est.emisor_id = :eid
-          AND p.is_active   = true
-    """), {"estab": estab, "pto": pto, "eid": emisor_id})
-
-    punto = res.fetchone()
-    if not punto:
-        raise HTTPException(status_code=404, detail="Establecimiento o punto de emisión no encontrado.")
-
-    rama = "pruebas" if es_sandbox else "produccion"
-
-    res_sec = await db.execute(text("""
-        UPDATE puntos_emision
-        SET secuenciales = jsonb_set(
-            secuenciales,
-            ARRAY[:rama, :tipo_doc],
-            ((COALESCE((secuenciales->:rama->>:tipo_doc)::int, 0) + 1)::text)::jsonb
-        )
-        WHERE id = :pid
-        RETURNING (secuenciales->:rama->>:tipo_doc)::int AS sec
-    """), {"pid": punto.punto_id, "tipo_doc": tipo_doc, "rama": rama})
-
-    secuencial = str(res_sec.scalar()).zfill(9)
-    return punto, secuencial
-
-
-# =============================================================================
-# BLOQUE 3 — CONSTRUIR XML
-# =============================================================================
-async def _construir_xml(
-    tipo_doc, tipo_info, data, emisor, punto_emision,
-    cliente_final, calculos, clave_acceso, secuencial,
-    fecha_sri, nombre_comercial, direccion_est,
-    doc_origen_emitido, doc_origen_recibido, importe_total,
-    ambiente_efectivo: int = None,
-) -> dict:
-
-    info_tributaria = {
-        "ambiente":        ambiente_efectivo or emisor.ambiente,
-        "tipoEmision":     "1",
-        "razonSocial":      emisor.razon_social,
-        "nombreComercial": nombre_comercial,
-        "ruc":             emisor.ruc,
-        "claveAcceso":     clave_acceso,
-        "codDoc":          tipo_info["cod_doc"],
-        "estab":           punto_emision.estab_codigo,
-        "ptoEmi":          punto_emision.punto_codigo,
-        "secuencial":      secuencial,
-        "dirMatriz":       emisor.direccion_matriz,
-    }
-
-    # ══ Leyendas SRI — Ficha Técnica v2.34 (tags en infoTributaria) ═════════
-    if getattr(emisor, "agente_retencion", None):
-        info_tributaria["agenteRetencion"] = emisor.agente_retencion
-    if getattr(emisor, "regimen_rimpe", None):
-        info_tributaria["contribuyenteRimpe"] = emisor.regimen_rimpe
-
-    # ══ Campos adicionales (infoAdicional) ══════════════════════════════════
-    campos_adicionales = construir_campos_adicionales(data)
-    # Anexo 24: Gran Contribuyente
-    if getattr(emisor, "gran_contribuyente_resolucion", None):
-        campos_adicionales.insert(-1, {  # antes del RUC Proveedor que va al final
-            "@nombre": "Gran Contribuyente",
-            "#text":   emisor.gran_contribuyente_resolucion,
-        })
-
-    # ── FAC ───────────────────────────────────────────────────────────────────
-    if tipo_doc == "FAC":
-        propina   = Decimal(str(data.get("propina", 0) or 0)).quantize(Decimal("0.01"))
-        pagos_xml = resolver_pagos(data.get("pagos", []), importe_total)
-
-        info_fac = {
-            "fechaEmision":                fecha_sri,
-            "dirEstablecimiento":          direccion_est,
-            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
-            "obligadoContabilidad":        getattr(emisor, "obligado_contabilidad", "NO"),
-            "tipoIdentificacionComprador": cliente_final["tipo_id"],
-            "razonSocialComprador":        cliente_final["razon_social"],
-            "identificacionComprador":     cliente_final["identificacion"],
-            "totalSinImpuestos":           calculos["totales"]["totalSinImpuestos"],
-            "totalDescuento":              calculos["totales"]["totalDescuento"],
-            "totalConImpuestos":           {"totalImpuesto": calculos["totalConImpuestosXml"]},
-            "propina":                      f"{propina:.2f}",
-            "importeTotal":                f"{importe_total:.2f}",
-            "moneda":                      "DOLAR",
-            "pagos":                       {"pago": pagos_xml},
-        }
-
-        return {
-            "factura": {
-                "@id":            "comprobante",
-                "@version":        tipo_info["xml_version"],
-                "infoTributaria": info_tributaria,
-                "infoFactura":    info_fac,
-                "detalles":       {"detalle": calculos["detallesXml"]},
-                "infoAdicional":  {"campoAdicional": campos_adicionales},
-            }
-        }
-
-    # ── LIQ ───────────────────────────────────────────────────────────────────
-    elif tipo_doc == "LIQ":
-        pagos_xml = resolver_pagos(data.get("pagos", []), importe_total)
-
-        info_liq = {
-            "fechaEmision":                 fecha_sri,
-            "dirEstablecimiento":           direccion_est,
-            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
-            "obligadoContabilidad":         getattr(emisor, "obligado_contabilidad", "NO"),
-            "tipoIdentificacionProveedor":  cliente_final["tipo_id"],
-            "razonSocialProveedor":         cliente_final["razon_social"],
-            "identificacionProveedor":      cliente_final["identificacion"],
-            "direccionProveedor":           cliente_final.get("direccion", "S/N"),
-            "totalSinImpuestos":            calculos["totales"]["totalSinImpuestos"],
-            "totalDescuento":               calculos["totales"]["totalDescuento"],
-            "totalConImpuestos":            {"totalImpuesto": calculos["totalConImpuestosXml"]},
-            "importeTotal":                 f"{importe_total:.2f}",
-            "moneda":                       "DOLAR",
-            "pagos":                        {"pago": pagos_xml},
-        }
-
-        return {
-            "liquidacionCompra": {
-                "@id":                   "comprobante",
-                "@version":               tipo_info["xml_version"],
-                "infoTributaria":        info_tributaria,
-                "infoLiquidacionCompra": info_liq,
-                "detalles":              {"detalle": calculos["detallesXml"]},
-                "infoAdicional":         {"campoAdicional": campos_adicionales},
-            }
-        }
-
-    # ── NCR ───────────────────────────────────────────────────────────────────
-    elif tipo_doc == "NCR":
-        motivo = data.get("motivo", "OTROS").strip().upper()
-        if not motivo:
-            motivo = "OTROS"
-
-        datos_origen = doc_origen_emitido.datos or {}
-        info_origen  = datos_origen.get("infoFactura") or datos_origen.get("infoLiquidacionCompra") or {}
-        fecha_origen = doc_origen_emitido.fecha_emision.strftime("%d/%m/%Y")
-        detalles_nc  = _adaptar_detalles_nc(calculos["detallesXml"])
-
-        info_nc = {
-            "fechaEmision":                fecha_sri,
-            "dirEstablecimiento":          direccion_est,
-            "tipoIdentificacionComprador": cliente_final["tipo_id"],
-            "razonSocialComprador":        cliente_final["razon_social"],
-            "identificacionComprador":     cliente_final["identificacion"],
-            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
-            "obligadoContabilidad":        info_origen.get("obligadoContabilidad", "NO"),
-            "codDocModificado":            doc_origen_emitido.cod_doc,
-            "numDocModificado":            doc_origen_emitido.numero_doc,
-            "fechaEmisionDocSustento":     fecha_origen,
-            "totalSinImpuestos":           calculos["totales"]["totalSinImpuestos"],
-            "valorModificacion":           calculos["totales"]["importeTotal"],
-            "totalConImpuestos":           {"totalImpuesto": calculos["totalConImpuestosXml"]},
-            "motivo":                      motivo,
-        }
-
-        return {
-            "notaCredito": {
-                "@id":              "comprobante",
-                "@version":        tipo_info["xml_version"],
-                "infoTributaria":  info_tributaria,
-                "infoNotaCredito": info_nc,
-                "detalles":        {"detalle": detalles_nc},
-                "infoAdicional":   {"campoAdicional": campos_adicionales},
-            }
-        }
-
-    # ── NDB ───────────────────────────────────────────────────────────────────
-    elif tipo_doc == "NDB":
-        motivos_raw = data.get("motivos", [])
-        if not motivos_raw:
-            raise HTTPException(status_code=400, detail="Se requiere al menos un motivo.")
-
-        datos_origen = doc_origen_emitido.datos or {}
-        info_origen  = datos_origen.get("infoFactura") or datos_origen.get("infoLiquidacionCompra") or {}
-        fecha_origen = doc_origen_emitido.fecha_emision.strftime("%d/%m/%Y")
-
-        total_ndb = sum(Decimal(str(m.get("valor", 0))) for m in motivos_raw)
-
-        motivos_xml = [
-            {
-                "razon": m.get("razon", ""),
-                "valor": f"{Decimal(str(m.get('valor', 0))):.2f}",
-            }
-            for m in motivos_raw
-        ]
-
-        impuestos_ndb_raw = data.get("impuestos", [])
-        if impuestos_ndb_raw:
-            impuestos_ndb_xml = [
-                {
-                    "codigo":           str(i.get("codigo", "2")),
-                    "codigoPorcentaje": str(i.get("codigoPorcentaje", "4")),
-                    "tarifa":           str(i.get("tarifa", "15")),
-                    "baseImponible":    f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
-                    "valor":            f"{Decimal(str(i.get('valor', 0))):.2f}",
-                }
-                for i in impuestos_ndb_raw
-            ]
-        else:
-            impuestos_ndb_xml = [{
-                "codigo":           "2",
-                "codigoPorcentaje": "0",
-                "tarifa":           "0",
-                "baseImponible":    f"{total_ndb:.2f}",
-                "valor":            "0.00",
-            }]
-
-        total_iva_ndb = sum(Decimal(str(i.get('valor', 0))) for i in impuestos_ndb_raw) if impuestos_ndb_raw else Decimal('0')
-        valor_total_ndb = total_ndb + total_iva_ndb
-
-        pagos_xml = resolver_pagos(data.get("pagos", []), valor_total_ndb)
-
-        info_ndb = {
-            "fechaEmision":                fecha_sri,
-            "dirEstablecimiento":          direccion_est,
-            "tipoIdentificacionComprador": cliente_final["tipo_id"],
-            "razonSocialComprador":        cliente_final["razon_social"],
-            "identificacionComprador":     cliente_final["identificacion"],
-            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
-            "obligadoContabilidad":        info_origen.get("obligadoContabilidad", "NO"),
-            "codDocModificado":            doc_origen_emitido.cod_doc,
-            "numDocModificado":            doc_origen_emitido.numero_doc,
-            "fechaEmisionDocSustento":     fecha_origen,
-            "totalSinImpuestos":           f"{total_ndb:.2f}",
-            "impuestos":                   {"impuesto": impuestos_ndb_xml},
-            "valorTotal":                  f"{valor_total_ndb:.2f}",
-            "pagos":                       {"pago": pagos_xml},
-        }
-
-        return {
-            "notaDebito": {
-                "@id":            "comprobante",
-                "@version":        tipo_info["xml_version"],
-                "infoTributaria": info_tributaria,
-                "infoNotaDebito": info_ndb,
-                "motivos":        {"motivo": motivos_xml},
-                "infoAdicional":  {"campoAdicional": campos_adicionales},
-            }
-        }
-
-    # ── RET v2.0.0 ────────────────────────────────────────────────────────────
-    elif tipo_doc == "RET":
-        impuestos_ret = data.get("impuestos_ret") or data.get("impuestos") or []
-        if not impuestos_ret:
-            raise HTTPException(status_code=400, detail="Se requiere al menos un impuesto.")
-
-        doc_ret = doc_origen_recibido or doc_origen_emitido
-        if not doc_ret:
-            raise HTTPException(status_code=400, detail="Se requiere documento origen para la retención.")
-
-        fecha_origen = doc_ret.fecha_emision.strftime("%d/%m/%Y")
-
-        # ── Datos del documento sustento ──────────────────────────────────
-        cod_sustento      = data.get("cod_sustento", "01")
-        pago_loc_ext      = data.get("pago_loc_ext", "01")
-        forma_pago_sust   = data.get("forma_pago_sustento", "01")
-        cod_doc_sustento  = str(getattr(doc_ret, "cod_doc", None) or "01")
-        num_doc_sustento  = (getattr(doc_ret, "numero_doc", "") or "").replace("-", "").zfill(15)
-
-        # Clave de acceso del doc sustento
-        num_aut = data.get("num_aut_doc_sustento") or getattr(doc_ret, "clave_acceso", None) or ""
-
-        # Totales del doc sustento — auto desde Kipu o manual desde frontend
-        total_sin_imp_sust = Decimal(str(
-            data.get("total_sin_impuestos_sustento")
-            or getattr(doc_ret, "subtotal_base", None)
-            or 0
-        ))
-        importe_total_sust = Decimal(str(
-            data.get("importe_total_sustento")
-            or getattr(doc_ret, "importe_total", None)
-            or 0
-        ))
-
-        # ── Impuestos del doc sustento (IVA/ICE que nos facturaron) ───────
-        imp_doc_sust_raw = data.get("impuestos_doc_sustento") or []
-
-        # Auto-rellenar desde datos del doc origen si viene de Kipu y no hay manual
-        if not imp_doc_sust_raw and hasattr(doc_ret, "datos") and doc_ret.datos:
-            datos_origen = doc_ret.datos or {}
-            # Buscar en resumenImpuestos o totalConImpuestos
-            resumen = datos_origen.get("resumenImpuestos", [])
-            if not resumen:
-                info_doc = (
-                    datos_origen.get("infoFactura")
-                    or datos_origen.get("infoLiquidacionCompra")
-                    or {}
-                )
-                total_imp = info_doc.get("totalConImpuestos", {}).get("totalImpuesto", [])
-                resumen = toArray_py(total_imp)
-
-            for imp in toArray_py(resumen):
-                tarifa  = str(imp.get("tarifa", "0"))
-                cod_pct = str(imp.get("codigoPorcentaje", "")) or _tarifa_a_codigo_porcentaje(tarifa)
-                imp_doc_sust_raw.append({
-                    "codImpuestoDocSustento": str(imp.get("codigo", "2")),
-                    "codigoPorcentaje":       cod_pct,
-                    "baseImponible":          str(imp.get("baseImponible", "0")),
-                    "tarifa":                 tarifa,
-                    "valorImpuesto":          str(imp.get("valor", "0")),
-                })
-
-            # Intentar obtener totalSinImpuestos desde datos si no vino
-            if total_sin_imp_sust == 0:
-                info_doc = (
-                    datos_origen.get("infoFactura")
-                    or datos_origen.get("infoLiquidacionCompra")
-                    or {}
-                )
-                total_sin_imp_sust = Decimal(str(info_doc.get("totalSinImpuestos", 0)))
-            if importe_total_sust == 0:
-                info_doc = (
-                    datos_origen.get("infoFactura")
-                    or datos_origen.get("infoLiquidacionCompra")
-                    or {}
-                )
-                importe_total_sust = Decimal(str(info_doc.get("importeTotal", 0)))
-
-        # Serializar impuestos doc sustento
-        impuestos_doc_xml = [
-            {
-                "codImpuestoDocSustento": str(i.get("codImpuestoDocSustento", i.get("codigo", "2"))),
-                "codigoPorcentaje":       str(i.get("codigoPorcentaje", "0")),
-                "baseImponible":          f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
-                "tarifa":                 str(i.get("tarifa", "0")),
-                "valorImpuesto":          f"{Decimal(str(i.get('valorImpuesto', i.get('valor', 0)))):.2f}",
-            }
-            for i in imp_doc_sust_raw
-        ]
-
-        # ── Retenciones ──────────────────────────────────────────────────
-        retenciones_xml = [
-            {
-                "codigo":            str(i.get("codigo", "1")),
-                "codigoRetencion":   str(i.get("codigoRetencion", "")),
-                "baseImponible":     f"{Decimal(str(i.get('baseImponible', 0))):.2f}",
-                "porcentajeRetener": str(i.get("porcentajeRetener", i.get("tarifa", ""))),
-                "valorRetenido":     f"{Decimal(str(i.get('valorRetenido', i.get('valor', 0)))):.2f}",
-            }
-            for i in impuestos_ret
-        ]
-
-        # ── Armar docSustento ────────────────────────────────────────────
-        doc_sustento = {
-            "codSustento":              cod_sustento,
-            "codDocSustento":           cod_doc_sustento,
-            **({"numDocSustento": num_doc_sustento} if num_doc_sustento.strip("0") else {}),
-            "fechaEmisionDocSustento":  fecha_origen,
-            **({"numAutDocSustento": num_aut} if num_aut else {}),
-            "pagoLocExt":               pago_loc_ext,
-            **({"tipoRegi":            data.get("tipo_regi", "01")}             if pago_loc_ext == "02" else {}),
-            **({"paisEfecPago":        data.get("pais_efec_pago", "593")}       if pago_loc_ext == "02" else {}),
-            **({"aplicConvDobTrib":    data.get("aplic_conv_dob_trib", "NO")}   if pago_loc_ext == "02" else {}),
-            **({"pagExtSujRetNorLeg":  data.get("pag_ext_suj_ret_nor_leg", "SI")} if pago_loc_ext == "02" and data.get("aplic_conv_dob_trib", "NO") == "NO" else {}),
-            **({"pagoRegFis":          data.get("pago_reg_fis", "NO")}          if pago_loc_ext == "02" else {}),
-            "totalSinImpuestos":        f"{total_sin_imp_sust:.2f}",
-            "importeTotal":             f"{importe_total_sust:.2f}",
-            "impuestosDocSustento":     {"impuestoDocSustento": impuestos_doc_xml},
-            "retenciones":              {"retencion": retenciones_xml},
-            "pagos":                    {"pago": [{
-                "formaPago": forma_pago_sust,
-                "total":     f"{importe_total_sust:.2f}",
-            }]},
-        }
-
-        # ── Info retención ───────────────────────────────────────────────
-        info_ret = {
-            "fechaEmision":                         fecha_sri,
-            "dirEstablecimiento":                   direccion_est,
-            **({"contribuyenteEspecial": emisor.contribuyente_especial} if emisor.contribuyente_especial else {}),
-            "obligadoContabilidad":                 getattr(emisor, "obligado_contabilidad", "NO"),
-            "tipoIdentificacionSujetoRetenido":     cliente_final["tipo_id"],
-            **({"tipoSujetoRetenido": data.get("tipo_sujeto_retenido", "01")} if cliente_final["tipo_id"] == "08" else {}),
-            "parteRel":                             data.get("parte_rel", "NO"),
-            "razonSocialSujetoRetenido":            cliente_final["razon_social"],
-            "identificacionSujetoRetenido":         cliente_final["identificacion"],
-            "periodoFiscal":                        data.get("periodo_fiscal", datetime.now(TZ_EC).strftime("%m/%Y")),
-        }
-
-        return {
-            "comprobanteRetencion": {
-                "@id":               "comprobante",
-                "@version":          "2.0.0",
-                "infoTributaria":    info_tributaria,
-                "infoCompRetencion": info_ret,
-                "docsSustento":      {"docSustento": doc_sustento},
-                "infoAdicional":     {"campoAdicional": campos_adicionales},
-            }
-        }
-
-
-# =============================================================================
-# BLOQUE 5 — PERSISTIR
-# =============================================================================
-async def _persistir(
-    tipo_doc, cod_doc, xml_firmado_str, xml_obj, xml_root,
-    calculos, emisor, punto_emision, cliente_final, cliente_id,
-    secuencial, clave_acceso, importe_total, ahora_ec,
-    api_key_id, acceso, data,
-    doc_origen_emitido, doc_origen_recibido,
-    es_sandbox: bool = False, created_by = None,
-    db = None,
-) -> str:
-    """Inserta el documento y sus movimientos de stock. NO encola ni hace commit."""
-    carpeta  = _carpeta_por_tipo(tipo_doc)
-    prefijo  = "sandbox/" if es_sandbox else ""
-    xml_path = f"{emisor.ruc}/{prefijo}{carpeta}/{clave_acceso}.xml"
-    upload_file(xml_path, xml_firmado_str.encode("utf-8"), "text/xml")
-
-    if acceso["descontar_credito"]:
-        await db.execute(text("""
-            UPDATE user_credits SET balance = balance - 1, last_updated = NOW()
-            WHERE emisor_id = :eid
-        """), {"eid": emisor.id})
-
-    datos_json = {
-        **xml_obj[xml_root],
-        "resumenImpuestos": calculos["resumenImpuestos"] if calculos else [],
-    }
-    if doc_origen_emitido:
-        datos_json["doc_origen_id"] = str(doc_origen_emitido.id)
-    if doc_origen_recibido:
-        datos_json["doc_origen_recibido_id"] = str(doc_origen_recibido.id)
-
-    origen     = "api" if api_key_id else data.get("origen", "web")
-    numero_doc = f"{punto_emision.estab_codigo}-{punto_emision.punto_codigo}-{secuencial}"
-
-    # Extraer email del comprador de forma segura
-    email_comprador = (cliente_final.get("email") or "").strip().lower() if cliente_final else ""
-
-    res = await db.execute(text("""
-        INSERT INTO documentos_emitidos (
-            id,
-            emisor_id, punto_emision_id, cliente_id, api_key_id,
-            tipo_doc, cod_doc,
-            clave_acceso, numero_doc, secuencial, fecha_emision,
-            estado_sri, importe_total,
-            datos, xml_path, origen,
-            email_comprador,
-            doc_origen_emitido_id, doc_origen_recibido_id,
-            es_sandbox, created_by,
-            estado_cobro, forma_pago_cobro,
-            numero_comprobante_pago, fecha_pago,
-            credito_estado,
-            created_at, updated_at
-        ) VALUES (
-            gen_random_uuid(),
-            :emisor_id, :pto_id, :cliente_id, :api_key_id,
-            :tipo_doc, :cod_doc,
-            :clave, :numero_doc, :sec, :fecha,
-            'FIRMADO', :total,
-            CAST(:datos AS jsonb), :xml_path, :origen,
-            :email_comprador,
-            :doc_origen_emitido_id, :doc_origen_recibido_id,
-            :es_sandbox, :created_by,
-            :estado_cobro, :forma_pago_cobro,
-            :num_comp_pago, :fecha_pago_cobro,
-            :credito_estado,
-            NOW(), NOW()
-        ) RETURNING id
-    """), {
-        "emisor_id":              emisor.id,
-        "pto_id":                 punto_emision.punto_id,
-        "cliente_id":             cliente_id,
-        "api_key_id":             api_key_id,
-        "tipo_doc":               tipo_doc,
-        "cod_doc":                cod_doc,
-        "clave":                  clave_acceso,
-        "numero_doc":             numero_doc,
-        "sec":                    secuencial,
-        "fecha":                  ahora_ec.date(),
-        "total":                  str(importe_total),
-        "datos":                  json.dumps(datos_json, default=str),
-        "xml_path":               xml_path,
-        "origen":                 origen,
-        "email_comprador":        email_comprador or None,
-        "doc_origen_emitido_id":  str(doc_origen_emitido.id) if doc_origen_emitido and getattr(doc_origen_emitido, "id", None) else None,
-        "doc_origen_recibido_id": str(doc_origen_recibido.id) if doc_origen_recibido and getattr(doc_origen_recibido, "id", None) else None,
-        "es_sandbox":             es_sandbox,
-        "created_by":             str(created_by) if created_by else None,
-        "estado_cobro":           data.get("estado_cobro", "PENDIENTE"),
-        "forma_pago_cobro":       data.get("forma_pago_cobro"),
-        "num_comp_pago":          data.get("numero_comprobante_pago"),
-        "fecha_pago_cobro":       date.fromisoformat(data["fecha_pago"]) if data.get("fecha_pago") else None,
-        # Solo lo que se cobró se devuelve si el SRI rechaza
-        "credito_estado":         "COBRADO" if acceso["descontar_credito"] else None,
-    })
-    doc_id = str(res.scalar())
-
-    # ── Inventario: FAC resta, LIQ suma, sandbox no mueve nada ────────────────
-    cruces = await stock_service.aplicar_emision(
-        db, doc_id=doc_id, emisor_id=emisor.id, tipo_doc=tipo_doc,
-        datos=datos_json, es_sandbox=es_sandbox,
-    )
-    for item in cruces:
-        # Diferida: se envía solo si la emisión hace commit
-        encolar_notificacion(
-            db         = db,
-            emisor_id  = emisor.id,
-            tipo       = "SISTEMA",
-            titulo     = f"⚠️ Stock bajo: {item['descripcion']}",
-            mensaje    = f"Quedan {item['stock']} unidades. Stock mínimo configurado: {item['stock_minimo']}.",
-            referencia = f"/productos/{item['id']}",
-        )
-    if cruces or tipo_doc in ("FAC", "LIQ"):
-        try:
-            from app.core.cache import cache_clear_prefix
-            await cache_clear_prefix(f"productos:{emisor.id}:")
-        except Exception as e:
-            print(f"[Stock] ⚠️ No se limpió la caché de productos: {e}")
-
-    if tipo_doc in ("FAC", "LIQ") and data.get("items"):
-        await _guardar_items_catalogo(data["items"], emisor.id, db)
-
-    return doc_id
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-def _carpeta_por_tipo(tipo_doc: str) -> str:
-    return {
-        "FAC": "facturas",
-        "LIQ": "liquidaciones",
-        "NCR": "notas_credito",
-        "NDB": "notas_debito",
-        "RET": "retenciones",
-    }.get(tipo_doc, "documentos")
-
-
-def _preparar_items_desde_raw(items_raw: list) -> list:
-    resultado = []
-    for item in items_raw:
-        codigo_raw = item.get("codigo")
-        resultado.append({
-            "codigo":          str(codigo_raw) if codigo_raw and str(codigo_raw) != "None" else "S/C",
-            "descripcion":     item.get("descripcion", ""),
-            "cantidad":        float(item.get("cantidad", 1)),
-            "precio_unitario": float(item.get("precio_unitario", 0)),
-            "descuento":       float(item.get("descuento", 0)),
-            "tipo_iva":        str(item.get("tipo_iva", "15")),
-            "unidad_medida":   item.get("unidad_medida", "UNIDAD"),
-        })
-    if not resultado:
-        raise HTTPException(status_code=400, detail="Se requiere al menos un ítem.")
-    return resultado
-
-
-def _adaptar_detalles_nc(detalles_xml: list) -> list:
-    resultado = []
-    for det in detalles_xml:
-        d      = dict(det)
-        codigo = d.pop("codigoPrincipal", "S/C")
-        det_nc = {}
-        if codigo and codigo != "S/C":
-            det_nc["codigoInterno"] = codigo
-        det_nc["descripcion"]            = d.get("descripcion", "")
-        det_nc["cantidad"]               = d.get("cantidad", "1.000000")
-        det_nc["precioUnitario"]         = d.get("precioUnitario", "0.000000")
-        det_nc["descuento"]              = d.get("descuento", "0.00")
-        det_nc["precioTotalSinImpuesto"] = d.get("precioTotalSinImpuesto", "0.00")
-        det_nc["impuestos"]              = d.get("impuestos", {})
-        resultado.append(det_nc)
-    return resultado
-
-
-def _tarifa_a_codigo_porcentaje(tarifa: str) -> str:
-    """Convierte tarifa IVA a codigoPorcentaje según Tabla 17 ficha técnica."""
-    MAPA = {
-        "0":  "0",
-        "5":  "5",
-        "12": "2",
-        "13": "10",
-        "14": "3",
-        "15": "4",
-    }
-    return MAPA.get(str(tarifa).split(".")[0], "0")
-
-
-def toArray_py(v):
-    """Normaliza a lista — equivalente al toArray de helpers.js"""
-    if not v:
-        return []
-    return v if isinstance(v, list) else [v]
-
-
-async def _guardar_items_catalogo(items: list, emisor_id: int, db: AsyncSession):
-    """Guarda en catalogo_items los ítems marcados con guardar_catalogo=True."""
-    try:
-        guardados = 0
-        for item in items:
-            if not item.get("guardar_catalogo"):
-                continue
-            codigo = (item.get("codigo") or "").strip()
-            if not codigo:
-                continue
-
-            res = await db.execute(text("""
-                SELECT id FROM catalogo_items
-                WHERE emisor_id = :eid AND codigo = :cod
-            """), {"eid": emisor_id, "cod": codigo})
-            if res.fetchone():
-                continue
-
-            await db.execute(text("""
-                INSERT INTO catalogo_items (emisor_id, codigo, descripcion, precio, tipo_iva, unidad)
-                VALUES (:eid, :cod, :desc, :precio, :iva, :unidad)
-            """), {
-                "eid":    emisor_id,
-                "cod":    codigo,
-                "desc":   item.get("descripcion", ""),
-                "precio": item.get("precio_unitario", item.get("precio", 0)),
-                "iva":    str(item.get("tipo_iva", "15")),
-                "unidad": item.get("unidad_medida", item.get("unidad", "UNIDAD")),
-            })
-            guardados += 1
-
-        if guardados > 0:
-            from app.core.cache import cache_clear_prefix
-            await cache_clear_prefix(f"productos:{emisor_id}:")
-            print(f"[Catálogo] ✅ {guardados} ítem(s) guardado(s) en catálogo")
-    except Exception as e:
-        print(f"[Catálogo] ⚠️ Error guardando ítems: {e}")

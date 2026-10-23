@@ -55,26 +55,31 @@ async def listar_productos(
     response:          Response,
     auth_data:         dict         = Depends(verify_firebase_token),
     db:                AsyncSession = Depends(get_db),
-    incluir_inactivos: bool         = Query(False)
+    incluir_inactivos: bool         = Query(False),
+    limit:             int          = Query(50, ge=1, le=200),
+    offset:            int          = Query(0, ge=0),
 ):
     response.headers["Cache-Control"] = "no-cache"
     emisor_id = auth_data["emisor_id"]
     verificar_permiso(auth_data, "productos")
 
-    cache_key = ck_lista(emisor_id)
+    cache_key = f"{ck_lista(emisor_id)}:{limit}:{offset}"
     if not incluir_inactivos:
         cached = await cache_get(cache_key)
         if cached:
-            return {"ok": True, "data": cached, "source": "cache"}
+            return cached
 
     filtro = "" if incluir_inactivos else "AND activo = true"
     res = await db.execute(text(f"""
-        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, activo, created_at
+        SELECT id, codigo, descripcion, precio, tipo_iva, unidad, stock, stock_minimo, activo, created_at,
+               COUNT(*) OVER() AS total
         FROM catalogo_items
         WHERE emisor_id = :eid {filtro}
         ORDER BY descripcion ASC
-    """), {"eid": emisor_id})
+        LIMIT :lim OFFSET :off
+    """), {"eid": emisor_id, "lim": limit, "off": offset})
     rows = res.fetchall()
+    total = rows[0].total if rows else 0
     data = [
         {
             "id":           str(r.id),
@@ -89,9 +94,10 @@ async def listar_productos(
         }
         for r in rows
     ]
+    result = {"ok": True, "data": data, "total": total, "source": "db"}
     if not incluir_inactivos:
-        await cache_set(cache_key, data, TTL_LISTA)
-    return {"ok": True, "data": data, "source": "db"}
+        await cache_set(cache_key, result, TTL_LISTA)
+    return result
 
 # ── GET /buscar ───────────────────────────────────────────────────────────────
 @router.get("/buscar", summary="Buscar productos por descripción o código")

@@ -1,4 +1,5 @@
 # app/api/v1/app/dashboard.py
+import asyncio
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,7 @@ async def get_dashboard(
 
     email_verificado = False
     try:
-        fb_user          = fb_auth.get_user(auth_data["uid"])
+        fb_user          = await asyncio.to_thread(fb_auth.get_user, auth_data["uid"])
         email_verificado = fb_user.email_verified
     except Exception:
         pass

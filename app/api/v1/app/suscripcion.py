@@ -1,4 +1,5 @@
 # app/api/v1/app/suscripcion.py
+import asyncio
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import text
@@ -84,15 +85,16 @@ async def crear_checkout_suscripcion(
     stripe_customer_id = await _obtener_o_crear_customer(emisor_id, db)
 
     try:
-        session = stripe.checkout.Session.create(
-            customer              = stripe_customer_id,
-            mode                  = "subscription",
-            line_items            = [{"price": STRIPE_PRICE_PRO_ANUAL, "quantity": 1}],
-            success_url           = f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan=PRO&periodo=ANUAL",
-            cancel_url            = f"{settings.FRONTEND_URL}/planes?pago=cancelado",
-            allow_promotion_codes = True,
-            metadata              = {"emisor_id": str(emisor_id), "tipo": "SUSCRIPCION", "plan": "PRO", "periodo": "ANUAL"},
-            subscription_data     = {"metadata": {"emisor_id": str(emisor_id), "plan": "PRO", "periodo": "ANUAL"}},
+        session = await asyncio.to_thread(
+            stripe.checkout.Session.create,
+            customer=stripe_customer_id,
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_PRO_ANUAL, "quantity": 1}],
+            success_url=f"{settings.FRONTEND_URL}/planes/exitoso?tipo=suscripcion&plan=PRO&periodo=ANUAL",
+            cancel_url=f"{settings.FRONTEND_URL}/planes?pago=cancelado",
+            allow_promotion_codes=True,
+            metadata={"emisor_id": str(emisor_id), "tipo": "SUSCRIPCION", "plan": "PRO", "periodo": "ANUAL"},
+            subscription_data={"metadata": {"emisor_id": str(emisor_id), "plan": "PRO", "periodo": "ANUAL"}},
         )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
@@ -120,9 +122,10 @@ async def portal_cliente(
         raise HTTPException(status_code=404, detail="No tienes una cuenta de facturación configurada.")
 
     try:
-        session = stripe.billing_portal.Session.create(
-            customer   = emisor.stripe_customer_id,
-            return_url = f"{settings.FRONTEND_URL}/configuracion?tab=suscripcion",
+        session = await asyncio.to_thread(
+            stripe.billing_portal.Session.create,
+            customer=emisor.stripe_customer_id,
+            return_url=f"{settings.FRONTEND_URL}/configuracion?tab=suscripcion",
         )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
@@ -154,7 +157,11 @@ async def cancelar_suscripcion(
         raise HTTPException(status_code=400, detail="Tu suscripción no está activa.")
 
     try:
-        stripe.Subscription.modify(sub.stripe_subscription_id, cancel_at_period_end=True)
+        await asyncio.to_thread(
+            stripe.Subscription.modify,
+            sub.stripe_subscription_id,
+            cancel_at_period_end=True,
+        )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
 
@@ -201,7 +208,11 @@ async def reactivar_suscripcion(
         raise HTTPException(status_code=400, detail="Tu suscripción no está programada para cancelarse.")
 
     try:
-        stripe.Subscription.modify(sub.stripe_subscription_id, cancel_at_period_end=False)
+        await asyncio.to_thread(
+            stripe.Subscription.modify,
+            sub.stripe_subscription_id,
+            cancel_at_period_end=False,
+        )
     except stripe.StripeError as e:
         raise HTTPException(status_code=500, detail=f"Error Stripe: {str(e)}")
 
@@ -240,10 +251,11 @@ async def _obtener_o_crear_customer(emisor_id: int, db: AsyncSession) -> str:
     if emisor.stripe_customer_id:
         return emisor.stripe_customer_id
 
-    customer = stripe.Customer.create(
-        email    = emisor.email,
-        name     = emisor.razon_social,
-        metadata = {"emisor_id": str(emisor_id), "ruc": emisor.ruc}
+    customer = await asyncio.to_thread(
+        stripe.Customer.create,
+        email=emisor.email,
+        name=emisor.razon_social,
+        metadata={"emisor_id": str(emisor_id), "ruc": emisor.ruc},
     )
 
     await db.execute(text("""
@@ -252,4 +264,3 @@ async def _obtener_o_crear_customer(emisor_id: int, db: AsyncSession) -> str:
     await db.commit()
 
     return customer.id
-

@@ -4,6 +4,7 @@
 # Muestra las cifras acumuladas de la facturación electrónica del año
 # sin asumir responsabilidades de cálculo completo de personas naturales.
 
+import asyncio
 from datetime import date
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,135 +20,146 @@ async def calcular_renta_102(db: AsyncSession, emisor_id: int, anio: int) -> dic
     ff = date(anio, 12, 31)
     params = {"eid": emisor_id, "fi": fi, "ff": ff}
 
+    # ── 6 queries independientes en paralelo ────────────────────────────────
+    (
+        res_vta,
+        res_ncr,
+        res_compras,
+        res_liq,
+        res_ret_rec,
+        res_ret_emi,
+    ) = await asyncio.gather(
+        # 1. VENTAS EMITIDAS (FAC + NDB)
+        db.execute(text("""
+            SELECT id, COALESCE(importe_total, 0) AS bruto
+            FROM documentos_emitidos
+            WHERE emisor_id     = :eid
+              AND estado_sri    = 'AUTORIZADO'
+              AND es_sandbox    = false
+              AND fecha_emision BETWEEN :fi AND :ff
+              AND tipo_doc      IN ('FAC', 'NDB')
+        """), params),
+        # 2. NOTAS DE CRÉDITO EMITIDAS
+        db.execute(text("""
+            SELECT id, COALESCE(importe_total, 0) AS ncr
+            FROM documentos_emitidos
+            WHERE emisor_id     = :eid
+              AND estado_sri    = 'AUTORIZADO'
+              AND es_sandbox    = false
+              AND fecha_emision BETWEEN :fi AND :ff
+              AND tipo_doc      = 'NCR'
+        """), params),
+        # 3. COMPRAS RECIBIDAS (Deducibles)
+        db.execute(text("""
+            SELECT id, COALESCE(subtotal_base, 0) AS deducibles
+            FROM documentos_recibidos
+            WHERE emisor_id       = :eid
+              AND fecha_emision   BETWEEN :fi AND :ff
+              AND deducible_renta = true
+              AND tipo_doc        IN ('FAC', 'LIQ', 'NDB')
+        """), params),
+        # 4. LIQUIDACIONES DE COMPRA EMITIDAS
+        db.execute(text("""
+            SELECT id, COALESCE(importe_total, 0) AS total
+            FROM documentos_emitidos
+            WHERE emisor_id     = :eid
+              AND estado_sri    = 'AUTORIZADO'
+              AND es_sandbox    = false
+              AND fecha_emision BETWEEN :fi AND :ff
+              AND tipo_doc      = 'LIQ'
+        """), params),
+        # 5. RETENCIONES DE RENTA RECIBIDAS
+        db.execute(text("""
+            SELECT d.id, COALESCE(
+                CASE
+                    WHEN tipo_doc = 'RET' THEN subtotal_base
+                    ELSE COALESCE((item->>'valorRetenido')::numeric, 0)
+                END, 0) AS total
+            FROM documentos_recibidos d
+            LEFT JOIN LATERAL jsonb_array_elements(
+                CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
+            ) AS item ON true
+            WHERE d.emisor_id     = :eid
+              AND d.tipo_doc      = 'RET'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND (item->>'codigo_impuesto' = '1' OR item->>'codigo' = '1' OR d.tipo_doc = 'RET')
+        """), params),
+        # 6. RETENCIONES DE RENTA EMITIDAS
+        db.execute(text("""
+            SELECT d.id, COALESCE(SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)), 0) AS total
+            FROM documentos_emitidos d,
+                 jsonb_array_elements(
+                     CASE
+                         WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
+                             CASE WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                                  THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                                  ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') END
+                         WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
+                             CASE WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
+                                  THEN d.datos->'impuestos'->'impuesto'
+                                  ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto') END
+                         ELSE '[]'::jsonb
+                     END
+                 ) AS imp
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.es_sandbox    = false
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      = 'RET'
+              AND (imp->>'codigo') = '1'
+            GROUP BY d.id
+        """), params),
+    )
+
+    # ── Procesar resultados ─────────────────────────────────────────────────
     doc_emitidos_ids = set()
     doc_recibidos_ids = set()
 
-    # 1. VENTAS EMITIDAS (FAC + NDB)
-    res_vta = await db.execute(text("""
-        SELECT id, COALESCE(importe_total, 0) AS bruto
-        FROM documentos_emitidos
-        WHERE emisor_id     = :eid
-          AND estado_sri    = 'AUTORIZADO'
-          AND es_sandbox    = false
-          AND fecha_emision BETWEEN :fi AND :ff
-          AND tipo_doc      IN ('FAC', 'NDB')
-    """), params)
-    
+    # 1. Ventas
     ventas_brutas = 0.0
     for r in res_vta.fetchall():
         doc_emitidos_ids.add(str(r.id))
         ventas_brutas += float(r.bruto or 0)
 
-    # 2. NOTAS DE CRÉDITO EMITIDAS
-    res_ncr = await db.execute(text("""
-        SELECT id, COALESCE(importe_total, 0) AS ncr
-        FROM documentos_emitidos
-        WHERE emisor_id     = :eid
-          AND estado_sri    = 'AUTORIZADO'
-          AND es_sandbox    = false
-          AND fecha_emision BETWEEN :fi AND :ff
-          AND tipo_doc      = 'NCR'
-    """), params)
-    
+    # 2. NCR
     ncr_emitidas = 0.0
     for r in res_ncr.fetchall():
         doc_emitidos_ids.add(str(r.id))
         ncr_emitidas += float(r.ncr or 0)
-        
+
     ventas_netas = round(max(ventas_brutas - ncr_emitidas, 0.0), 2)
 
-    # 3. COMPRAS RECIBIDAS (Deducibles)
-    res_compras = await db.execute(text("""
-        SELECT id, COALESCE(subtotal_base, 0) AS deducibles
-        FROM documentos_recibidos
-        WHERE emisor_id       = :eid
-          AND fecha_emision   BETWEEN :fi AND :ff
-          AND deducible_renta = true
-          AND tipo_doc        IN ('FAC', 'LIQ', 'NDB')
-    """), params)
-    
+    # 3. Compras
     compras_recibidas = 0.0
     for r in res_compras.fetchall():
         doc_recibidos_ids.add(str(r.id))
         compras_recibidas += float(r.deducibles or 0)
 
-    # 4. LIQUIDACIONES DE COMPRA EMITIDAS (Son gastos/compras de la empresa)
-    res_liq = await db.execute(text("""
-        SELECT id, COALESCE(importe_total, 0) AS total
-        FROM documentos_emitidos
-        WHERE emisor_id     = :eid
-          AND estado_sri    = 'AUTORIZADO'
-          AND es_sandbox    = false
-          AND fecha_emision BETWEEN :fi AND :ff
-          AND tipo_doc      = 'LIQ'
-    """), params)
-    
+    # 4. Liquidaciones
     liquidaciones_emitidas = 0.0
     for r in res_liq.fetchall():
         doc_emitidos_ids.add(str(r.id))
         liquidaciones_emitidas += float(r.total or 0)
-        
+
     gastos_deducibles_totales = round(compras_recibidas + liquidaciones_emitidas, 2)
 
-    # 5. RETENCIONES DE RENTA RECIBIDAS (De tus clientes - Crédito Tributario)
-    res_ret_rec = await db.execute(text("""
-        SELECT d.id, COALESCE(
-            CASE 
-                WHEN tipo_doc = 'RET' THEN subtotal_base
-                ELSE COALESCE((item->>'valorRetenido')::numeric, 0)
-            END, 0) AS total
-        FROM documentos_recibidos d
-        LEFT JOIN LATERAL jsonb_array_elements(
-            CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
-        ) AS item ON true
-        WHERE d.emisor_id     = :eid
-          AND d.tipo_doc      = 'RET'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND (item->>'codigo_impuesto' = '1' OR item->>'codigo' = '1' OR d.tipo_doc = 'RET')
-    """), params)
-    
+    # 5. Retenciones recibidas
     retenciones_recibidas = 0.0
     for r in res_ret_rec.fetchall():
         doc_recibidos_ids.add(str(r.id))
         retenciones_recibidas += float(r.total or 0)
     retenciones_recibidas = round(retenciones_recibidas, 2)
 
-    # 6. RETENCIONES DE RENTA EMITIDAS (A tus proveedores)
-    res_ret_emi = await db.execute(text("""
-        SELECT d.id, COALESCE(SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)), 0) AS total
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
-                         CASE WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
-                              THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
-                              ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') END
-                     WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
-                         CASE WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
-                              THEN d.datos->'impuestos'->'impuesto'
-                              ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto') END
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.es_sandbox    = false
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      = 'RET'
-          AND (imp->>'codigo') = '1'
-        GROUP BY d.id
-    """), params)
-    
+    # 6. Retenciones emitidas
     retenciones_emitidas = 0.0
     for r in res_ret_emi.fetchall():
         doc_emitidos_ids.add(str(r.id))
         retenciones_emitidas += float(r.total or 0)
     retenciones_emitidas = round(retenciones_emitidas, 2)
 
-    # Base Informativa
+    # ── Armado de respuesta (sin cambios) ───────────────────────────────────
     base_informativa = round(max(ventas_netas - gastos_deducibles_totales, 0.0), 2)
 
-    # Casilleros formateados para evitar KeyError en el router
     casilleros = {
         "501": round(ventas_brutas, 2),
         "502": round(ncr_emitidas, 2),

@@ -59,6 +59,7 @@ async def listar_audit_logs(
     params["limit"]  = limit
     params["offset"] = offset
 
+    # Una sola query: COUNT(*) OVER() calcula el total sin ejecutar dos veces
     res = await db.execute(text(f"""
         SELECT
             al.id,
@@ -69,7 +70,8 @@ async def listar_audit_logs(
             al.ip,
             al.created_at,
             p.email      AS usuario_email,
-            p.full_name  AS usuario_nombre
+            p.full_name  AS usuario_nombre,
+            COUNT(*) OVER() AS _total
         FROM audit_logs al
         LEFT JOIN profiles p ON p.id = al.profile_id
         {filtros}
@@ -78,11 +80,7 @@ async def listar_audit_logs(
     """), params)
     rows = res.fetchall()
 
-    # Total para paginación
-    res_total = await db.execute(text(f"""
-        SELECT COUNT(*) FROM audit_logs al {filtros}
-    """), {k: v for k, v in params.items() if k not in ("limit", "offset")})
-    total = res_total.scalar()
+    total = rows[0]._total if rows else 0
 
     return {
         "ok":    True,

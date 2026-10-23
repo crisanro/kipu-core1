@@ -112,8 +112,8 @@ async def crear_proforma_core(emisor_id: int, datos: dict, db: AsyncSession):
 
 
 # ── 2. LISTAR ──────────────────────────────────────────────────────────────────
-async def listar_proformas_core(emisor_id: int, db: AsyncSession):
-    cache_key = CK.fmt(CK.PROFORMAS_LISTA, eid=emisor_id)
+async def listar_proformas_core(emisor_id: int, db: AsyncSession, limit: int = 50, offset: int = 0):
+    cache_key = f"{CK.fmt(CK.PROFORMAS_LISTA, eid=emisor_id)}:{limit}:{offset}"
     cached    = await cache_get(cache_key)
     if cached:
         return cached
@@ -126,19 +126,21 @@ async def listar_proformas_core(emisor_id: int, db: AsyncSession):
                 p.estado, p.notas, p.created_at,
                 ce.id          AS cliente_id,
                 ce.razon_social,
-                ce.identificacion
+                ce.identificacion,
+                COUNT(*) OVER() AS total_count
             FROM proformas p
             LEFT JOIN clientes_emisor ce ON ce.id = p.cliente_id
             WHERE p.emisor_id = :eid
             ORDER BY p.created_at DESC
-        """), {"eid": emisor_id})
+            LIMIT :lim OFFSET :off
+        """), {"eid": emisor_id, "lim": limit, "off": offset})
 
         rows = res.mappings().fetchall()
+        total = rows[0]["total_count"] if rows else 0
         data = [_fmt_proforma(r) for r in rows]
-        result = {"ok": True, "total": len(data), "data": data}
+        result = {"ok": True, "total": total, "data": data}
         await cache_set(cache_key, result, TTL.PROFORMAS_LISTA)
         return result
-
     except Exception as e:
         print(f"Error listando proformas: {e}")
         raise HTTPException(status_code=500, detail="ERROR AL OBTENER LAS PROFORMAS.")

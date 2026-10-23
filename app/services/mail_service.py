@@ -1,8 +1,7 @@
 # app/services/mail_service.py
 import html
-import smtplib
+import aiosmtplib
 import asyncio
-import xmltodict
 from email.message import EmailMessage
 from email.utils import formataddr
 from app.core.config import settings
@@ -10,8 +9,8 @@ from app.core.config import settings
 # =============================================================================
 # MARCA — ajusta cuando tengas logo y colores definidos
 # =============================================================================
-KIPU_LOGO_URL   = "https://cdn1.kipu.ec/kipu/kipu-mail.png"  # ← reemplazar
-KIPU_COLOR_MAIN = "#1B9670"                               # ← reemplazar
+KIPU_LOGO_URL   = "https://cdn1.kipu.ec/kipu/kipu-mail.png"
+KIPU_COLOR_MAIN = "#1B9670"
 KIPU_WEBSITE    = "https://kipu.ec"
 
 TIPO_DOC_LABEL = {
@@ -24,12 +23,13 @@ TIPO_DOC_LABEL = {
 
 
 # =============================================================================
-# HELPERS DE TEMPLATE
+# HELPERS DE TEMPLATE  (sin cambios)
 # =============================================================================
 
 def _extraer_total_y_comprador(xml_str: str) -> tuple[str, str]:
     """Extrae importeTotal y razonSocialComprador del XML autorizado."""
     try:
+        import xmltodict
         doc  = xmltodict.parse(xml_str)
         fact = doc.get("factura") or doc.get("liquidacionCompra") or {}
         info = (
@@ -376,7 +376,7 @@ def _build_text_cuenta(
 
 
 # =============================================================================
-# EMAIL SERVICE
+# EMAIL SERVICE  —  ahora 100% async con aiosmtplib
 # =============================================================================
 
 class EmailService:
@@ -386,24 +386,22 @@ class EmailService:
         if not self.enabled:
             print("⚠️ SMTP no configurado. El servicio de correo estará deshabilitado.")
 
-    def _send_sync(self, msg: EmailMessage) -> bool:
+    async def _send_async(self, msg: EmailMessage) -> bool:
+        """Envía un email de forma completamente async (sin bloquear el loop)."""
         try:
-            timeout_sec = 15
-            if settings.SMTP_PORT == 465:
-                server = smtplib.SMTP_SSL(
-                    settings.SMTP_HOST, settings.SMTP_PORT,
-                    timeout=timeout_sec,
-                )
-            else:
-                server = smtplib.SMTP(
-                    settings.SMTP_HOST, settings.SMTP_PORT,
-                    timeout=timeout_sec,
-                )
-                server.starttls()
+            use_tls    = settings.SMTP_PORT == 465
+            start_tls  = not use_tls  # STARTTLS para puertos 587, etc.
 
-            server.login(settings.SMTP_USER, settings.SMTP_PASS)
-            server.send_message(msg)
-            server.quit()
+            await aiosmtplib.send(
+                msg,
+                hostname   = settings.SMTP_HOST,
+                port       = settings.SMTP_PORT,
+                username   = settings.SMTP_USER,
+                password   = settings.SMTP_PASS,
+                use_tls    = use_tls,      # TLS implícito (puerto 465)
+                start_tls  = start_tls,    # STARTTLS (puerto 587)
+                timeout    = 15,
+            )
             return True
         except Exception as e:
             print(f"❌ [Email Error] {str(e)}")
@@ -416,7 +414,7 @@ class EmailService:
         html_content: str,
         attachments: list = None,
         from_name: str = None,
-        text_content: str = None,   # ← versión texto plano (opcional)
+        text_content: str = None,
     ) -> dict:
         if not self.enabled:
             return {"exito": False, "mensaje": "SMTP no configurado"}
@@ -427,9 +425,6 @@ class EmailService:
         msg["Subject"] = subject
         msg["To"]      = to
 
-        # ── From con nombre personalizado ─────────────────────────────────────
-        # formataddr genera: "Nombre del Emisor <no-reply@kipu.ec>"
-        # Si no viene from_name, usa "Kipu" como fallback
         display_name   = from_name or "Kipu"
         msg["From"]    = formataddr((display_name, smtp_address))
 
@@ -449,7 +444,7 @@ class EmailService:
                     filename=att["filename"],
                 )
 
-        success = await asyncio.to_thread(self._send_sync, msg)
+        success = await self._send_async(msg)
 
         if success:
             print(f"📧 [Email] Enviado a {to} (from: {display_name})")
@@ -470,10 +465,6 @@ class EmailService:
         pdf_bytes: bytes | None,
         es_sandbox: bool = False,
     ) -> dict:
-        """
-        Método de alto nivel para enviar comprobantes electrónicos.
-        El From mostrará la razón social del emisor, no "Kipu".
-        """
         tipo_label       = TIPO_DOC_LABEL.get(tipo_doc, "Comprobante")
         total, comprador = _extraer_total_y_comprador(xml_str)
         prefijo          = "[SANDBOX] " if es_sandbox else ""
@@ -510,7 +501,7 @@ class EmailService:
             subject      = subject,
             html_content = html_content,
             attachments  = attachments,
-            from_name    = razon_social,  # ← el comprador ve el nombre del emisor
+            from_name    = razon_social,
         )
 
     # ── Correos de cuenta ─────────────────────────────────────────────────────

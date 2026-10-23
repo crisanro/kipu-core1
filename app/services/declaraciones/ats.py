@@ -7,6 +7,7 @@
 #   - codSustento, tpIdProv, bases 0% y NCR con valores reales
 #   - validación contra el XSD del SRI
 
+import asyncio
 import io
 import zipfile
 from datetime import date
@@ -34,33 +35,99 @@ async def calcular_ats(db: AsyncSession, emisor, emisor_id: int, fi: date, ff: d
     emisor: fila con ruc, razon_social, obligado_contabilidad.
     Devuelve: preguntas, desglose, resumen, doc_emitidos_ids, doc_recibidos_ids
     """
-    # VENTAS — detalle por comprobante emitido
-    res_ventas = await db.execute(text("""
-        SELECT
-            d.id,
-            d.tipo_doc,
-            d.cod_doc,
-            d.numero_doc,
-            d.clave_acceso,
-            d.fecha_emision,
-            d.importe_total,
-            d.datos->'infoFactura'->>'identificacionComprador'    AS id_comprador_fac,
-            d.datos->'infoFactura'->>'razonSocialComprador'        AS razon_fac,
-            d.datos->'infoFactura'->>'tipoIdentificacionComprador' AS tipo_id_fac,
-            d.datos->'infoLiquidacionCompra'->>'identificacionProveedor'   AS id_comprador_liq,
-            d.datos->'infoLiquidacionCompra'->>'razonSocialProveedor'       AS razon_liq,
-            d.datos->>'legacy_id_comprador'    AS id_legacy,
-            d.datos->>'legacy_razon_comprador' AS razon_legacy,
-            d.datos->'resumenImpuestos'        AS resumen_impuestos
-        FROM documentos_emitidos d
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        ORDER BY d.fecha_emision, d.numero_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
+    params = {"eid": emisor_id, "fi": fi, "ff": ff}
 
+    # ── 4 queries independientes en paralelo ───────────────────────────────
+    res_ventas, res_ret_e, res_compras, res_ret_r = await asyncio.gather(
+        # 1. VENTAS — detalle por comprobante emitido
+        db.execute(text("""
+            SELECT
+                d.id,
+                d.tipo_doc,
+                d.cod_doc,
+                d.numero_doc,
+                d.clave_acceso,
+                d.fecha_emision,
+                d.importe_total,
+                d.datos->'infoFactura'->>'identificacionComprador'    AS id_comprador_fac,
+                d.datos->'infoFactura'->>'razonSocialComprador'        AS razon_fac,
+                d.datos->'infoFactura'->>'tipoIdentificacionComprador' AS tipo_id_fac,
+                d.datos->'infoLiquidacionCompra'->>'identificacionProveedor'   AS id_comprador_liq,
+                d.datos->'infoLiquidacionCompra'->>'razonSocialProveedor'       AS razon_liq,
+                d.datos->>'legacy_id_comprador'    AS id_legacy,
+                d.datos->>'legacy_razon_comprador' AS razon_legacy,
+                d.datos->'resumenImpuestos'        AS resumen_impuestos
+            FROM documentos_emitidos d
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
+            ORDER BY d.fecha_emision, d.numero_doc
+        """), params),
+        # 2. Retenciones emitidas
+        db.execute(text("""
+            SELECT
+                d.id,
+                d.numero_doc,
+                d.clave_acceso,
+                d.fecha_emision,
+                d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido' AS id_retenido,
+                d.datos->'infoCompRetencion'->>'razonSocialSujetoRetenido'     AS razon_retenido,
+                d.datos->'infoCompRetencion'->>'periodoFiscal'                 AS periodo_fiscal,
+                d.datos->'impuestos'                                           AS impuestos
+            FROM documentos_emitidos d
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      = 'RET'
+            ORDER BY d.fecha_emision, d.numero_doc
+        """), params),
+        # 3. COMPRAS — detalle por comprobante recibido
+        db.execute(text("""
+            SELECT
+                d.id,
+                d.tipo_doc,
+                d.cod_doc,
+                d.numero_doc,
+                d.clave_acceso,
+                d.fecha_emision,
+                d.importe_total,
+                d.ruc_proveedor,
+                d.razon_social_proveedor,
+                d.deducible_renta,
+                d.credito_tributario_iva,
+                d.fuente,
+                d.subtotal_base,
+                d.valor_iva_total
+            FROM documentos_recibidos d
+            WHERE d.emisor_id     = :eid
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
+            ORDER BY d.fecha_emision, d.numero_doc
+        """), params),
+        # 4. Retenciones recibidas
+        db.execute(text("""
+            SELECT
+                d.id,
+                d.numero_doc,
+                d.clave_acceso,
+                d.fecha_emision,
+                d.ruc_proveedor,
+                d.razon_social_proveedor,
+                d.items_detalle
+            FROM documentos_recibidos d
+            WHERE d.emisor_id     = :eid
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      = 'RET'
+            ORDER BY d.fecha_emision
+        """), params),
+    )
+
+    # ── Procesar resultados ────────────────────────────────────────────────
+
+    # 1. Ventas
     ventas_detalle   = []
     doc_emitidos_ids = set()
     totales_ventas   = {
@@ -117,26 +184,7 @@ async def calcular_ats(db: AsyncSession, emisor, emisor_id: int, fi: date, ff: d
         totales_ventas["total"]                += float(r.importe_total)
         totales_ventas["num_docs"]             += 1
 
-    # Retenciones emitidas
-    res_ret_e = await db.execute(text("""
-        SELECT
-            d.id,
-            d.numero_doc,
-            d.clave_acceso,
-            d.fecha_emision,
-            d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido' AS id_retenido,
-            d.datos->'infoCompRetencion'->>'razonSocialSujetoRetenido'     AS razon_retenido,
-            d.datos->'infoCompRetencion'->>'periodoFiscal'                 AS periodo_fiscal,
-            d.datos->'impuestos'                                           AS impuestos
-        FROM documentos_emitidos d
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      = 'RET'
-        ORDER BY d.fecha_emision, d.numero_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
+    # 2. Retenciones emitidas
     retenciones_emitidas = []
     for r in res_ret_e.fetchall():
         doc_emitidos_ids.add(str(r.id))
@@ -167,30 +215,7 @@ async def calcular_ats(db: AsyncSession, emisor, emisor_id: int, fi: date, ff: d
             "impuestos":      lineas,
         })
 
-    # COMPRAS — detalle por comprobante recibido
-    res_compras = await db.execute(text("""
-        SELECT
-            d.id,
-            d.tipo_doc,
-            d.cod_doc,
-            d.numero_doc,
-            d.clave_acceso,
-            d.fecha_emision,
-            d.importe_total,
-            d.ruc_proveedor,
-            d.razon_social_proveedor,
-            d.deducible_renta,
-            d.credito_tributario_iva,
-            d.fuente,
-            d.subtotal_base,
-            d.valor_iva_total
-        FROM documentos_recibidos d
-        WHERE d.emisor_id     = :eid
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        ORDER BY d.fecha_emision, d.numero_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
+    # 3. Compras
     compras_detalle   = []
     doc_recibidos_ids = set()
     totales_compras   = {
@@ -234,23 +259,7 @@ async def calcular_ats(db: AsyncSession, emisor, emisor_id: int, fi: date, ff: d
         totales_compras["total"]                += float(r.importe_total)
         totales_compras["num_docs"]             += 1
 
-    # Retenciones recibidas
-    res_ret_r = await db.execute(text("""
-        SELECT
-            d.id,
-            d.numero_doc,
-            d.clave_acceso,
-            d.fecha_emision,
-            d.ruc_proveedor,
-            d.razon_social_proveedor,
-            d.items_detalle
-        FROM documentos_recibidos d
-        WHERE d.emisor_id     = :eid
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      = 'RET'
-        ORDER BY d.fecha_emision
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
+    # 4. Retenciones recibidas
     retenciones_recibidas = []
     for r in res_ret_r.fetchall():
         doc_recibidos_ids.add(str(r.id))
@@ -337,51 +346,55 @@ async def generar_xml_ats(db: AsyncSession, emisor, emisor_id: int, anio: int, m
     Arma el XML del ATS y lo comprime.
     Devuelve: zip_bytes, nombre_zip, total_ventas, total_compras
     """
-    res_compras = await db.execute(text("""
-        SELECT
-            d.id, d.tipo_doc, d.cod_doc, d.numero_doc, d.clave_acceso,
-            d.fecha_emision, d.importe_total, d.ruc_proveedor,
-            d.razon_social_proveedor, d.fuente, d.subtotal_base,
-            d.valor_iva_total, d.credito_tributario_iva, d.items_detalle, d.datos
-        FROM documentos_recibidos d
-        WHERE d.emisor_id     = :eid
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        ORDER BY d.fecha_emision, d.numero_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-    compras = res_compras.fetchall()
+    params = {"eid": emisor_id, "fi": fi, "ff": ff}
 
-    res_ret = await db.execute(text("""
-        SELECT
-            d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
-            d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido' AS id_retenido,
-            d.datos->'impuestos' AS impuestos
-        FROM documentos_emitidos d
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      = 'RET'
-        ORDER BY d.fecha_emision
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
+    # ── 3 queries independientes en paralelo ───────────────────────────────
+    res_compras, res_ret, res_ventas = await asyncio.gather(
+        db.execute(text("""
+            SELECT
+                d.id, d.tipo_doc, d.cod_doc, d.numero_doc, d.clave_acceso,
+                d.fecha_emision, d.importe_total, d.ruc_proveedor,
+                d.razon_social_proveedor, d.fuente, d.subtotal_base,
+                d.valor_iva_total, d.credito_tributario_iva, d.items_detalle, d.datos
+            FROM documentos_recibidos d
+            WHERE d.emisor_id     = :eid
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
+            ORDER BY d.fecha_emision, d.numero_doc
+        """), params),
+        db.execute(text("""
+            SELECT
+                d.id, d.numero_doc, d.clave_acceso, d.fecha_emision,
+                d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido' AS id_retenido,
+                d.datos->'impuestos' AS impuestos
+            FROM documentos_emitidos d
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      = 'RET'
+            ORDER BY d.fecha_emision
+        """), params),
+        db.execute(text("""
+            SELECT
+                d.id, d.tipo_doc, d.cod_doc, d.numero_doc, d.clave_acceso,
+                d.fecha_emision, d.importe_total,
+                d.datos->'infoFactura'->>'identificacionComprador'     AS id_comprador,
+                d.datos->'infoFactura'->>'tipoIdentificacionComprador' AS tipo_id,
+                d.datos->'resumenImpuestos'                            AS resumen_impuestos
+            FROM documentos_emitidos d
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
+            ORDER BY d.fecha_emision, d.numero_doc
+        """), params),
+    )
+
+    compras     = res_compras.fetchall()
     retenciones = res_ret.fetchall()
-
-    res_ventas = await db.execute(text("""
-        SELECT
-            d.id, d.tipo_doc, d.cod_doc, d.numero_doc, d.clave_acceso,
-            d.fecha_emision, d.importe_total,
-            d.datos->'infoFactura'->>'identificacionComprador'     AS id_comprador,
-            d.datos->'infoFactura'->>'tipoIdentificacionComprador' AS tipo_id,
-            d.datos->'resumenImpuestos'                            AS resumen_impuestos
-        FROM documentos_emitidos d
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        ORDER BY d.fecha_emision, d.numero_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-    ventas = res_ventas.fetchall()
+    ventas      = res_ventas.fetchall()
 
     root = Element("iva")
     _t(root, "TipoIDInformante", "R")

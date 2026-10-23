@@ -4,6 +4,7 @@
 # Los créditos son exclusivos para consumo de la API REST externa.
 # Los suscriptores no necesitan créditos para usar la app web.
 
+import asyncio
 import stripe
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
@@ -14,6 +15,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.config import settings
+from app.core.cache import cache_get, cache_set
 from app.core.rate_limit import RateLimit, RateLimitScope
 from app.api.v1.app.suscripcion import _obtener_o_crear_customer
 
@@ -42,23 +44,37 @@ async def balance_creditos(
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
+    # Cache 30s — el balance cambia poco y se invalida al comprar/consumir
+    cache_key = f"creditos:balance:{emisor_id}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
     res = await db.execute(text("""
         SELECT balance, last_updated FROM user_credits
         WHERE emisor_id = :eid
     """), {"eid": emisor_id})
     credits = res.fetchone()
 
-    return {
+    result = {
         "ok":           True,
         "balance":      credits.balance if credits else 0,
         "last_updated": str(credits.last_updated) if credits else None,
     }
+    await cache_set(cache_key, result, 30)
+    return result
 
 
 @router.get("/planes", summary="Planes de créditos disponibles")
 async def listar_planes(
     db: AsyncSession = Depends(get_db),
 ):
+    # Cache 10 min — los planes casi nunca cambian
+    cache_key = "creditos:planes"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
+
     res = await db.execute(text("""
         SELECT id, nombre, descripcion, cantidad, precio
         FROM planes_creditos
@@ -67,7 +83,7 @@ async def listar_planes(
     """))
     planes = res.fetchall()
 
-    return {
+    result = {
         "ok":   True,
         "data": [
             {
@@ -81,6 +97,8 @@ async def listar_planes(
             for p in planes
         ]
     }
+    await cache_set(cache_key, result, 600)
+    return result
 
 
 @router.post("/checkout", summary="Crear sesión de pago para créditos API")
@@ -110,8 +128,10 @@ async def crear_checkout_creditos(
     # Extraer subtotal sin IVA
     subtotal = round(float(plan.precio) / (1 + settings.IVA_RATE), 2)
 
+    # Stripe SDK es síncrono — lo movemos a un hilo para no bloquear el event loop
     try:
-        session = stripe.checkout.Session.create(
+        session = await asyncio.to_thread(
+            stripe.checkout.Session.create,
             customer    = stripe_customer_id,
             mode        = "payment",
             line_items  = [{
@@ -156,10 +176,12 @@ async def historial_creditos(
     if not emisor_id:
         raise HTTPException(status_code=400, detail="Emisor no vinculado.")
 
+    # Una sola query con COUNT(*) OVER() para total + datos
     res = await db.execute(text("""
         SELECT
             id, tipo, cantidad, precio_total,
-            metodo_pago, referencia_pago, notas, created_at
+            metodo_pago, referencia_pago, notas, created_at,
+            COUNT(*) OVER() AS _total
         FROM credit_transactions
         WHERE emisor_id = :eid
         ORDER BY created_at DESC
@@ -167,19 +189,21 @@ async def historial_creditos(
     """), {"eid": emisor_id, "limit": limit, "offset": offset})
 
     rows = res.fetchall()
+    total = rows[0]._total if rows else 0
 
     return {
-        "ok":   True,
+        "ok":    True,
+        "total": total,
         "data": [
             {
-                "id":             str(r.id),
-                "tipo":           r.tipo,
-                "cantidad":       r.cantidad,
-                "precio_total":   float(r.precio_total or 0),
-                "metodo_pago":    r.metodo_pago,
+                "id":              str(r.id),
+                "tipo":            r.tipo,
+                "cantidad":        r.cantidad,
+                "precio_total":    float(r.precio_total or 0),
+                "metodo_pago":     r.metodo_pago,
                 "referencia_pago": r.referencia_pago,
-                "notas":          r.notas,
-                "created_at":     str(r.created_at),
+                "notas":           r.notas,
+                "created_at":      str(r.created_at),
             }
             for r in rows
         ]

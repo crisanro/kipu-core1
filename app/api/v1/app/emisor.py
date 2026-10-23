@@ -1,7 +1,7 @@
 # app/api/v1/app/emisor.py
 import time
-import httpx
 import base64
+import asyncio
 from datetime import datetime, date
 from fastapi import APIRouter, Depends, Form, UploadFile, File, HTTPException, Request
 from sqlalchemy import text
@@ -18,6 +18,7 @@ from app.core.rate_limit import RateLimit, RateLimitScope
 from app.core.config import settings
 from app.core.permisos import verificar_permiso, verificar_admin
 from app.services.audit_service import audit_log
+from app.core.http_clients import pdf_client
 
 router = APIRouter()
 NODE_VALIDATOR_URL = f"{settings.NODE_SIGNER_URL}/api/validar-p12"
@@ -77,7 +78,7 @@ async def onboarding(
 ):
     from firebase_admin import auth as firebase_auth
     try:
-        user_record = firebase_auth.get_user(auth_data["uid"])
+        user_record = await asyncio.to_thread(firebase_auth.get_user, auth_data["uid"])
         if not user_record.email_verified:
             raise HTTPException(status_code=403, detail="Debes verificar tu correo electrónico antes de continuar.")
     except HTTPException:
@@ -231,17 +232,16 @@ async def upload_p12(
     file_bytes = await file.read()
     p12_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
-    async with httpx.AsyncClient() as client:
-        try:
-            res_node = await client.post(
-                NODE_VALIDATOR_URL,
-                json={"p12Base64": p12_base64, "password": password, "ruc": emisor.ruc},
-                timeout=20.0
-            )
-            val = res_node.json()
-        except Exception as e:
-            print(f"❌ Error conexión Node.js: {e}")
-            raise HTTPException(status_code=500, detail="ERROR AL CONECTAR CON EL VALIDADOR.")
+    try:
+        res_node = await pdf_client.post(
+            NODE_VALIDATOR_URL,
+            json={"p12Base64": p12_base64, "password": password, "ruc": emisor.ruc},
+            timeout=20.0
+        )
+        val = res_node.json()
+    except Exception as e:
+        print(f"❌ Error conexión Node.js: {e}")
+        raise HTTPException(status_code=500, detail="ERROR AL CONECTAR CON EL VALIDADOR.")
 
     if not val.get("ok"):
         raise HTTPException(status_code=400, detail=val.get("mensaje", "CERTIFICADO INVÁLIDO.").upper())
@@ -249,13 +249,13 @@ async def upload_p12(
     try:
         if emisor.p12_path:
             try:
-                delete_folder(f"{emisor.ruc}/firmas/")
+                await asyncio.to_thread(delete_folder, f"{emisor.ruc}/firmas/")
             except:
                 pass
 
         p12_filename = f"firma_{emisor.ruc}_{int(time.time())}.p12"
         p12_path     = f"{emisor.ruc}/firmas/{p12_filename}"
-        upload_file(p12_path, file_bytes, "application/x-pkcs12")
+        await asyncio.to_thread(upload_file, p12_path, file_bytes, "application/x-pkcs12")
         pass_enc  = encrypt_password(password)
         raw_exp   = (val.get("expiracion") or val.get("expiration") or val.get("datos", {}).get("vence"))
         if not raw_exp:
@@ -312,7 +312,7 @@ async def remove_p12(
     try:
         if emisor.p12_path:
             try:
-                delete_folder(f"{emisor.ruc}/firmas/")
+                await asyncio.to_thread(delete_folder, f"{emisor.ruc}/firmas/")
             except Exception as e:
                 print(f"⚠️ No se pudo eliminar carpeta firmas: {e}")
 

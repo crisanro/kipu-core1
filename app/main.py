@@ -5,20 +5,19 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
-from fastapi.openapi.docs import get_swagger_ui_html  # ← Importante para /api-docs
 from contextlib import asynccontextmanager
 from starlette.responses import Response as StarResponse
+
+# Documentación Modular Scalar & OpenAPI
+from app.docs.scalar_views import router as docs_router
+from app.docs.openapi_schemas import build_custom_openapi
+
+# Core / Infrastructure
 from app.core.cloudflare import es_ip_cloudflare
-
-# Firebase
 import app.core.firebase
-
-# Cache / Redis
 from app.core.cache import get_redis
-
-# Config
 from app.core.config import settings
+from app.core.http_clients import close_http_clients
 
 # Workers
 from app.workers.sri_worker import iniciar_workers
@@ -40,7 +39,7 @@ from app.api.v1.app import (
     productos     as productos_app,
     usuarios      as usuarios_app,
     creditos      as creditos_app,
-    suscripcion   as suscripcion_app, 
+    suscripcion   as suscripcion_app,
     audit,
     cuentas       as cuentas_app,
     proformas     as proformas_app,
@@ -77,6 +76,8 @@ async def lifespan(app: FastAPI):
     _declaraciones_task = asyncio.create_task(iniciar_worker_declaraciones())
     print("🚀 Workers iniciados.")
     yield
+    # Cerrar clientes HTTP compartidos
+    await close_http_clients()
     for task in [_worker_task, _declaraciones_task]:
         if task and not task.done():
             task.cancel()
@@ -98,44 +99,15 @@ app = FastAPI(
     version          = "3.0.0",
     lifespan         = lifespan,
     redirect_slashes = False,
-    
-    # 🔒 En producción desactiva la documentación completa e interna
+
+    # 🔒 En producción desactiva la documentación estándar / Swagger incorporado
     docs_url         = None if ES_PRODUCCION else "/docs",
     redoc_url        = None if ES_PRODUCCION else "/redoc",
     openapi_url      = None if ES_PRODUCCION else "/openapi.json",
 )
 
-
-# =============================================================================
-# OPENAPI PERSONALIZADO (INTERNO / FULL)
-# =============================================================================
-
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(
-        title       = "Kipu Core API",
-        version     = "3.0.0",
-        description = "Backend de facturación electrónica SRI Ecuador",
-        routes      = app.routes,
-    )
-    schema["components"]["securitySchemes"] = {
-        "BearerAuth": {
-            "type":         "http",
-            "scheme":       "bearer",
-            "bearerFormat": "JWT",
-            "description":  "Token Firebase — cópialo desde la app web",
-        }
-    }
-    for path, path_item in schema["paths"].items():
-        if "/public/" in path or "/admin/" in path or path == "/":
-            continue
-        for method in path_item.values():
-            method["security"] = [{"BearerAuth": []}]
-    app.openapi_schema = schema
-    return app.openapi_schema
-
-app.openapi = custom_openapi
+# Inyección de OpenAPI Custom (Interno)
+app.openapi = lambda: build_custom_openapi(app)
 
 
 # =============================================================================
@@ -144,10 +116,10 @@ app.openapi = custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins    = ["*"],
+    allow_origins     = ["*"],
     allow_credentials = False,
-    allow_methods    = ["*"],
-    allow_headers    = ["*"],
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
 )
 
 
@@ -350,36 +322,43 @@ async def validar_cloudflare(request: Request, call_next):
 
 
 # =============================================================================
+# RUTAS — DOCUMENTACIÓN SCALAR Y OPENAPI
+# =============================================================================
+
+app.include_router(docs_router)
+
+
+# =============================================================================
 # RUTAS — APP
 # =============================================================================
 
-app.include_router(auth_app.router,          prefix="/api/v1/app/auth",                    tags=["📱 Auth"])
-app.include_router(emisor_app.router,        prefix="/api/v1/app/emisor",                  tags=["📱 Emisor"])
-app.include_router(estructura_app.router,    prefix="/api/v1/app/estructura",              tags=["📱 Estructura"])
-app.include_router(usuarios_app.router,      prefix="/api/v1/app/usuarios",                tags=["📱 Usuarios"])
-app.include_router(clientes_app.router,      prefix="/api/v1/app/clientes",                tags=["📱 Clientes"])
-app.include_router(cuentas_app.router,       prefix="/api/v1/app/cuentas",                   tags=["📱 Cuentas"])
-app.include_router(productos_app.router,     prefix="/api/v1/app/productos",               tags=["📱 Productos"])
-app.include_router(catalogo_app.router,      prefix="/api/v1/app/catalogo",                tags=["📱 Catálogo"])
-app.include_router(documentos_app.router,    prefix="/api/v1/app/documentos",              tags=["📱 Documentos Emitidos"])
-app.include_router(recibidas_app.router,     prefix="/api/v1/app/recibidos",               tags=["📱 Documentos Recibidos"])
-app.include_router(declaraciones_app.router, prefix="/api/v1/app/declaraciones",           tags=["📱 Declaraciones"])
-app.include_router(dashboard_app.router,     prefix="/api/v1/app/dashboard",               tags=["📱 Dashboard"])
-app.include_router(apikeys_app.router,       prefix="/api/v1/app/apikeys",                 tags=["📱 API Keys"])
-app.include_router(notificaciones_app.router,prefix="/api/v1/app/notificaciones",          tags=["📱 Notificaciones"])
-app.include_router(suscripcion_app.router,   prefix="/api/v1/app/suscripcion",             tags=["📱 Suscripción"])
-app.include_router(creditos_app.router,      prefix="/api/v1/app/creditos",                tags=["📱 Créditos API"])
-app.include_router(audit.router, prefix="/api/v1/app/audit", tags=["Auditoría"])
-app.include_router(proformas_app.router, prefix="/api/v1/app/proformas", tags=["📱 Proformas"])
+app.include_router(auth_app.router,          prefix="/api/v1/app/auth",          tags=["📱 Auth"])
+app.include_router(emisor_app.router,        prefix="/api/v1/app/emisor",        tags=["📱 Emisor"])
+app.include_router(estructura_app.router,    prefix="/api/v1/app/estructura",    tags=["📱 Estructura"])
+app.include_router(usuarios_app.router,      prefix="/api/v1/app/usuarios",      tags=["📱 Usuarios"])
+app.include_router(clientes_app.router,      prefix="/api/v1/app/clientes",      tags=["📱 Clientes"])
+app.include_router(cuentas_app.router,       prefix="/api/v1/app/cuentas",       tags=["📱 Cuentas"])
+app.include_router(productos_app.router,     prefix="/api/v1/app/productos",     tags=["📱 Productos"])
+app.include_router(catalogo_app.router,      prefix="/api/v1/app/catalogo",      tags=["📱 Catálogo"])
+app.include_router(documentos_app.router,    prefix="/api/v1/app/documentos",    tags=["📱 Documentos Emitidos"])
+app.include_router(recibidas_app.router,     prefix="/api/v1/app/recibidos",     tags=["📱 Documentos Recibidos"])
+app.include_router(declaraciones_app.router, prefix="/api/v1/app/declaraciones", tags=["📱 Declaraciones"])
+app.include_router(dashboard_app.router,     prefix="/api/v1/app/dashboard",     tags=["📱 Dashboard"])
+app.include_router(apikeys_app.router,       prefix="/api/v1/app/apikeys",       tags=["📱 API Keys"])
+app.include_router(notificaciones_app.router,prefix="/api/v1/app/notificaciones", tags=["📱 Notificaciones"])
+app.include_router(suscripcion_app.router,   prefix="/api/v1/app/suscripcion",   tags=["📱 Suscripción"])
+app.include_router(creditos_app.router,      prefix="/api/v1/app/creditos",      tags=["📱 Créditos API"])
+app.include_router(audit.router,             prefix="/api/v1/app/audit",         tags=["Auditoría"])
+app.include_router(proformas_app.router,     prefix="/api/v1/app/proformas",     tags=["📱 Proformas"])
 
 # =============================================================================
 # RUTAS — PUBLIC (SOLO ESTAS LLEVAN "public_export")
 # =============================================================================
 
-app.include_router(documentos_public.router,    prefix="/api/v1/public",                  tags=["🌍 Documentos Públicos", "public_export"])
-app.include_router(clientes_public.router,      prefix="/api/v1/public/clientes",         tags=["🌍 Clientes", "public_export"])
-app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones",    tags=["🌍 API Externa", "public_export"])
-app.include_router(dev_docs_public.router,      prefix="/api/v1/public",                  tags=["📖 Dev Docs"])
+app.include_router(documentos_public.router,    prefix="/api/v1/public")
+app.include_router(clientes_public.router,      prefix="/api/v1/public/clientes")
+app.include_router(integraciones_public.router, prefix="/api/v1/public/integraciones")
+app.include_router(dev_docs_public.router,      prefix="/api/v1/public",               tags=["📖 Dev Docs"])
 
 # =============================================================================
 # RUTAS — ADMIN
@@ -388,7 +367,7 @@ app.include_router(dev_docs_public.router,      prefix="/api/v1/public",        
 app.include_router(integraciones_admin.router, prefix="/api/v1/admin",         tags=["🔧 Admin - Integraciones"])
 app.include_router(panel_admin.router,         prefix="/api/v1/admin/panel",   tags=["🔧 Admin - Panel"])
 app.include_router(stripe_webhook.router,      prefix="/api/v1/admin/stripe",  tags=["💳 Stripe"])
-app.include_router(diagnostico_router.router,  prefix="/api/v1/admin/panel",  tags=["🔧 Admin - Diagnóstico"])
+app.include_router(diagnostico_router.router,  prefix="/api/v1/admin/panel",   tags=["🔧 Admin - Diagnóstico"])
 
 
 # =============================================================================
@@ -401,78 +380,3 @@ async def root():
         "status":   "Kipu API v0.1.0 🚀",
         "api_docs": "/api-docs",
     }
-
-
-# =============================================================================
-# DOCUMENTACIÓN PÚBLICA DE SWAGGER Y ESQUEMA OPENAPI
-# =============================================================================
-
-@app.get("/api-docs", include_in_schema=False)
-async def swagger_publico():
-    """Renderiza la interfaz visual de Swagger UI para desarrolladores externos."""
-    return get_swagger_ui_html(
-        openapi_url="/openapi-public.json",
-        title="Kipu — Documentación Pública API",
-        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
-    )
-
-
-@app.get("/openapi-public.json", include_in_schema=False)
-async def openapi_publico():
-    """Genera el JSON de OpenAPI filtrando NADA por defecto, salvo lo etiquetado."""
-    schema = get_openapi(
-        title="Kipu — API de Facturación Electrónica",
-        version="0.1.0",
-        description="""
-
-Integra facturación electrónica SRI en tu sistema en minutos.
-
-## Autenticación
-`X-Api-Key: tu_api_key_aqui`  
-Obtén tu API Key desde **Configuración → API Keys** en [app.kipu.ec](https://app.kipu.ec).
-
-## Flujo básico
-1. **Validar** → `POST /api/v1/public/integraciones/validate`
-2. **Emitir** → `POST /api/v1/public/integraciones/invoice`
-3. **PDF** → `GET /api/v1/public/pdf/{clave_acceso}`
-4. **XML** → `GET /api/v1/public/xml/{clave_acceso}`
-        """,
-        routes=app.routes,
-    )
-
-    paths_publicos = {}
-
-    # Por defecto NADA se muestra
-    for path, path_item in schema.get("paths", {}).items():
-        metodos_filtrados = {}
-
-        for method, operation in path_item.items():
-            tags = operation.get("tags", [])
-
-            # REGLA: Si NO tiene la etiqueta 'public_export', SE IGNORA POR COMPLETO
-            if "public_export" in tags:
-                # Removemos la etiqueta 'public_export' para que no ensucie la UI
-                operation["tags"] = [t for t in tags if t != "public_export"]
-                
-                # Asignamos la seguridad con API Key
-                operation["security"] = [{"ApiKeyAuth": []}]
-                
-                metodos_filtrados[method] = operation
-
-        if metodos_filtrados:
-            paths_publicos[path] = metodos_filtrados
-
-    # Reemplazamos todos los paths por ÚNICAMENTE los aprobados
-    schema["paths"] = paths_publicos
-
-    # Configuración de Seguridad global
-    schema["components"]["securitySchemes"] = {
-        "ApiKeyAuth": {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-Api-Key",
-            "description": "API Key desde Configuración → API Keys en app.kipu.ec",
-        }
-    }
-
-    return JSONResponse(content=schema)

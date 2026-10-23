@@ -1,7 +1,7 @@
 # app/api/v1/app/proformas.py
 from datetime import date
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,9 +90,11 @@ async def crear_proforma(
 async def listar_proformas(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
     verificar_permiso(auth_data, "emitir")
-    return await listar_proformas_core(auth_data["emisor_id"], db)
+    return await listar_proformas_core(auth_data["emisor_id"], db, limit, offset)
 
 
 @router.get("/{proforma_id}")

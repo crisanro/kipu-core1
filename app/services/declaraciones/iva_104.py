@@ -16,6 +16,7 @@
 #   6. AGENTE RETENCIÓN  + retenciones que TÚ hiciste (721…731)        → 801
 #                                                               TOTAL A PAGAR → 859
 
+import asyncio
 from datetime import date
 from decimal import Decimal
 from sqlalchemy import text
@@ -91,25 +92,126 @@ async def calcular_iva_104(
     doc_emitidos_ids:  set[str] = set()
     doc_recibidos_ids: set[str] = set()
 
-    # ── Comprobantes EMITIDOS: ventas (FAC, ND), NC y liquidaciones (compras) ──
-    res = await db.execute(text(f"""
-        SELECT d.id, d.tipo_doc,
-               COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
-               SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
-               SUM(COALESCE((imp->>'valor')::numeric, 0))          AS iva
-        FROM documentos_emitidos d,
-             jsonb_array_elements({_IMPUESTOS_EMITIDO}) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.es_sandbox    = false
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR', 'LIQ')
-        GROUP BY d.id, d.tipo_doc, COALESCE((imp->>'tarifa')::numeric, 0)
-    """), params)
+    # ── 5 queries independientes en paralelo ───────────────────────────────
+    (
+        res_emitidos,
+        res_recibidos,
+        res_ret_recib,
+        res_ret_emit,
+        res_conteo,
+    ) = await asyncio.gather(
+        # 1. Comprobantes EMITIDOS: ventas (FAC, ND), NC y liquidaciones (compras)
+        db.execute(text(f"""
+            SELECT d.id, d.tipo_doc,
+                   COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
+                   SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
+                   SUM(COALESCE((imp->>'valor')::numeric, 0))          AS iva
+            FROM documentos_emitidos d,
+                 jsonb_array_elements({_IMPUESTOS_EMITIDO}) AS imp
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.es_sandbox    = false
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR', 'LIQ')
+            GROUP BY d.id, d.tipo_doc, COALESCE((imp->>'tarifa')::numeric, 0)
+        """), params),
+        # 2. Comprobantes RECIBIDOS
+        db.execute(text("""
+            SELECT d.id, d.tipo_doc,
+                   COALESCE((item->>'tarifa_iva')::numeric, 0)                    AS tarifa,
+                   COALESCE((item->>'credito_tributario_iva')::boolean, false)    AS credito,
+                   COALESCE((item->>'subtotal')::numeric, 0)                      AS base,
+                   COALESCE((item->>'valor_iva')::numeric, 0)                      AS iva
+            FROM documentos_recibidos d,
+                 jsonb_array_elements(
+                     CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
+                 ) AS item
+            WHERE d.emisor_id     = :eid
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR')
 
+            UNION ALL
+
+            SELECT d.id, d.tipo_doc,
+                   CASE WHEN COALESCE(d.subtotal_base, 0) > 0 AND COALESCE(d.valor_iva_total, 0) > 0
+                        THEN ROUND(d.valor_iva_total / d.subtotal_base * 100)
+                        ELSE 0 END                                                AS tarifa,
+                   COALESCE(d.credito_tributario_iva, false)                      AS credito,
+                   COALESCE(d.subtotal_base, 0)                                   AS base,
+                   COALESCE(d.valor_iva_total, 0)                                 AS iva
+            FROM documentos_recibidos d
+            WHERE d.emisor_id     = :eid
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR')
+              AND (jsonb_typeof(d.items_detalle) IS DISTINCT FROM 'array'
+                   OR jsonb_array_length(d.items_detalle) = 0)
+        """), params),
+        # 3. Retenciones de IVA que TE hicieron (Casillero 609)
+        db.execute(text("""
+            SELECT d.id,
+                   COALESCE((item->>'valor_iva')::numeric, (item->>'total')::numeric, (item->>'valorRetenido')::numeric, 0) AS valor
+            FROM documentos_recibidos d,
+                 jsonb_array_elements(
+                     CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
+                 ) AS item
+            WHERE d.emisor_id = :eid AND d.tipo_doc = 'RET'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND (item->>'codigo_impuesto' = '2' OR item->>'codigo' = '2')
+
+            UNION ALL
+
+            SELECT d.id, COALESCE(d.valor_iva_total, 0) AS valor
+            FROM documentos_recibidos d
+            WHERE d.emisor_id = :eid AND d.tipo_doc = 'RET'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND (jsonb_typeof(d.items_detalle) IS DISTINCT FROM 'array'
+                   OR jsonb_array_length(d.items_detalle) = 0)
+        """), params),
+        # 4. Retenciones de IVA que TÚ hiciste (Casilleros 721–731 y 799)
+        db.execute(text("""
+            SELECT d.id,
+                   COALESCE((imp->>'porcentajeRetener')::numeric, 0)  AS pct,
+                   SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)) AS valor
+            FROM documentos_emitidos d,
+                 jsonb_array_elements(
+                     CASE
+                         WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
+                             CASE
+                                 WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                                 THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                                 ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
+                             END
+                         WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
+                             CASE
+                                 WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
+                                 THEN d.datos->'impuestos'->'impuesto'
+                                 ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto')
+                             END
+                         ELSE '[]'::jsonb
+                     END
+                 ) AS imp
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.es_sandbox    = false
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.tipo_doc      = 'RET'
+              AND (imp->>'codigo') = '2'
+            GROUP BY d.id, COALESCE((imp->>'porcentajeRetener')::numeric, 0)
+        """), params),
+        # 5. Conteo de comprobantes
+        db.execute(text("""
+            SELECT COUNT(*) FILTER (WHERE estado_sri <> 'ANULADO' AND tipo_doc IN ('FAC', 'NDB', 'NCR')) AS emitidos,
+                   COUNT(*) FILTER (WHERE estado_sri =  'ANULADO' AND tipo_doc IN ('FAC', 'NDB', 'NCR')) AS anulados
+            FROM documentos_emitidos
+            WHERE emisor_id = :eid AND es_sandbox = false
+              AND fecha_emision BETWEEN :fi AND :ff
+        """), params),
+    )
+
+    # ── Procesar emitidos ──────────────────────────────────────────────────
     ventas, ncr_emit, liq = {}, {}, {}
     liq_ids: set[str] = set()
-    for r in res.fetchall():
+    for r in res_emitidos.fetchall():
         doc_emitidos_ids.add(str(r.id))
         t = float(r.tarifa)
         if r.tipo_doc in ("FAC", "NDB"):
@@ -120,41 +222,10 @@ async def calcular_iva_104(
             _acumular(liq, t, r.base, r.iva)
             liq_ids.add(str(r.id))
 
-    # ── Comprobantes RECIBIDOS ──
-    res = await db.execute(text("""
-        SELECT d.id, d.tipo_doc,
-               COALESCE((item->>'tarifa_iva')::numeric, 0)                    AS tarifa,
-               COALESCE((item->>'credito_tributario_iva')::boolean, false)    AS credito,
-               COALESCE((item->>'subtotal')::numeric, 0)                      AS base,
-               COALESCE((item->>'valor_iva')::numeric, 0)                      AS iva
-        FROM documentos_recibidos d,
-             jsonb_array_elements(
-                 CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
-             ) AS item
-        WHERE d.emisor_id     = :eid
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR')
-
-        UNION ALL
-
-        SELECT d.id, d.tipo_doc,
-               CASE WHEN COALESCE(d.subtotal_base, 0) > 0 AND COALESCE(d.valor_iva_total, 0) > 0
-                    THEN ROUND(d.valor_iva_total / d.subtotal_base * 100)
-                    ELSE 0 END                                                AS tarifa,
-               COALESCE(d.credito_tributario_iva, false)                      AS credito,
-               COALESCE(d.subtotal_base, 0)                                   AS base,
-               COALESCE(d.valor_iva_total, 0)                                 AS iva
-        FROM documentos_recibidos d
-        WHERE d.emisor_id     = :eid
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      IN ('FAC', 'NDB', 'NCR')
-          AND (jsonb_typeof(d.items_detalle) IS DISTINCT FROM 'array'
-               OR jsonb_array_length(d.items_detalle) = 0)
-    """), params)
-
+    # ── Procesar recibidos ─────────────────────────────────────────────────
     compras_cc, compras_sc, ncr_recib = {}, {}, {}
     recibidos_venta: set[str] = set()
-    for r in res.fetchall():
+    for r in res_recibidos.fetchall():
         doc_recibidos_ids.add(str(r.id))
         t = float(r.tarifa)
         if r.tipo_doc == "NCR":
@@ -168,72 +239,18 @@ async def calcular_iva_104(
     for t, v in liq.items():
         _acumular(compras_cc, t, v["base"], v["iva"])
 
-    # ── Retenciones de IVA que TE hicieron (Casillero 609) ──
-    res = await db.execute(text("""
-        SELECT d.id, 
-               COALESCE((item->>'valor_iva')::numeric, (item->>'total')::numeric, (item->>'valorRetenido')::numeric, 0) AS valor
-        FROM documentos_recibidos d,
-             jsonb_array_elements(
-                 CASE WHEN jsonb_typeof(d.items_detalle) = 'array' THEN d.items_detalle ELSE '[]'::jsonb END
-             ) AS item
-        WHERE d.emisor_id = :eid AND d.tipo_doc = 'RET'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND (item->>'codigo_impuesto' = '2' OR item->>'codigo' = '2')
-
-        UNION ALL
-
-        SELECT d.id, COALESCE(d.valor_iva_total, 0) AS valor
-        FROM documentos_recibidos d
-        WHERE d.emisor_id = :eid AND d.tipo_doc = 'RET'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND (jsonb_typeof(d.items_detalle) IS DISTINCT FROM 'array'
-               OR jsonb_array_length(d.items_detalle) = 0)
-    """), params)
+    # ── Retenciones de IVA recibidas (609) ─────────────────────────────────
     c609 = 0.0
-    for r in res.fetchall():
+    for r in res_ret_recib.fetchall():
         doc_recibidos_ids.add(str(r.id))
         c609 += float(r.valor)
     c609 = _r(c609)
 
-    # ── Retenciones de IVA que TÚ hiciste (Casilleros 721–731 y 799) ──
-    # Soporta esquemas v1.0 y v2.0 del SRI en JSONB
-    res = await db.execute(text("""
-        SELECT d.id,
-               COALESCE((imp->>'porcentajeRetener')::numeric, 0)  AS pct,
-               SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)) AS valor
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     -- Esquema v2.0 SRI (docsSustento -> docSustento -> retenciones -> retencion)
-                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL THEN
-                         CASE 
-                             WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
-                             THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
-                             ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
-                         END
-                     -- Esquema v1.0 SRI (impuestos -> impuesto)
-                     WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL THEN
-                         CASE
-                             WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
-                             THEN d.datos->'impuestos'->'impuesto'
-                             ELSE jsonb_build_array(d.datos->'impuestos'->'impuesto')
-                         END
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.es_sandbox    = false
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.tipo_doc      = 'RET'
-          AND (imp->>'codigo') = '2' -- 2 = IVA
-        GROUP BY d.id, COALESCE((imp->>'porcentajeRetener')::numeric, 0)
-    """), params)
-
+    # ── Retenciones de IVA emitidas (721–731) ──────────────────────────────
     PCT_CAS = {10: "721", 20: "723", 30: "725", 50: "727", 70: "729", 100: "731"}
     cas_ret = {c: 0.0 for c in PCT_CAS.values()}
     ret_e_desglose: dict[float, float] = {}
-    for r in res.fetchall():
+    for r in res_ret_emit.fetchall():
         doc_emitidos_ids.add(str(r.id))
         pct, valor = float(r.pct), float(r.valor)
         cas = PCT_CAS.get(int(pct))
@@ -242,15 +259,8 @@ async def calcular_iva_104(
         ret_e_desglose[pct] = ret_e_desglose.get(pct, 0.0) + valor
     cas_ret = {k: _r(v) for k, v in cas_ret.items()}
 
-    # ── Conteo de comprobantes ──
-    res = await db.execute(text("""
-        SELECT COUNT(*) FILTER (WHERE estado_sri <> 'ANULADO' AND tipo_doc IN ('FAC', 'NDB', 'NCR')) AS emitidos,
-               COUNT(*) FILTER (WHERE estado_sri =  'ANULADO' AND tipo_doc IN ('FAC', 'NDB', 'NCR')) AS anulados
-        FROM documentos_emitidos
-        WHERE emisor_id = :eid AND es_sandbox = false
-          AND fecha_emision BETWEEN :fi AND :ff
-    """), params)
-    cnt = res.fetchone()
+    # ── Conteo ─────────────────────────────────────────────────────────────
+    cnt = res_conteo.fetchone()
 
     # ═════════════════════════════════════════════════════════════════════════
     # 1. VENTAS

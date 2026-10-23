@@ -1,13 +1,7 @@
 # app/api/v1/app/declaraciones.py
-#
-# Endpoints de declaraciones tributarias. La lógica vive en app/services/declaraciones/.
-#
-# El sistema NO declara por el usuario: prepara los valores y registra si declaró.
-# La declaración real se hace en SRI en Línea.
-#
-# Tipos: 104 (IVA) | 102 (Renta) | ATS
 
 import json
+import asyncio
 from datetime import date, timedelta
 from typing import Optional
 from decimal import Decimal
@@ -19,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.security import verify_firebase_token
 from app.core.permisos import verificar_permiso
-from app.core.cache import cache_get, cache_set, invalidate_emisor, TTL, CK
+from app.core.cache import cache_get, cache_set, cache_clear_prefix, invalidate_emisor, TTL, CK
 from app.services.audit_service import audit_log
 from app.services.storage_service import upload_file, get_presigned_url
 
@@ -47,7 +41,6 @@ def _emisor(auth_data: dict) -> int:
 
 
 def _permiso(auth_data: dict) -> None:
-    """Un solo permiso para todo el módulo: basta con 'declaraciones' o 'reportes'."""
     try:
         verificar_permiso(auth_data, "declaraciones")
     except HTTPException:
@@ -74,12 +67,8 @@ async def _verificar_suscripcion(emisor_id: int, db: AsyncSession) -> bool:
 
 
 async def _invalidar_dashboard(emisor_id: int) -> None:
-    """El widget del dashboard vive en caché: al declarar, se limpia para que cambie al instante."""
     try:
-        from app.core.cache import get_redis
-        redis = await get_redis()
-        async for key in redis.scan_iter(f"dashboard:{emisor_id}*"):
-            await redis.delete(key)
+        await cache_clear_prefix(f"dashboard:{emisor_id}")
     except Exception as e:
         print(f"[Cache] ⚠️ No invalidado: {e}")
 
@@ -92,7 +81,7 @@ def _parse_periodo(tipo: str, tipo_periodo: str, key: str) -> per.Periodo:
 
 
 # =============================================================================
-# GET /obligaciones — qué declara esta empresa
+# GET /obligaciones
 # =============================================================================
 @router.get("/obligaciones", summary="Obligaciones tributarias de la empresa")
 async def obtener_obligaciones(
@@ -106,7 +95,7 @@ async def obtener_obligaciones(
 
 
 # =============================================================================
-# GET /actual — el periodo que toca declarar ahora
+# GET /actual
 # =============================================================================
 @router.get("/actual", summary="Declaración que toca declarar ahora")
 async def obtener_declaracion_actual(
@@ -155,7 +144,7 @@ async def obtener_declaracion_actual(
 
 
 # =============================================================================
-# GET /historial — todos los periodos del año (por calendario)
+# GET /historial
 # =============================================================================
 @router.get("/historial", summary="Periodos del año con su estado")
 async def historial_declaraciones(
@@ -191,7 +180,7 @@ async def historial_declaraciones(
 
 
 # =============================================================================
-# GET /periodo/{anio}/{mes} — un periodo específico
+# GET /periodo/{anio}/{mes}
 # =============================================================================
 @router.get("/periodo/{anio}/{mes}", summary="Declaración de un periodo específico")
 async def declaracion_periodo(
@@ -221,7 +210,7 @@ async def declaracion_periodo(
 
 
 # =============================================================================
-# GET /totales/{anio}/{mes} — totales del mes (mismo cálculo que el 104)
+# GET /totales/{anio}/{mes}
 # =============================================================================
 @router.get("/totales/{anio}/{mes}", summary="Totales fiscales de un mes")
 async def calcular_totales_periodo(
@@ -245,7 +234,7 @@ async def calcular_totales_periodo(
 
 
 # =============================================================================
-# GET /reportes — reportes guardados
+# GET /reportes
 # =============================================================================
 @router.get("/reportes", summary="Reportes tributarios guardados")
 async def listar_reportes(
@@ -260,7 +249,7 @@ async def listar_reportes(
 
 
 # =============================================================================
-# POST /declarar — marcar un periodo como declarado
+# POST /declarar
 # =============================================================================
 @router.post("/declarar", summary="Marcar un periodo como declarado")
 async def marcar_declarado(
@@ -307,7 +296,7 @@ async def marcar_declarado(
             db, emisor_id=emisor_id, tipo="IVA", tipo_periodo=tp, periodo_db=p.inicio,
             casilleros=calc["casilleros"], preguntas=calc["preguntas"],
             desglose=calc["desglose"], resumen=calc["resumen"],
-            doc_emitidos_ids=calc.get("doc_emitidos_ids") or set(), 
+            doc_emitidos_ids=calc.get("doc_emitidos_ids") or set(),
             doc_recibidos_ids=calc.get("doc_recibidos_ids") or set(),
             profile_id=profile_id, regenerar=False,
         )
@@ -342,12 +331,17 @@ async def casilleros_iva(
     profile_id = auth_data.get("profile_id")
     _permiso(auth_data)
 
-    if not await _verificar_suscripcion(emisor_id, db):
+    # Verificar suscripción y obligaciones en paralelo
+    tiene_sub, obl = await asyncio.gather(
+        _verificar_suscripcion(emisor_id, db),
+        _obligaciones(db, emisor_id),
+    )
+
+    if not tiene_sub:
         return {"ok": True, "demo": True, "cached": False, "en_curso": False,
                 "total_doc_emitidos": 0, "total_doc_recibidos": 0,
                 "data": demo.datos_demo_iva()}
 
-    obl = await _obligaciones(db, emisor_id)
     tp  = obl.tipo_periodo("104")
     p   = _parse_periodo("104", tp, periodo)
     hoy = per.hoy_ec()
@@ -413,7 +407,7 @@ async def casilleros_iva(
 
 
 # =============================================================================
-# PATCH /iva/campos-manuales — casilleros manuales del 104
+# PATCH /iva/campos-manuales
 # =============================================================================
 @router.patch("/iva/campos-manuales", summary="Guardar casilleros manuales del formulario 104")
 async def guardar_campos_manuales_iva(
@@ -421,7 +415,7 @@ async def guardar_campos_manuales_iva(
     periodo:   str          = Query(..., description="Periodo YYYY-MM, ej: 2026-08"),
     auth_data: dict         = Depends(verify_firebase_token),
     db:        AsyncSession = Depends(get_db),
-    body:      dict         = Body(..., example={"605": 150.00, "606": 0.00, "625": 0.00}),
+    body:      dict         = Body(..., examples={"605": 150.00, "606": 0.00, "625": 0.00}),
 ):
     emisor_id  = _emisor(auth_data)
     profile_id = auth_data.get("profile_id")
@@ -455,7 +449,7 @@ async def guardar_campos_manuales_iva(
 
 
 # =============================================================================
-# GET /renta — Impuesto a la Renta anual (Consolidado)
+# GET /renta
 # =============================================================================
 @router.get("/renta", summary="Impuesto a la Renta anual")
 async def casilleros_renta(
@@ -481,14 +475,12 @@ async def casilleros_renta(
     en_curso = p.en_curso(hoy)
     info_periodo = {"anio": anio, "desde": p.inicio.isoformat(), "hasta": p.fin.isoformat()}
 
-    # 1. Intentar leer de Redis (si no viene ?regenerar=true)
     cache_key = f"declaracion:renta:{emisor_id}:{anio}"
     if not regenerar:
         cached_redis = await cache_get(cache_key)
         if cached_redis is not None:
             return cached_redis
 
-    # 2. Intentar responder desde snapshot congelado si no está en curso
     if not en_curso and not regenerar:
         cached = await snapshots.leer(db, emisor_id, "RENTA", p.inicio)
         if cached:
@@ -510,7 +502,6 @@ async def casilleros_renta(
             await cache_set(cache_key, response_payload, ttl=300)
             return response_payload
 
-    # 3. Recalcular consolidado anual
     calc = await calcular_renta_102(db, emisor_id, anio)
 
     doc_emitidos = calc.get("doc_emitidos_ids") or set()
@@ -550,7 +541,7 @@ async def casilleros_renta(
 
 
 # =============================================================================
-# GET /ats — Anexo Transaccional Simplificado
+# GET /ats
 # =============================================================================
 async def _emisor_ats(db: AsyncSession, emisor_id: int):
     res = await db.execute(text("""
@@ -574,15 +565,21 @@ async def casilleros_ats(
     profile_id = auth_data.get("profile_id")
     _permiso(auth_data)
 
-    p        = _parse_periodo("ATS", "MENSUAL", periodo)
-    hoy      = per.hoy_ec()
+    p   = _parse_periodo("ATS", "MENSUAL", periodo)
+    hoy = per.hoy_ec()
+
+    # 3 queries independientes en paralelo
+    tiene_sub, emisor, obl = await asyncio.gather(
+        _verificar_suscripcion(emisor_id, db),
+        _emisor_ats(db, emisor_id),
+        _obligaciones(db, emisor_id),
+    )
+
     en_curso = p.en_curso(hoy)
-    emisor   = await _emisor_ats(db, emisor_id)
-    obl      = await _obligaciones(db, emisor_id)
 
     demo_base = {"ok": True, "demo": True, "cached": False, "en_curso": False,
                  "total_doc_emitidos": 0, "total_doc_recibidos": 0, "data": demo.datos_demo_ats()}
-    if not await _verificar_suscripcion(emisor_id, db):
+    if not tiene_sub:
         return {**demo_base, "motivo": "sin_suscripcion"}
     if not obl.ats:
         return {**demo_base, "motivo": "no_obligado"}
@@ -642,7 +639,7 @@ async def casilleros_ats(
 
 
 # =============================================================================
-# POST /ats/generar — XML del ATS subido a R2
+# POST /ats/generar
 # =============================================================================
 @router.post("/ats/generar", summary="Generar archivo XML del ATS para el SRI")
 async def generar_ats(
@@ -654,11 +651,16 @@ async def generar_ats(
     profile_id = auth_data.get("profile_id")
     _permiso(auth_data)
 
-    p      = _parse_periodo("ATS", "MENSUAL", periodo)
-    emisor = await _emisor_ats(db, emisor_id)
-    obl    = await _obligaciones(db, emisor_id)
+    p = _parse_periodo("ATS", "MENSUAL", periodo)
 
-    if not await _verificar_suscripcion(emisor_id, db):
+    # 3 queries independientes en paralelo
+    tiene_sub, emisor, obl = await asyncio.gather(
+        _verificar_suscripcion(emisor_id, db),
+        _emisor_ats(db, emisor_id),
+        _obligaciones(db, emisor_id),
+    )
+
+    if not tiene_sub:
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa para generar el ATS.")
     if not obl.ats:
         raise HTTPException(status_code=403, detail="El ATS aplica solo a obligados a llevar contabilidad y sociedades.")
@@ -666,7 +668,9 @@ async def generar_ats(
     archivo = await generar_xml_ats(db, emisor, emisor_id, p.inicio.year, p.inicio.month, p.inicio, p.fin)
 
     r2_path = f"{emisor.ruc}/ats/{archivo['nombre_zip']}"
-    upload_file(r2_path, archivo["zip_bytes"], "application/zip")
+
+    # upload_file es síncrono — no bloquear el event loop
+    await asyncio.to_thread(upload_file, r2_path, archivo["zip_bytes"], "application/zip")
 
     await snapshots.guardar_archivo_ats(
         db, emisor_id=emisor_id, periodo_db=p.inicio,
@@ -675,11 +679,14 @@ async def generar_ats(
         profile_id=profile_id,
     )
 
+    # get_presigned_url puede ser síncrono también
+    download_url = await asyncio.to_thread(get_presigned_url, r2_path)
+
     return {
         "ok":            True,
         "nombre_zip":    archivo["nombre_zip"],
         "r2_path":       r2_path,
-        "download_url":  get_presigned_url(r2_path),
+        "download_url":  download_url,
         "total_ventas":  archivo["total_ventas"],
         "total_compras": archivo["total_compras"],
         "mensaje":       f"ATS generado correctamente — {archivo['nombre_zip']}",
@@ -687,7 +694,7 @@ async def generar_ats(
 
 
 # =============================================================================
-# GET /ats/descargar — URL de descarga del ATS
+# GET /ats/descargar
 # =============================================================================
 @router.get("/ats/descargar", summary="Obtener URL de descarga del ATS")
 async def descargar_ats(
@@ -698,9 +705,14 @@ async def descargar_ats(
     emisor_id = _emisor(auth_data)
     _permiso(auth_data)
 
-    if not await _verificar_suscripcion(emisor_id, db):
+    # 2 queries independientes en paralelo
+    tiene_sub, obl = await asyncio.gather(
+        _verificar_suscripcion(emisor_id, db),
+        _obligaciones(db, emisor_id),
+    )
+
+    if not tiene_sub:
         raise HTTPException(status_code=402, detail="Se requiere suscripción activa.")
-    obl = await _obligaciones(db, emisor_id)
     if not obl.ats:
         raise HTTPException(status_code=403, detail="El ATS aplica solo a obligados a llevar contabilidad y sociedades.")
 
@@ -713,8 +725,10 @@ async def descargar_ats(
     if not row or not row.resumen or not row.resumen.get("xml_path"):
         raise HTTPException(status_code=404, detail="ATS no generado aún. Genera el archivo primero.")
 
+    download_url = await asyncio.to_thread(get_presigned_url, row.resumen["xml_path"])
+
     return {
         "ok":           True,
-        "download_url": get_presigned_url(row.resumen["xml_path"]),
+        "download_url": download_url,
         "nombre_zip":   row.resumen.get("nombre_zip"),
     }

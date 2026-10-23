@@ -1,4 +1,4 @@
-# app/services/cliente_service.py — OPTIMIZADO con cache
+# app/services/cliente_service.py — OPTIMIZADO con cache + paginación detalle
 import uuid
 from sqlalchemy import text, bindparam
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -294,77 +294,107 @@ async def consultar_todos_clientes_core(emisor_id: int, db: AsyncSession):
         raise HTTPException(status_code=500, detail="Error al obtener listado de clientes.")
 
 
-# ── 3. DETALLE + HISTORIAL — CON CACHE ────────────────────────────────────────
+# ── 3. DETALLE + HISTORIAL — OPTIMIZADO: 2 queries separadas ─────────────────
 
-async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: AsyncSession):
-    """Detalle completo del cliente + historial de facturas — CON CACHE (TTL 5 min)."""
+# Límite por defecto de facturas en el detalle (configurable desde el endpoint)
+DEFAULT_FACTURAS_LIMIT = 20
+
+async def consultar_detalle_cliente_core(
+    emisor_id: int,
+    cliente_id: str,
+    db: AsyncSession,
+    facturas_limit: int = DEFAULT_FACTURAS_LIMIT,
+):
+    """
+    Detalle del cliente + últimas N facturas — CON CACHE (TTL 5 min).
+
+    Separado en 2 queries:
+      1. Datos del cliente + resumen agregado (COUNT + SUM, sin traer filas)
+      2. Últimas N facturas ordenadas por fecha
+    """
     cache_key = CK.fmt(CK.CLIENTE_DETALLE, eid=emisor_id, cid=cliente_id)
     cached = await cache_get(cache_key)
     if cached:
         return cached
 
     try:
-        query = text("""
+        # ── Query 1: cliente + resumen agregado ──────────────────────────────
+        res_cliente = await db.execute(text("""
             SELECT
-                c.id, c.tipo_identificacion_sri, c.identificacion, c.razon_social,
-                c.direccion, c.email, c.telefono,
-                d.id        AS factura_id,
-                d.numero_doc,
-                d.importe_total,
-                d.fecha_emision,
-                d.estado_sri
+                c.id, c.tipo_identificacion_sri, c.identificacion,
+                c.razon_social, c.direccion, c.email, c.telefono,
+                COALESCE(r.total_docs, 0)       AS total_documentos,
+                COALESCE(r.suma_autorizada, 0.0) AS suma_facturada
             FROM clientes_emisor c
-            LEFT JOIN documentos_emitidos d
-                   ON d.cliente_id = c.id
-                  AND d.emisor_id  = :eid
-                  AND d.tipo_doc   = 'FAC'
-                  AND d.es_sandbox = false
-            WHERE c.id        = :cid
-              AND c.emisor_id = :eid
-            ORDER BY d.created_at DESC
-        """)
-        res  = await db.execute(query, {"cid": cliente_id, "eid": emisor_id})
-        rows = res.mappings().fetchall()
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*)                                          AS total_docs,
+                    SUM(CASE WHEN estado_sri = 'AUTORIZADO'
+                             THEN importe_total ELSE 0 END)          AS suma_autorizada
+                FROM documentos_emitidos
+                WHERE cliente_id = c.id
+                  AND emisor_id  = :eid
+                  AND tipo_doc   = 'FAC'
+                  AND es_sandbox = false
+            ) r ON true
+            WHERE c.id = :cid AND c.emisor_id = :eid
+        """), {"cid": cliente_id, "eid": emisor_id})
 
-        if not rows:
+        row_cliente = res_cliente.mappings().fetchone()
+        if not row_cliente:
             raise HTTPException(status_code=404, detail="EL CLIENTE NO EXISTE.")
 
-        first = rows[0]
         cliente = {
-            "id":                      str(first["id"]),
-            "tipo_identificacion_sri": first["tipo_identificacion_sri"],
-            "identificacion":          first["identificacion"],
-            "razon_social":            first["razon_social"],
-            "direccion":               first["direccion"],
-            "email":                   first["email"],
-            "telefono":                first["telefono"],
+            "id":                      str(row_cliente["id"]),
+            "tipo_identificacion_sri": row_cliente["tipo_identificacion_sri"],
+            "identificacion":          row_cliente["identificacion"],
+            "razon_social":            row_cliente["razon_social"],
+            "direccion":               row_cliente["direccion"],
+            "email":                   row_cliente["email"],
+            "telefono":                row_cliente["telefono"],
         }
 
-        lista_facturas  = []
-        total_facturado = 0.0
+        resumen = {
+            "total_documentos": int(row_cliente["total_documentos"]),
+            "suma_facturada":   round(float(row_cliente["suma_facturada"]), 2),
+        }
 
-        for f in rows:
-            if f["factura_id"] is None:
-                continue
-            monto = float(f["importe_total"]) if f["importe_total"] else 0.0
+        # ── Query 2: últimas N facturas ──────────────────────────────────────
+        res_facturas = await db.execute(text("""
+            SELECT id, numero_doc, importe_total, fecha_emision, estado_sri, created_at
+            FROM documentos_emitidos
+            WHERE cliente_id = :cid
+              AND emisor_id  = :eid
+              AND tipo_doc   = 'FAC'
+              AND es_sandbox = false
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), {"cid": cliente_id, "eid": emisor_id, "lim": facturas_limit})
+
+        lista_facturas = []
+        last_created = None
+        for f in res_facturas.mappings().fetchall():
             lista_facturas.append({
-                "id":            str(f["factura_id"]),
+                "id":            str(f["id"]),
                 "numero_doc":    f["numero_doc"],
-                "importe_total": monto,
+                "importe_total": float(f["importe_total"]) if f["importe_total"] else 0.0,
                 "fecha_emision": f["fecha_emision"].strftime('%Y-%m-%d') if f["fecha_emision"] else None,
                 "estado_sri":    f["estado_sri"],
+                "created_at":    f["created_at"].isoformat() if f["created_at"] else None,
             })
-            if f["estado_sri"] == "AUTORIZADO":
-                total_facturado += monto
+            last_created = f["created_at"]
+
+        hay_mas = resumen["total_documentos"] > len(lista_facturas)
 
         result = {
             "ok": True,
             "cliente": cliente,
-            "resumen": {
-                "total_documentos": len(lista_facturas),
-                "suma_facturada":   round(total_facturado, 2),
-            },
+            "resumen": resumen,
             "facturas": lista_facturas,
+            "facturas_limit": facturas_limit,
+            "hay_mas": hay_mas,
+            # Cursor para la siguiente página (el created_at de la última factura)
+            "next_cursor": last_created.isoformat() if hay_mas and last_created else None,
         }
 
         await cache_set(cache_key, result, TTL.CLIENTE_DETALLE)
@@ -375,7 +405,74 @@ async def consultar_detalle_cliente_core(emisor_id: int, cliente_id: str, db: As
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL CONSULTAR HISTORIAL.")
-    
+
+
+async def consultar_facturas_cliente_core(
+    emisor_id: int,
+    cliente_id: str,
+    db: AsyncSession,
+    cursor: str | None = None,
+    limit: int = DEFAULT_FACTURAS_LIMIT,
+):
+    """Página siguiente de facturas de un cliente, usando cursor (created_at)."""
+    try:
+        # Verificar que el cliente pertenece al emisor
+        res_check = await db.execute(
+            text("SELECT id FROM clientes_emisor WHERE id = :cid AND emisor_id = :eid"),
+            {"cid": cliente_id, "eid": emisor_id}
+        )
+        if not res_check.fetchone():
+            raise HTTPException(status_code=404, detail="EL CLIENTE NO EXISTE.")
+
+        params: dict = {"cid": cliente_id, "eid": emisor_id, "lim": limit}
+        cursor_filter = ""
+        if cursor:
+            from datetime import datetime as _dt
+            cursor_filter = "AND created_at < :cursor"
+            params["cursor"] = _dt.fromisoformat(cursor)
+
+        res = await db.execute(text(f"""
+            SELECT id, numero_doc, importe_total, fecha_emision, estado_sri, created_at
+            FROM documentos_emitidos
+            WHERE cliente_id = :cid
+              AND emisor_id  = :eid
+              AND tipo_doc   = 'FAC'
+              AND es_sandbox = false
+              {cursor_filter}
+            ORDER BY created_at DESC
+            LIMIT :lim
+        """), params)
+
+        rows = res.mappings().fetchall()
+        lista = []
+        last_created = None
+        for f in rows:
+            lista.append({
+                "id":            str(f["id"]),
+                "numero_doc":    f["numero_doc"],
+                "importe_total": float(f["importe_total"]) if f["importe_total"] else 0.0,
+                "fecha_emision": f["fecha_emision"].strftime('%Y-%m-%d') if f["fecha_emision"] else None,
+                "estado_sri":    f["estado_sri"],
+                "created_at":    f["created_at"].isoformat() if f["created_at"] else None,
+            })
+            last_created = f["created_at"]
+
+        # Si devolvimos menos del limit, ya no hay más
+        hay_mas = len(lista) == limit
+
+        return {
+            "ok": True,
+            "facturas": lista,
+            "hay_mas": hay_mas,
+            "next_cursor": last_created.isoformat() if hay_mas and last_created else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail="ERROR AL CONSULTAR FACTURAS.")
+
 
 async def verificar_cliente_existente_flexible(emisor_id: int, busqueda: str, db: AsyncSession):
     try:

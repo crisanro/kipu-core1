@@ -14,23 +14,23 @@
 import re
 import json
 import base64
+import asyncio
 import httpx
-from typing import Optional
-from fastapi import APIRouter, Depends, Request
+from typing import Optional, Any, List
+from fastapi import APIRouter, Depends, Request, Header, HTTPException
 from fastapi.responses import Response, JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.database import get_db
-from app.core.security import verify_public_origin
+from app.core.security import verify_public_origin, verify_api_key
 from app.core.cache import get_redis
 from app.core.config import settings
+from app.core.http_clients import pdf_client, turnstile_client
 from app.services.storage_service import download_file
 
 router = APIRouter()
-
-NODE_PDF_URL = f"{settings.NODE_SIGNER_URL}/api/pdf"
 
 REGEX_CLAVE = re.compile(r"^\d{49}$")
 
@@ -62,6 +62,28 @@ class ConsultarRequest(BaseModel):
     hpValue:      Optional[str] = None
 
 
+class ErrorPublicResponse(BaseModel):
+    """Respuesta de error genérica."""
+    error: str = Field(..., description="Descripción del error")
+
+
+class EstadoDocumentoResponse(BaseModel):
+    """Estado de un comprobante consultado por clave de acceso."""
+    ok:                  bool          = Field(True, description="Siempre true si se encontró el documento")
+    clave_acceso:        str           = Field(..., description="Clave de acceso de 49 dígitos", examples=["2210202601091234567800110010010000001231234567816"])
+    tipo_doc:            str           = Field(..., description="Código interno: FAC, LIQ, NCR, NDB, RET", examples=["FAC"])
+    tipo_doc_descripcion: str          = Field(..., description="Nombre legible del tipo de documento", examples=["Factura"])
+    numero_doc:          Optional[str] = Field(None, description="Número del comprobante (est-pto-sec)", examples=["001-001-000000123"])
+    estado_sri:          str           = Field(..., description="Estado SRI: FIRMADO, RECIBIDA, EN_REVISION, AUTORIZADO, DEVUELTA, RECHAZADO, ANULADO", examples=["AUTORIZADO"])
+    fecha_emision:       str           = Field(..., description="Fecha de emisión (YYYY-MM-DD)", examples=["2026-10-22"])
+    fecha_autorizacion:  Optional[str] = Field(None, description="Fecha/hora de autorización SRI (dd/mm/yyyy HH:MM:SS)", examples=["22/10/2026 14:35:20"])
+    importe_total:       float         = Field(..., description="Importe total del comprobante", examples=[115.00])
+    comprador_nombre:    Optional[str] = Field(None, description="Razón social del comprador/proveedor/sujeto retenido", examples=["Juan Pérez"])
+    comprador_id:        Optional[str] = Field(None, description="Identificación del comprador", examples=["1722334455"])
+    mensajes_sri:        Optional[Any] = Field(None, description="Mensajes del SRI (solo si fue devuelta/rechazada)")
+    links:               Optional[dict] = Field(None, description="Links de descarga (PDF y XML) — solo si está AUTORIZADO o en proceso")
+
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -89,10 +111,141 @@ def _respuesta_no_descargable(estado_sri: str, tipo: str = "documento") -> JSONR
 
 
 # =============================================================================
+# GET /estado/{clave_acceso}  — Consulta autenticada por API Key
+# =============================================================================
+
+@router.get(
+    "/estado/{clave_acceso}",
+    summary="Consultar estado de un comprobante por clave de acceso",
+    tags=["🔍 Consultas", "public_export"],
+    description=(
+        "Devuelve el estado actual de un comprobante emitido, identificado por su clave de acceso "
+        "de 49 dígitos.\n\n"
+        "**Requiere autenticación** con `X-Api-Key`. Solo devuelve documentos que pertenecen "
+        "al emisor autenticado — si la clave de acceso corresponde a otro emisor, responde 404.\n\n"
+        "**Estados posibles:**\n"
+        "- `FIRMADO` — XML firmado, pendiente de envío al SRI.\n"
+        "- `RECIBIDA` — El SRI recibió el comprobante, pendiente de autorización.\n"
+        "- `EN_REVISION` — El SRI está procesando el comprobante.\n"
+        "- `AUTORIZADO` — Comprobante válido y autorizado por el SRI.\n"
+        "- `DEVUELTA` — El SRI rechazó el envío (error de estructura o validación).\n"
+        "- `RECHAZADO` — El SRI no autorizó el comprobante.\n"
+        "- `ANULADO` — Comprobante anulado manualmente.\n\n"
+        "**Links de descarga:** se incluyen `pdf` y `xml` cuando el documento está AUTORIZADO "
+        "o en proceso de autorización."
+    ),
+    response_model=EstadoDocumentoResponse,
+    responses={
+        400: {"model": ErrorPublicResponse, "description": "Clave de acceso inválida (no son 49 dígitos)."},
+        401: {"model": ErrorPublicResponse, "description": "API Key inválida o no proporcionada."},
+        404: {"model": ErrorPublicResponse, "description": "Documento no encontrado o no pertenece al emisor autenticado."},
+        500: {"model": ErrorPublicResponse, "description": "Error interno del servidor."},
+    },
+)
+async def get_estado_documento(
+    clave_acceso: str,
+    auth:         dict         = Depends(verify_api_key),
+    db:           AsyncSession = Depends(get_db),
+):
+    if not REGEX_CLAVE.match(clave_acceso):
+        raise HTTPException(status_code=400, detail="Clave de acceso inválida. Debe ser exactamente 49 dígitos numéricos.")
+
+    emisor_id = auth["emisor_id"]
+
+    try:
+        res = await db.execute(text("""
+            SELECT
+                d.clave_acceso, d.tipo_doc, d.cod_doc, d.numero_doc,
+                d.estado_sri, d.fecha_emision, d.fecha_autorizacion,
+                d.importe_total, d.mensajes_sri,
+                COALESCE(
+                    d.datos->'infoFactura'->>'razonSocialComprador',
+                    d.datos->'infoLiquidacionCompra'->>'razonSocialProveedor',
+                    d.datos->'infoNotaCredito'->>'razonSocialComprador',
+                    d.datos->'infoNotaDebito'->>'razonSocialComprador',
+                    d.datos->'infoCompRetencion'->>'razonSocialSujetoRetenido'
+                ) AS comprador_nombre,
+                COALESCE(
+                    d.datos->'infoFactura'->>'identificacionComprador',
+                    d.datos->'infoLiquidacionCompra'->>'identificacionProveedor',
+                    d.datos->'infoNotaCredito'->>'identificacionComprador',
+                    d.datos->'infoNotaDebito'->>'identificacionComprador',
+                    d.datos->'infoCompRetencion'->>'identificacionSujetoRetenido'
+                ) AS comprador_id
+            FROM documentos_emitidos d
+            WHERE d.clave_acceso = :clave
+              AND d.emisor_id = :emisor_id
+        """), {"clave": clave_acceso, "emisor_id": emisor_id})
+
+        doc = res.fetchone()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Documento no encontrado o no pertenece al emisor autenticado.")
+
+        tipo_label = LABELS_TIPO_DOC.get(doc.cod_doc, "Comprobante")
+        base_url   = settings.BACKEND_URL
+
+        # Links de descarga solo si tiene PDF disponible
+        links = None
+        if doc.estado_sri in _ESTADOS_CON_PDF:
+            links = {
+                "pdf": f"{base_url}/api/v1/public/pdf/{clave_acceso}",
+                "xml": f"{base_url}/api/v1/public/xml/{clave_acceso}" if doc.estado_sri == "AUTORIZADO" else None,
+            }
+
+        fecha_auth = None
+        if doc.fecha_autorizacion:
+            fecha_auth = doc.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S")
+
+        return {
+            "ok":                  True,
+            "clave_acceso":        doc.clave_acceso,
+            "tipo_doc":            doc.tipo_doc,
+            "tipo_doc_descripcion": tipo_label,
+            "numero_doc":          doc.numero_doc,
+            "estado_sri":          doc.estado_sri,
+            "fecha_emision":       str(doc.fecha_emision),
+            "fecha_autorizacion":  fecha_auth,
+            "importe_total":       float(doc.importe_total),
+            "comprador_nombre":    doc.comprador_nombre,
+            "comprador_id":        doc.comprador_id,
+            "mensajes_sri":        doc.mensajes_sri if doc.estado_sri in ("DEVUELTA", "RECHAZADO") else None,
+            "links":               links,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Estado] ❌ {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor.")
+
+
+# =============================================================================
 # GET /pdf/{clave_acceso}
 # =============================================================================
 
-@router.get("/pdf/{clave_acceso}", summary="Descargar RIDE (PDF)")
+@router.get(
+    "/pdf/{clave_acceso}",
+    summary="Descargar RIDE (PDF)",
+    tags=["📥 Descargas", "public_export"],
+    description=(
+        "Descarga el RIDE (Representación Impresa del Documento Electrónico) en formato PDF.\n\n"
+        "**No requiere autenticación** — cualquiera con la clave de acceso puede descargar.\n\n"
+        "**Comportamiento según estado:**\n"
+        "- `AUTORIZADO` → RIDE oficial con fecha y número de autorización SRI. Cache: 2 horas.\n"
+        "- `FIRMADO` / `RECIBIDA` / `EN_REVISION` → PDF provisional con marca \"PENDIENTE DE AUTORIZACIÓN\". Cache: 30 seg.\n"
+        "- `DEVUELTA` / `RECHAZADO` → Error 422.\n"
+        "- `ANULADO` → Error 410.\n\n"
+        "**Parámetro `formato`:** `a4` (default) o `ticket` para impresión térmica."
+    ),
+    responses={
+        200: {"content": {"application/pdf": {}}, "description": "PDF del RIDE generado correctamente."},
+        400: {"model": ErrorPublicResponse, "description": "Clave de acceso inválida."},
+        404: {"model": ErrorPublicResponse, "description": "Documento no encontrado o XML no disponible."},
+        410: {"model": ErrorPublicResponse, "description": "Comprobante anulado."},
+        422: {"model": ErrorPublicResponse, "description": "Comprobante rechazado/devuelto por el SRI."},
+        500: {"model": ErrorPublicResponse, "description": "Error generando el PDF."},
+    },
+)
 async def get_pdf(
     clave_acceso: str,
     formato:      str          = "a4",
@@ -142,7 +295,8 @@ async def get_pdf(
 
         es_autorizado = doc.estado_sri == "AUTORIZADO"
 
-        xml_bytes  = download_file(doc.xml_path)
+        # asyncio.to_thread() evita bloquear el event loop en I/O síncrono
+        xml_bytes  = await asyncio.to_thread(download_file, doc.xml_path)
         xml_str    = xml_bytes.decode("utf-8")
 
         # AUTORIZADO → fecha real de autorización
@@ -151,14 +305,14 @@ async def get_pdf(
         if es_autorizado and doc.fecha_autorizacion:
             fecha_auth = doc.fecha_autorizacion.strftime("%d/%m/%Y %H:%M:%S")
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res_pdf = await client.post(NODE_PDF_URL, json={
-                "xmlAutorizado":     xml_str,
-                "emisor":            {"contribuyente_especial": doc.contribuyente_especial or ""},
-                "fechaAutorizacion": fecha_auth,
-                "formato":           formato,
-                "provisional":       not es_autorizado,
-            })
+        # Cliente HTTP compartido — reutiliza conexiones TCP/TLS
+        res_pdf = await pdf_client.post("/api/pdf", json={
+            "xmlAutorizado":     xml_str,
+            "emisor":            {"contribuyente_especial": doc.contribuyente_especial or ""},
+            "fechaAutorizacion": fecha_auth,
+            "formato":           formato,
+            "provisional":       not es_autorizado,
+        })
 
         if res_pdf.status_code != 200 or not res_pdf.json().get("ok"):
             return JSONResponse(status_code=500, content={"error": "Error generando PDF."})
@@ -197,7 +351,28 @@ async def get_pdf(
 # GET /xml/{clave_acceso}
 # =============================================================================
 
-@router.get("/xml/{clave_acceso}", summary="Descargar XML autorizado")
+@router.get(
+    "/xml/{clave_acceso}",
+    summary="Descargar XML autorizado",
+    tags=["📥 Descargas", "public_export"],
+    description=(
+        "Descarga el XML autorizado del comprobante electrónico.\n\n"
+        "**No requiere autenticación** — cualquiera con la clave de acceso puede descargar.\n\n"
+        "**Solo disponible en estado `AUTORIZADO`** — el XML firmado sin autorización del SRI "
+        "no tiene validez tributaria.\n\n"
+        "- `FIRMADO` / `RECIBIDA` / `EN_REVISION` → 202 Accepted (en proceso, reintenta luego).\n"
+        "- `DEVUELTA` / `RECHAZADO` / `ANULADO` → Error con detalle del estado."
+    ),
+    responses={
+        200: {"content": {"application/xml": {}}, "description": "XML autorizado del comprobante."},
+        202: {"model": ErrorPublicResponse, "description": "Comprobante en proceso de autorización. Reintenta en unos minutos."},
+        400: {"model": ErrorPublicResponse, "description": "Clave de acceso inválida."},
+        404: {"model": ErrorPublicResponse, "description": "Documento no encontrado."},
+        410: {"model": ErrorPublicResponse, "description": "Comprobante anulado."},
+        422: {"model": ErrorPublicResponse, "description": "Comprobante rechazado/devuelto por el SRI."},
+        500: {"model": ErrorPublicResponse, "description": "Error interno."},
+    },
+)
 async def get_xml(
     clave_acceso: str,
     db:           AsyncSession = Depends(get_db),
@@ -247,7 +422,7 @@ async def get_xml(
         if not doc.xml_path:
             return JSONResponse(status_code=404, content={"error": "XML autorizado no disponible."})
 
-        file_bytes = download_file(doc.xml_path)
+        file_bytes = await asyncio.to_thread(download_file, doc.xml_path)
 
         try:
             await redis.setex(cache_key, 7200, file_bytes)
@@ -270,10 +445,31 @@ async def get_xml(
 
 
 # =============================================================================
-# POST /consultar/{clave_acceso}
+# POST /consultar/{clave_acceso}  — Consulta pública con captcha
 # =============================================================================
 
-@router.post("/consultar/{clave_acceso}", summary="Consultar comprobante por clave de acceso")
+@router.post(
+    "/consultar/{clave_acceso}",
+    summary="Consultar comprobante público (con captcha)",
+    tags=["🔍 Consultas", "public_export"],
+    description=(
+        "Consulta de un comprobante para el **comprador/receptor**.\n\n"
+        "⚠️ **Este endpoint NO es de uso abierto.** Funciona exclusivamente desde la "
+        "página de consulta de Kipu (`consulta.kipu.ec`), ya que requiere un token válido "
+        "de **Cloudflare Turnstile** que solo se genera en esa página.\n\n"
+        "No requiere API Key, pero las peticiones sin un `captchaToken` válido "
+        "serán rechazadas con `403`.\n\n"
+        "Devuelve los datos completos del comprobante: emisor, comprador, totales, impuestos "
+        "y links de descarga (PDF/XML) si está AUTORIZADO."
+    ),
+    responses={
+        200: {"description": "Datos del comprobante (puede ser success=true o false según el estado)."},
+        400: {"model": ErrorPublicResponse, "description": "Clave de acceso inválida o bot detectado."},
+        403: {"model": ErrorPublicResponse, "description": "Verificación de captcha fallida."},
+        404: {"model": ErrorPublicResponse, "description": "Comprobante no encontrado."},
+        500: {"model": ErrorPublicResponse, "description": "Error interno."},
+    },
+)
 async def consultar_comprobante(
     clave_acceso: str,
     request:      Request,
@@ -286,22 +482,24 @@ async def consultar_comprobante(
     if not REGEX_CLAVE.match(clave_acceso):
         return JSONResponse(status_code=400, content={"error": "Clave de acceso inválida."})
 
-    # Verificar Turnstile
+    # Verificar Turnstile — cliente compartido con timeout de 10s
     try:
-        async with httpx.AsyncClient() as client:
-            cf_resp = await client.post(
-                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-                data={
-                    "secret":   settings.TURNSTILE_SECRET_KEY,
-                    "response": body.captchaToken,
-                    "remoteip": request.client.host,
-                }
-            )
-            if not cf_resp.json().get("success"):
-                return JSONResponse(status_code=403, content={
-                    "success":         False,
-                    "mensaje_usuario": "La verificación de seguridad falló. Intenta de nuevo.",
-                })
+        cf_resp = await turnstile_client.post(
+            "/turnstile/v0/siteverify",
+            data={
+                "secret":   settings.TURNSTILE_SECRET_KEY,
+                "response": body.captchaToken,
+                "remoteip": request.client.host,
+            }
+        )
+        if not cf_resp.json().get("success"):
+            return JSONResponse(status_code=403, content={
+                "success":         False,
+                "mensaje_usuario": "La verificación de seguridad falló. Intenta de nuevo.",
+            })
+    except httpx.TimeoutException:
+        print("[Turnstile] ⚠️ Timeout verificando captcha")
+        return JSONResponse(status_code=500, content={"error": "Timeout en validación de seguridad."})
     except httpx.HTTPError as e:
         print(f"[Turnstile] ⚠️ Error: {e}")
         return JSONResponse(status_code=500, content={"error": "Error de validación externa."})

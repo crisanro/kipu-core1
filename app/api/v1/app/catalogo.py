@@ -9,22 +9,26 @@ router = APIRouter()
 
 @router.get("/ads", summary="Obtener un anuncio balanceado")
 async def get_ad(
-    auth_data: dict = Depends(verify_firebase_token),  # ← agregar
+    auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db)
 ):
+    # Un solo query: selecciona el ad con menos views y le suma 1 atómicamente
     res = await db.execute(text("""
-        SELECT id, titulo, descripcion, imagen_url, cta_url, hex_color, views_count, producto
-        FROM app_ads WHERE activo = true ORDER BY views_count ASC LIMIT 1
+        UPDATE app_ads SET views_count = views_count + 1
+        WHERE id = (
+            SELECT id FROM app_ads WHERE activo = true
+            ORDER BY views_count ASC LIMIT 1
+        )
+        RETURNING id, titulo, descripcion, imagen_url, cta_url, hex_color, producto
     """))
     ad = res.fetchone()
+    await db.commit()
     if not ad:
         raise HTTPException(status_code=404, detail="NO HAY ANUNCIOS DISPONIBLES.")
-    await db.execute(text("UPDATE app_ads SET views_count = views_count + 1 WHERE id = :id"), {"id": ad.id})
-    await db.commit()
     return {
         "id": ad.id, "titulo": ad.titulo, "descripcion": ad.descripcion,
-        "imagen_url": ad.imagen_url, "hex_color": ad.hex_color,"producto": ad.producto,
-        "click_url": f"/api/v1/app/catalogo/ads/{ad.id}/click"  # ← URL correcta
+        "imagen_url": ad.imagen_url, "hex_color": ad.hex_color, "producto": ad.producto,
+        "click_url": f"/api/v1/app/catalogo/ads/{ad.id}/click"
     }
 
 @router.post("/ads/{ad_id}/click", summary="Registrar clic en anuncio")

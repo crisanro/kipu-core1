@@ -2,6 +2,7 @@
 
 import json
 import math
+import asyncio
 from typing import Optional
 from datetime import date, timedelta, datetime
 from decimal import Decimal
@@ -152,7 +153,11 @@ async def registrar_documento_recibido(
     xml_path = None
     try:
         xml_path = f"{emisor.ruc}/recibidas/{data.clave_acceso}.json"
-        upload_file(xml_path, json.dumps(data.datos, ensure_ascii=False).encode("utf-8"), "application/json")
+        await asyncio.to_thread(
+            upload_file, xml_path,
+            json.dumps(data.datos, ensure_ascii=False).encode("utf-8"),
+            "application/json",
+        )
     except Exception as e:
         print(f"⚠️ Error guardando en R2: {e}")
 
@@ -294,7 +299,7 @@ async def registrar_documento_fisico(
         imagen_path = f"{emisor.ruc}/recibidas/fisicos/{clave_sintetica}{ext}"
         try:
             content_type = "application/pdf" if ext == ".pdf" else f"image/{ext.lstrip('.')}"
-            upload_file(imagen_path, img_bytes, content_type)
+            await asyncio.to_thread(upload_file, imagen_path, img_bytes, content_type)
         except Exception as e:
             print(f"⚠️️ Error subiendo imagen: {e}")
             imagen_path = None
@@ -437,7 +442,7 @@ async def registrar_desde_xml(
     xml_path = None
     try:
         xml_path = f"{emisor.ruc}/recibidas/{clave}.xml"
-        upload_file(xml_path, xml_bytes, "text/xml")
+        await asyncio.to_thread(upload_file, xml_path, xml_bytes, "text/xml")
     except Exception as e:
         print(f"⚠️ Error guardando XML en R2: {e}")
 
@@ -531,7 +536,7 @@ async def registrar_desde_xml(
 
 
 # =============================================================================
-# GET / — Historial Paginado y Búsqueda (hasta 365 días)
+# GET / — Historial — UNA sola query con COUNT(*) OVER() y resumen en window
 # =============================================================================
 @router.get("", summary="Historial de documentos recibidos con paginación")
 async def historial_recibidos(
@@ -559,7 +564,6 @@ async def historial_recibidos(
     estado_clean = (estado_pago or "ALL").upper()
     q_clean      = (q or "").strip().lower()
 
-    # 1. Intentar leer de caché
     cache_key = CK.fmt(
         CK.DOCS_RECIBIDOS,
         eid=emisor_id, fi=str(fi), ff=str(ff),
@@ -570,7 +574,7 @@ async def historial_recibidos(
     if cached is not None:
         return cached
 
-    # 2. Si no está en caché, consultar a PostgreSQL
+    # ── Filtros dinámicos ─────────────────────────────────────────────────
     filtros = ["emisor_id = :eid", "fecha_emision BETWEEN :fi AND :ff"]
     params  = {"eid": emisor_id, "fi": fi, "ff": ff}
 
@@ -585,55 +589,55 @@ async def historial_recibidos(
         params["q"] = f"%{q}%"
 
     where_clause = " AND ".join(filtros)
-
-    res_count = await db.execute(text(f"SELECT COUNT(*) FROM documentos_recibidos WHERE {where_clause}"), params)
-    total_items = res_count.scalar() or 0
-
-    res_resumen = await db.execute(text(f"""
-        SELECT
-            COUNT(*)                                                                             AS total,
-            COALESCE(SUM(importe_total), 0)                                                      AS importe_total,
-            COALESCE(SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END), 0) AS total_deducible,
-            COALESCE(SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END), 0) AS iva_credito_tributario
-        FROM documentos_recibidos WHERE {where_clause}
-    """), params)
-    resumen_row = res_resumen.fetchone()
-
     offset = (page - 1) * limit
-    params["limit"]  = limit
-    params["offset"] = offset
+    params["lim"] = limit
+    params["off"] = offset
 
+    # ── UNA sola query: datos + count + resumen ───────────────────────────
     res = await db.execute(text(f"""
         SELECT
             id, ruc_proveedor, razon_social_proveedor, tipo_doc,
             numero_doc, fecha_emision,
             subtotal_base, valor_iva_total, importe_total,
             deducible_renta, credito_tributario_iva,
-            estado_pago, notas, fuente
+            estado_pago, notas, fuente,
+            COUNT(*)       OVER() AS total_count,
+            SUM(importe_total)                                                       OVER() AS sum_importe,
+            SUM(CASE WHEN deducible_renta        THEN subtotal_base   ELSE 0 END)    OVER() AS sum_deducible,
+            SUM(CASE WHEN credito_tributario_iva THEN valor_iva_total ELSE 0 END)    OVER() AS sum_iva_credito
         FROM documentos_recibidos
         WHERE {where_clause}
         ORDER BY fecha_emision DESC, created_at DESC
-        LIMIT :limit OFFSET :offset
+        LIMIT :lim OFFSET :off
     """), params)
     rows = res.fetchall()
+
+    if rows:
+        total_items        = rows[0].total_count
+        sum_importe        = float(rows[0].sum_importe or 0)
+        sum_deducible      = float(rows[0].sum_deducible or 0)
+        sum_iva_credito    = float(rows[0].sum_iva_credito or 0)
+    else:
+        total_items = 0
+        sum_importe = sum_deducible = sum_iva_credito = 0.0
 
     total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
 
     payload = {
         "ok": True,
         "resumen": {
-            "total_documentos":       int(resumen_row.total or 0),
-            "importe_total":          float(resumen_row.importe_total or 0),
-            "total_deducible":        float(resumen_row.total_deducible or 0),
-            "iva_credito_tributario": float(resumen_row.iva_credito_tributario or 0),
+            "total_documentos":       total_items,
+            "importe_total":          sum_importe,
+            "total_deducible":        sum_deducible,
+            "iva_credito_tributario": sum_iva_credito,
         },
         "pagination": {
-            "page": page,
-            "limit": limit,
+            "page":        page,
+            "limit":       limit,
             "total_items": total_items,
             "total_pages": total_pages,
-            "has_next": page < total_pages,
-            "has_prev": page > 1,
+            "has_next":    page < total_pages,
+            "has_prev":    page > 1,
         },
         "data": [
             {
@@ -657,14 +661,12 @@ async def historial_recibidos(
         "periodo": {"desde": str(fi), "hasta": str(ff)},
     }
 
-    # 3. Guardar respuesta en caché por 3 minutos
     await cache_set(cache_key, payload, ttl=TTL.DOCUMENTOS_RECIBIDOS)
-
     return payload
 
 
 # =============================================================================
-# GET /{id} — Detalle
+# GET /{id} — Detalle (columnas explícitas, sin SELECT *)
 # =============================================================================
 @router.get("/{doc_id}", summary="Detalle de documento recibido")
 async def detalle_recibido(
@@ -676,7 +678,15 @@ async def detalle_recibido(
     verificar_permiso(auth_data, "documentos_recibidos")
 
     res = await db.execute(text("""
-        SELECT d.*,
+        SELECT
+            d.id, d.ruc_proveedor, d.razon_social_proveedor,
+            d.tipo_doc, d.cod_doc, d.clave_acceso, d.numero_doc,
+            d.fecha_emision, d.fecha_autorizacion,
+            d.subtotal_base, d.valor_iva_total, d.importe_total,
+            d.items_detalle, d.deducible_renta, d.credito_tributario_iva,
+            d.notas, d.estado_pago, d.forma_pago,
+            d.numero_comprobante_pago, d.fecha_pago,
+            d.datos, d.xml_path, d.fuente, d.created_at,
             (
                 SELECT json_build_object(
                     'id', de.id, 'numero_doc', de.numero_doc,

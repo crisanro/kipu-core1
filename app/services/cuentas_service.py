@@ -5,11 +5,13 @@ from fastapi import HTTPException
 from app.core.cache import cache_get, cache_set, cache_delete, CK, TTL
 
 # ── Helpers cache ──────────────────────────────────────────────────────────────
-async def _invalidar_cuentas(emisor_id: int, cliente_id: str = None):
+async def _invalidar_cuentas(emisor_id: int, cliente_id: str = None, cuenta_id: str = None):
     await cache_delete(CK.fmt(CK.CUENTAS_LISTA, eid=emisor_id))
     if cliente_id:
         await cache_delete(CK.fmt(CK.CUENTAS_CLIENTE, eid=emisor_id, cid=cliente_id))
         await cache_delete(CK.fmt(CK.CLIENTE_DETALLE, eid=emisor_id, cid=cliente_id))
+    if cuenta_id:
+        await cache_delete(f"cuentas:detalle:{emisor_id}:{cuenta_id}")
 
 # ── 1. CREAR CUENTA ────────────────────────────────────────────────────────────
 async def crear_cuenta_core(emisor_id: int, datos: dict, db: AsyncSession):
@@ -97,7 +99,7 @@ async def registrar_abono_core(emisor_id: int, cuenta_id: str, datos: dict, db: 
             "notas":     datos.get("notas", "").strip() or None,
         })
         await db.commit()
-        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]))
+        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]), cuenta_id)
         return {"ok": True, "mensaje": "ABONO REGISTRADO."}
     except HTTPException:
         await db.rollback()
@@ -164,7 +166,7 @@ async def registrar_ajuste_core(emisor_id: int, cuenta_id: str, datos: dict, db:
         })
 
         await db.commit()
-        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]))
+        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]), cuenta_id)
         return {
             "ok":          True,
             "mensaje":     "AJUSTE REGISTRADO.",
@@ -200,7 +202,7 @@ async def anular_cuenta_core(emisor_id: int, cuenta_id: str, db: AsyncSession):
             WHERE id = :cid AND emisor_id = :eid
         """), {"cid": cuenta_id, "eid": emisor_id})
         await db.commit()
-        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]))
+        await _invalidar_cuentas(emisor_id, str(cuenta["cliente_id"]), cuenta_id)
         return {"ok": True, "mensaje": "CUENTA ANULADA."}
     except HTTPException:
         await db.rollback()
@@ -298,6 +300,11 @@ async def listar_cuentas_cliente_core(emisor_id: int, cliente_id: str, db: Async
 
 # ── 7. DETALLE DE UNA CUENTA (con movimientos) ─────────────────────────────────
 async def detalle_cuenta_core(emisor_id: int, cuenta_id: str, db: AsyncSession):
+    # Cache 30s
+    cache_key = f"cuentas:detalle:{emisor_id}:{cuenta_id}"
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
     try:
         res_cuenta = await db.execute(text("""
             SELECT
@@ -339,13 +346,15 @@ async def detalle_cuenta_core(emisor_id: int, cuenta_id: str, db: AsyncSession):
         abonos  = [m for m in movimientos if m["tipo"] == "ABONO"]
         ajustes = [m for m in movimientos if m["tipo"] == "AJUSTE"]
 
-        return {
+        result = {
             "ok":          True,
             "cuenta":      _fmt_cuenta(cuenta),
-            "movimientos": movimientos,   # lista unificada para el historial
-            "abonos":      abonos,        # compat
+            "movimientos": movimientos,
+            "abonos":      abonos,
             "ajustes":     ajustes,
         }
+        await cache_set(cache_key, result, 30)
+        return result
     except HTTPException:
         raise
     except Exception as e:

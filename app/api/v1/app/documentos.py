@@ -1,5 +1,6 @@
 # app/api/v1/app/documentos.py
 import math
+import asyncio
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Header, Request
 from sqlalchemy import text
@@ -269,7 +270,7 @@ async def historial_documentos(
     if cached is not None:
         return cached
 
-    # 2. Consultar base de datos
+    # 2. Consultar base de datos — UNA SOLA QUERY con COUNT(*) OVER()
     filtros = "WHERE emisor_id = :eid AND es_sandbox = :sandbox"
     params  = {"eid": emisor_id, "sandbox": sandbox}
 
@@ -301,11 +302,6 @@ async def historial_documentos(
         )"""
         params["q"] = f"%{q}%"
 
-    res_total = await db.execute(text(f"""
-        SELECT COUNT(*) FROM documentos_emitidos {filtros}
-    """), params)
-    total_items = res_total.scalar() or 0
-
     offset = (page - 1) * limit
     params["limit"]  = limit
     params["offset"] = offset
@@ -332,13 +328,16 @@ async def historial_documentos(
                 datos->'infoNotaDebito'->>'identificacionComprador',
                 datos->'infoCompRetencion'->>'identificacionSujetoRetenido',
                 datos->'infoLiquidacionCompra'->>'identificacionProveedor'
-            ) AS id_fac
+            ) AS id_fac,
+            COUNT(*) OVER() AS total_count
         FROM documentos_emitidos
         {filtros}
         ORDER BY fecha_emision DESC, created_at DESC
         LIMIT :limit OFFSET :offset
     """), params)
     rows = res.fetchall()
+
+    total_items = rows[0].total_count if rows else 0
 
     data = []
     for r in rows:
@@ -411,103 +410,112 @@ async def resumen_documentos(
     if cached is not None:
         return cached
 
-    # 2. Consultar base de datos
-    res_iva = await db.execute(text("""
-        SELECT
-            d.tipo_doc,
-            COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
-            SUM(COALESCE((imp->>'baseImponible')::numeric, 0))      AS subtotal,
-            SUM(COALESCE((imp->>'valor')::numeric, 0))              AS iva,
-            COUNT(DISTINCT d.id)                                    AS num_docs,
-            SUM(d.importe_total)                                    AS total
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array' 
-                          AND jsonb_array_length(d.datos->'resumenImpuestos') > 0
-                     THEN d.datos->'resumenImpuestos'
+    # 2. Consultar base de datos — 3 queries EN PARALELO con asyncio.gather
+    query_params = {"eid": emisor_id, "fi": fi, "ff": ff}
 
-                     WHEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
-                     THEN CASE 
-                         WHEN jsonb_typeof(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto') = 'array'
-                         THEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto'
-                         ELSE jsonb_build_array(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto')
+    async def _query_iva():
+        return await db.execute(text("""
+            SELECT
+                d.tipo_doc,
+                COALESCE((imp->>'tarifa')::numeric, 0)                  AS tarifa,
+                SUM(COALESCE((imp->>'baseImponible')::numeric, 0))      AS subtotal,
+                SUM(COALESCE((imp->>'valor')::numeric, 0))              AS iva,
+                COUNT(DISTINCT d.id)                                    AS num_docs,
+                SUM(d.importe_total)                                    AS total
+            FROM documentos_emitidos d,
+                 jsonb_array_elements(
+                     CASE
+                         WHEN jsonb_typeof(d.datos->'resumenImpuestos') = 'array' 
+                              AND jsonb_array_length(d.datos->'resumenImpuestos') > 0
+                         THEN d.datos->'resumenImpuestos'
+
+                         WHEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                         THEN CASE 
+                             WHEN jsonb_typeof(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                             THEN d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto'
+                             ELSE jsonb_build_array(d.datos->'infoFactura'->'totalConImpuestos'->'totalImpuesto')
+                         END
+
+                         WHEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                         THEN CASE 
+                             WHEN jsonb_typeof(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                             THEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto'
+                             ELSE jsonb_build_array(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto')
+                         END
+
+                         WHEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
+                         THEN CASE 
+                             WHEN jsonb_typeof(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto') = 'array'
+                             THEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto'
+                             ELSE jsonb_build_array(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto')
+                         END
+
+                         WHEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto' IS NOT NULL
+                         THEN CASE 
+                             WHEN jsonb_typeof(d.datos->'infoNotaDebito'->'impuestos'->'impuesto') = 'array'
+                             THEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto'
+                             ELSE jsonb_build_array(d.datos->'infoNotaDebito'->'impuestos'->'impuesto')
+                         END
+
+                         ELSE '[]'::jsonb
                      END
+                 ) AS imp
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
+            GROUP BY d.tipo_doc, COALESCE((imp->>'tarifa')::numeric, 0)
+            ORDER BY d.tipo_doc, tarifa
+        """), query_params)
 
-                     WHEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
-                     THEN CASE 
-                         WHEN jsonb_typeof(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto') = 'array'
-                         THEN d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto'
-                         ELSE jsonb_build_array(d.datos->'infoLiquidacionCompra'->'totalConImpuestos'->'totalImpuesto')
+    async def _query_ret():
+        return await db.execute(text("""
+            SELECT
+                (imp->>'codigo')          AS codigo_impuesto,
+                (imp->>'codigoRetencion') AS codigo_retencion,
+                SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
+                SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)) AS valor_retenido,
+                COUNT(DISTINCT d.id)                                AS num_docs
+            FROM documentos_emitidos d,
+                 jsonb_array_elements(
+                     CASE
+                         WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL
+                         THEN CASE
+                             WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
+                             THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
+                             ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
+                         END
+                         WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
+                         THEN d.datos->'impuestos'->'impuesto'
+                         WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL
+                         THEN jsonb_build_array(d.datos->'impuestos'->'impuesto')
+                         ELSE '[]'::jsonb
                      END
+                 ) AS imp
+            WHERE d.emisor_id     = :eid
+              AND d.estado_sri    = 'AUTORIZADO'
+              AND d.fecha_emision BETWEEN :fi AND :ff
+              AND d.es_sandbox    = false
+              AND d.tipo_doc      = 'RET'
+            GROUP BY (imp->>'codigo'), (imp->>'codigoRetencion')
+            ORDER BY codigo_impuesto, codigo_retencion
+        """), query_params)
 
-                     WHEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto' IS NOT NULL
-                     THEN CASE 
-                         WHEN jsonb_typeof(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto') = 'array'
-                         THEN d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto'
-                         ELSE jsonb_build_array(d.datos->'infoNotaCredito'->'totalConImpuestos'->'totalImpuesto')
-                     END
+    async def _query_totales():
+        return await db.execute(text("""
+            SELECT tipo_doc, COUNT(*) AS num_docs, SUM(importe_total) AS total
+            FROM documentos_emitidos
+            WHERE emisor_id     = :eid
+              AND estado_sri    = 'AUTORIZADO'
+              AND fecha_emision BETWEEN :fi AND :ff
+              AND es_sandbox    = false
+            GROUP BY tipo_doc
+        """), query_params)
 
-                     WHEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto' IS NOT NULL
-                     THEN CASE 
-                         WHEN jsonb_typeof(d.datos->'infoNotaDebito'->'impuestos'->'impuesto') = 'array'
-                         THEN d.datos->'infoNotaDebito'->'impuestos'->'impuesto'
-                         ELSE jsonb_build_array(d.datos->'infoNotaDebito'->'impuestos'->'impuesto')
-                     END
-
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      IN ('FAC', 'LIQ', 'NCR', 'NDB')
-        GROUP BY d.tipo_doc, COALESCE((imp->>'tarifa')::numeric, 0)
-        ORDER BY d.tipo_doc, tarifa
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
-    res_ret = await db.execute(text("""
-        SELECT
-            (imp->>'codigo')          AS codigo_impuesto,
-            (imp->>'codigoRetencion') AS codigo_retencion,
-            SUM(COALESCE((imp->>'baseImponible')::numeric, 0)) AS base,
-            SUM(COALESCE((imp->>'valorRetenido')::numeric, 0)) AS valor_retenido,
-            COUNT(DISTINCT d.id)                                AS num_docs
-        FROM documentos_emitidos d,
-             jsonb_array_elements(
-                 CASE
-                     WHEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion' IS NOT NULL
-                     THEN CASE
-                         WHEN jsonb_typeof(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion') = 'array'
-                         THEN d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion'
-                         ELSE jsonb_build_array(d.datos->'docsSustento'->'docSustento'->'retenciones'->'retencion')
-                     END
-                     WHEN jsonb_typeof(d.datos->'impuestos'->'impuesto') = 'array'
-                     THEN d.datos->'impuestos'->'impuesto'
-                     WHEN d.datos->'impuestos'->'impuesto' IS NOT NULL
-                     THEN jsonb_build_array(d.datos->'impuestos'->'impuesto')
-                     ELSE '[]'::jsonb
-                 END
-             ) AS imp
-        WHERE d.emisor_id     = :eid
-          AND d.estado_sri    = 'AUTORIZADO'
-          AND d.fecha_emision BETWEEN :fi AND :ff
-          AND d.es_sandbox    = false
-          AND d.tipo_doc      = 'RET'
-        GROUP BY (imp->>'codigo'), (imp->>'codigoRetencion')
-        ORDER BY codigo_impuesto, codigo_retencion
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
-
-    res_totales = await db.execute(text("""
-        SELECT tipo_doc, COUNT(*) AS num_docs, SUM(importe_total) AS total
-        FROM documentos_emitidos
-        WHERE emisor_id     = :eid
-          AND estado_sri    = 'AUTORIZADO'
-          AND fecha_emision BETWEEN :fi AND :ff
-          AND es_sandbox    = false
-        GROUP BY tipo_doc
-    """), {"eid": emisor_id, "fi": fi, "ff": ff})
+    res_iva, res_ret, res_totales = await asyncio.gather(
+        _query_iva(), _query_ret(), _query_totales()
+    )
 
     rows_iva     = res_iva.fetchall()
     rows_ret     = res_ret.fetchall()

@@ -18,6 +18,7 @@ from app.services.cuentas_service import (
     registrar_ajuste_core,
 )
 from app.services.audit_service import audit_log
+from app.core.cache import cache_get, cache_set
 
 router = APIRouter()
 
@@ -46,13 +47,25 @@ class AjusteCreate(BaseModel):
 
 # ── Helper suscripción ─────────────────────────────────────────────────────────
 async def _verificar_suscripcion(emisor_id: int, db: AsyncSession):
+    # Cache 60s — la suscripción no cambia cada request
+    cache_key = f"sub:estado:{emisor_id}"
+    cached = await cache_get(cache_key)
+    if cached:
+        if cached["estado"] not in ("ACTIVO", "TRIAL"):
+            raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
+        return
+
     res = await db.execute(text("""
         SELECT estado FROM subscriptions WHERE emisor_id = :eid
     """), {"eid": emisor_id})
     sub = res.fetchone()
+
+    if sub:
+        await cache_set(cache_key, {"estado": sub.estado}, 60)
+
     if not sub or sub.estado not in ("ACTIVO", "TRIAL"):
         raise HTTPException(status_code=402, detail="LAS CUENTAS REQUIEREN UNA SUSCRIPCIÓN ACTIVA.")
-
+    
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @router.post("")
 async def crear_cuenta(

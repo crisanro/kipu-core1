@@ -35,7 +35,6 @@ RESET_CONTINUE_URL  = "https://app.kipu.ec/"
 async def send_verification(
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
-    # Rate limit: 10 requests/min por IP (protege contra spam de emails)
     _rl: None = Depends(RateLimit(RateLimitScope.RESET, use_ip=True)),
 ):
     email = (auth_data.get("email") or "").strip().lower()
@@ -101,8 +100,6 @@ async def reset_password(
     request: Request,
     _rl: None = Depends(RateLimit(RateLimitScope.AUTH, use_ip=True)),
 ):
-    # Por seguridad no revelamos si el email está registrado o no:
-    # siempre respondemos lo mismo, y los errores solo van al log.
     email = (data.email or "").strip().lower()
     try:
         link = await asyncio.to_thread(
@@ -124,12 +121,15 @@ async def reset_password(
 
 
 # ── Exportar Facturas ──────────────────────────────────────────────────────────
+
+# Máximo de descargas paralelas a storage (evita saturar conexiones)
+_MAX_CONCURRENT_DOWNLOADS = 10
+
 @router.get("/exportar-facturas", summary="Exportar XMLs de facturas autorizadas")
 async def exportar_facturas(
     pin: str,
     auth_data: dict = Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db),
-    # Rate limit: 3 exports cada 5 minutos (ZIP es costoso)
     _rl: None = Depends(RateLimit(RateLimitScope.EXPORT)),
 ):
     emisor_id = auth_data.get("emisor_id")
@@ -138,7 +138,6 @@ async def exportar_facturas(
 
     await validar_y_quemar_pin(db, emisor_id, pin, "EXPORTAR_DATOS")
 
-    # OPTIMIZACIÓN: query con columnas mínimas necesarias
     res = await db.execute(text("""
         SELECT e.ruc, i.clave_acceso, i.xml_path, i.numero_factura, i.fecha_emision
         FROM invoices_emitidas i
@@ -153,18 +152,29 @@ async def exportar_facturas(
     if not facturas:
         raise HTTPException(status_code=404, detail="NO TIENES FACTURAS AUTORIZADAS PARA EXPORTAR.")
 
-    zip_buffer = io.BytesIO()
-    errores    = []
+    # Descargar XMLs en paralelo con semáforo (no bloquea el event loop)
+    semaforo = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+    errores  = []
 
-    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        for factura in facturas:
+    async def descargar(factura):
+        async with semaforo:
             try:
-                xml_bytes = download_file(factura.xml_path)
+                xml_bytes = await asyncio.to_thread(download_file, factura.xml_path)
                 nombre    = f"{factura.numero_factura}_{factura.fecha_emision}.xml".replace("-", "")
-                zip_file.writestr(nombre, xml_bytes)
+                return (nombre, xml_bytes)
             except Exception as e:
                 errores.append(factura.clave_acceso)
                 print(f"[EXPORTAR] ⚠️ Error descargando {factura.xml_path}: {e}")
+                return None
+
+    resultados = await asyncio.gather(*[descargar(f) for f in facturas])
+
+    # Armar ZIP (operación CPU, rápida)
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for item in resultados:
+            if item:
+                zip_file.writestr(item[0], item[1])
 
     zip_buffer.seek(0)
 
@@ -215,14 +225,12 @@ async def nuke_account(
             )
 
         if row.ambiente == 1:
-            # Pruebas — PIN fijo 999999, no requiere solicitud previa
             if pin != "111111":
                 raise HTTPException(
                     status_code=403,
                     detail="PIN incorrecto, expirado o ya utilizado. Solicite uno nuevo."
                 )
         else:
-            # Producción — PIN real desde auth_challenges
             await validar_y_quemar_pin(db, emisor_id, pin, "NUKE")
 
     try:
@@ -230,13 +238,13 @@ async def nuke_account(
             await db.execute(text("""
                 INSERT INTO leads_ex_usuarios (
                     ruc, razon_social, email, full_name,
-                    whatsapp_number,                          -- ← agregar
+                    whatsapp_number,
                     ultimo_balance_emision, ultimo_balance_recepcion,
                     total_facturas_emitidas, total_facturas_recibidas,
                     fecha_registro_original, fecha_eliminacion
                 ) VALUES (
                     :ruc, :razon_social, :email, :full_name,
-                    :whatsapp_number,                         -- ← agregar
+                    :whatsapp_number,
                     :bal_emi, :bal_rec,
                     :total_emi, :total_rec,
                     :fecha_reg, NOW()
@@ -246,7 +254,7 @@ async def nuke_account(
                 "razon_social":     row.razon_social,
                 "email":            row.email,
                 "full_name":        row.full_name,
-                "whatsapp_number":  row.whatsapp_number,      # ← agregar
+                "whatsapp_number":  row.whatsapp_number,
                 "bal_emi":          row.balance_emision   or 0,
                 "bal_rec":          row.balance_recepcion or 0,
                 "total_emi":        row.total_emitidas    or 0,
@@ -260,7 +268,6 @@ async def nuke_account(
 
         await db.commit()
 
-        # Limpiar todo el cache del emisor antes de que deje de existir
         if emisor_id:
             await invalidate_emisor(emisor_id)
 
@@ -269,26 +276,28 @@ async def nuke_account(
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="ERROR AL ELIMINAR LA CUENTA EN BASE DE DATOS.")
 
-    # ── 1. Borrar Firebase Auth ───────────────────────────────────────────────
+    # Firebase Auth — en hilo para no bloquear event loop
     try:
-        auth.delete_user(uid)
+        await asyncio.to_thread(auth.delete_user, uid)
         print(f"[NUKE] 🔥 Firebase Auth eliminado: {uid}")
     except Exception as e_fb:
         print(f"[NUKE] ⚠️ Error eliminando Firebase Auth (no crítico): {e_fb}")
 
-    # ── 2. Borrar Firestore ───────────────────────────────────────────────────
+    # Firestore — en hilo para no bloquear event loop
     try:
         from firebase_admin import firestore
-        fs_client = firestore.client()
-        fs_client.collection("users").document(uid).delete()
+        def _borrar_firestore():
+            fs_client = firestore.client()
+            fs_client.collection("users").document(uid).delete()
+        await asyncio.to_thread(_borrar_firestore)
         print(f"[NUKE] 🗑️ Firestore eliminado para UID: {uid}")
     except Exception as e_fs:
         print(f"[NUKE] ⚠️ Error eliminando Firestore (no crítico): {e_fs}")
 
-    # ── 3. Borrar R2 ──────────────────────────────────────────────────────────
+    # R2 — en hilo para no bloquear event loop
     if emisor_id and row.ruc:
         try:
-            delete_folder(f"{row.ruc}/")
+            await asyncio.to_thread(delete_folder, f"{row.ruc}/")
             print(f"[NUKE] 🗑️ R2 eliminado para RUC: {row.ruc}")
         except Exception as e_r2:
             print(f"[NUKE] ⚠️ Error eliminando R2 (no crítico): {e_r2}")
@@ -315,7 +324,7 @@ async def ping(request: Request):
     token = auth_header.split(" ")[1]
 
     try:
-        decoded = auth.verify_id_token(token)
+        decoded = await asyncio.to_thread(auth.verify_id_token, token)
     except Exception as e:
         if "expired" in str(e).lower():
             raise HTTPException(status_code=401, detail="TOKEN_POR_EXPIRAR")
