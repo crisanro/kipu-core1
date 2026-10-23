@@ -95,6 +95,14 @@ class VerificarManualRequest(BaseModel):
     email:  str
     motivo: str = Field(..., min_length=5, max_length=300)
 
+
+class CambiarCorreoRequest(BaseModel):
+    email_actual: str
+    email_nuevo:  str
+    motivo:       str = Field(..., min_length=5, max_length=300)
+
+
+
 # =============================================================================
 # GET /emisores
 # =============================================================================
@@ -1090,3 +1098,64 @@ async def soporte_verificar_manual(
         "motivo":         req.motivo.strip(),
     })
     return {"ok": True, "mensaje": "Correo marcado como verificado. El usuario ya puede iniciar sesión."}
+
+
+
+@router.post("/soporte/cambiar-correo", summary="Cambiar correo de un usuario (Firebase + Kipu)")
+async def soporte_cambiar_correo(
+    req:       CambiarCorreoRequest,
+    auth_data: dict         = Depends(verify_superadmin),
+    db:        AsyncSession = Depends(get_db),
+):
+    email_actual = _norm_email(req.email_actual)
+    email_nuevo  = _norm_email(req.email_nuevo)
+ 
+    if email_actual == email_nuevo:
+        raise HTTPException(status_code=400, detail="El correo nuevo es igual al actual.")
+ 
+    # 1. Verificar que el usuario actual existe en Firebase
+    fb_user = await _fb_por_email(email_actual)
+    if not fb_user:
+        raise HTTPException(status_code=404, detail="No existe en Firebase.")
+ 
+    # 2. Verificar que el correo nuevo no esté ocupado en Firebase
+    fb_nuevo = await _fb_por_email(email_nuevo)
+    if fb_nuevo:
+        raise HTTPException(status_code=409, detail="El correo nuevo ya está registrado en Firebase.")
+ 
+    # 3. Verificar que no esté ocupado en Kipu tampoco
+    res = await db.execute(text("""
+        SELECT id FROM profiles WHERE lower(email) = :email LIMIT 1
+    """), {"email": email_nuevo})
+    if res.fetchone():
+        raise HTTPException(status_code=409, detail="El correo nuevo ya existe en Kipu.")
+ 
+    # 4. Actualizar en Firebase (email + marcar como verificado)
+    try:
+        await asyncio.to_thread(
+            fb_auth.update_user, fb_user.uid,
+            email=email_nuevo,
+            email_verified=True,
+        )
+    except Exception as ex:
+        raise HTTPException(status_code=502, detail=f"Error actualizando Firebase: {ex}")
+ 
+    # 5. Actualizar en Kipu (profiles)
+    await db.execute(text("""
+        UPDATE profiles
+        SET email = :nuevo
+        WHERE lower(email) = :actual OR firebase_uid = :uid
+    """), {"nuevo": email_nuevo, "actual": email_actual, "uid": fb_user.uid})
+ 
+    # 6. Auditoría
+    await _audit_soporte(db, auth_data, fb_user.uid, {
+        "accion_soporte": "cambiar_correo",
+        "email_anterior": email_actual,
+        "email_nuevo":    email_nuevo,
+        "motivo":         req.motivo.strip(),
+    })
+ 
+    return {
+        "ok":      True,
+        "mensaje": f"Correo actualizado de {email_actual} a {email_nuevo}.",
+    }
